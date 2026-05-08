@@ -181,7 +181,7 @@ func (s *ExternalSort) emitBatch(rows []sortRow) *Batch {
 			out := &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}
 			for i, r := range rows {
 				if !r.nulls[c] {
-					out.Values[i] = float64FromBits(uint64(r.values[c]))
+					out.Values[i] = math.Float64frombits(uint64(r.values[c]))
 					storage.SetValidBit(out.NullBitmap, i)
 				}
 			}
@@ -205,9 +205,7 @@ func (s *ExternalSort) emitBatch(rows []sortRow) *Batch {
 					storage.SetValidBit(nullBmp, i)
 				}
 			}
-			rawDict := db.Marshal()
-			dict, _ := storage.UnmarshalDictionary(rawDict)
-			vecs[c] = &StringVector{Codes: codes, Dict: dict, NullBitmap: nullBmp}
+			vecs[c] = newStringVector(db, codes, nullBmp)
 
 		default:
 			out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
@@ -222,7 +220,5 @@ func (s *ExternalSort) emitBatch(rows []sortRow) *Batch {
 	}
 	return &Batch{Schema: s.schema, Vectors: vecs, Length: n}
 }
-
-func float64FromBits(b uint64) float64 { return math.Float64frombits(b) }
 
 func (s *ExternalSort) Close() error { return s.child.Close() }

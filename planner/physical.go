@@ -322,20 +322,11 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		_ = child
 		pattern, ok := x.Pattern.(*sql.StringLiteral)
 		if !ok {
 			return nil, fmt.Errorf("planner: LIKE pattern must be a string literal")
 		}
-		// Use StringEqExpr fast path only for equality; use LikeExpr for patterns.
-		idx := schema.IndexOf("")
-		if cr, ok := x.Expr.(*sql.ColumnRefExpr); ok {
-			idx = schema.IndexOf(cr.Name)
-		}
-		like := &exec.LikeExpr{
-			Child:   &exec.ColumnRef{Idx: idx, T: exec.TypeString},
-			Pattern: pattern.Value,
-		}
+		like := &exec.LikeExpr{Child: child, Pattern: pattern.Value}
 		if x.Not {
 			return &exec.NotExpr{Child: like}, nil
 		}
@@ -490,7 +481,9 @@ func zonePredEval(e sql.Expr, schema exec.Schema, rg *storage.RowGroupMeta) bool
 		rgMin := int64(zm.Min)
 		rgMax := int64(zm.Max)
 		if rgMax < *loVal || rgMin > *hiVal {
-			return !x.Not // prune if NOT BETWEEN and range contains all values
+			// Row group entirely outside [lo, hi]: plain BETWEEN has no matches (prune),
+			// NOT BETWEEN always matches (don't prune).
+			return x.Not
 		}
 		return true
 	}
@@ -530,6 +523,17 @@ func zoneRangePred(x *sql.BinaryExpr, schema exec.Schema, rg *storage.RowGroupMe
 		return true
 	}
 	v := *litVal
+
+	// For float64 columns, zone map stores float64 bit patterns.
+	// If the literal was an integer (not yet converted to float bits), coerce it now
+	// so the bit-level comparison is valid.
+	colType := schema.Fields[colIdx].Type
+	if colType == exec.TypeFloat64 {
+		if _, isInt := lit.(*sql.IntLiteral); isInt {
+			v = int64(math.Float64bits(float64(v)))
+		}
+	}
+
 	rgMin := int64(zm.Min)
 	rgMax := int64(zm.Max)
 

@@ -49,13 +49,14 @@ func run(args []string) error {
 		return fmt.Errorf("new writer: %w", err)
 	}
 
+	const scanBufSize = 1 << 20 // 1 MiB — enough for the widest TPC-H .tbl line
+
 	ncols := len(schema.Fields)
-	const rowGroupSize = storage.RowGroupRows
 
 	// Pre-allocate column buffers.
 	colBufs := make([]columnBuffer, ncols)
 	for i, f := range schema.Fields {
-		colBufs[i] = newColumnBuffer(f.Type, rowGroupSize)
+		colBufs[i] = newColumnBuffer(f.Type, storage.RowGroupRows)
 	}
 
 	var totalRows int
@@ -77,7 +78,7 @@ func run(args []string) error {
 	}
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	scanner.Buffer(make([]byte, scanBufSize), scanBufSize)
 	rgRow := 0
 
 	for scanner.Scan() {
@@ -97,7 +98,7 @@ func run(args []string) error {
 		}
 		rgRow++
 		totalRows++
-		if rgRow == rowGroupSize {
+		if rgRow == storage.RowGroupRows {
 			if err := flushRowGroup(rgRow); err != nil {
 				_ = w.Abort()
 				return fmt.Errorf("flush row group: %w", err)
@@ -149,8 +150,7 @@ func newColumnBuffer(t storage.DataType, cap int) columnBuffer {
 }
 
 func (cb *columnBuffer) reset() {
-	n := cap(cb.nulls) * 8
-	cb.nulls = make([]byte, (n+7)/8)
+	clear(cb.nulls)
 	switch cb.t {
 	case storage.TypeInt64:
 		cb.int64s = cb.int64s[:0]

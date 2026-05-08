@@ -124,3 +124,11 @@ func (v *DateVector) Len() int        { return len(v.Values) }
 func (v *DateVector) Type() DataType  { return TypeDate }
 func (v *DateVector) IsNull(i int) bool { return storage.IsNullBit(v.NullBitmap, i) }
 func (v *DateVector) Nulls() []byte   { return v.NullBitmap }
+
+// newStringVector builds a StringVector from a DictBuilder, pre-filled codes,
+// and a null bitmap.  Shared by aggregate and sort output paths.
+func newStringVector(db *storage.DictBuilder, codes []uint32, nullBmp []byte) *StringVector {
+	rawDict := db.Marshal()
+	dict, _ := storage.UnmarshalDictionary(rawDict)
+	return &StringVector{Codes: codes, Dict: dict, NullBitmap: nullBmp}
+}

@@ -47,9 +47,8 @@ type HashAggregate struct {
 	groups   map[string][]int64    // key → per-aggregate accumulators
 	groupCnt map[string]int64      // key → count of rows in group (for AVG)
 	samples  map[string][]groupByVal // key → representative group-by values
-	done     bool
-	outRows  []string // keys to emit
-	outPos   int
+	done   bool
+	outPos int
 }
 
 func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashAggregate, error) {
@@ -101,19 +100,18 @@ func (h *HashAggregate) Next(ctx context.Context) (*Batch, error) {
 			return nil, err
 		}
 		h.done = true
-		h.outRows = h.keys
 	}
 
-	if h.outPos >= len(h.outRows) {
+	if h.outPos >= len(h.keys) {
 		return nil, nil // EOF
 	}
 
 	// Emit up to BlockRows output rows per call.
 	end := h.outPos + BlockRows
-	if end > len(h.outRows) {
-		end = len(h.outRows)
+	if end > len(h.keys) {
+		end = len(h.keys)
 	}
-	batch := h.buildOutputBatch(h.outRows[h.outPos:end])
+	batch := h.buildOutputBatch(h.keys[h.outPos:end])
 	h.outPos = end
 	return batch, nil
 }
@@ -166,7 +164,6 @@ func (h *HashAggregate) consumeAll(ctx context.Context) error {
 					}
 				}
 				h.groups[key] = accs
-				h.groupCnt[key] = 0
 				h.keys = append(h.keys, key)
 				// Store a representative row sample for reconstructing group-by values.
 				if len(h.groupBy) > 0 {
@@ -361,9 +358,7 @@ func buildGroupByVector(h *HashAggregate, keys []string, gbPos int, srcType Data
 			codes[i] = db.Add(sample[gbPos].strVal)
 			storage.SetValidBit(nullBmp, i)
 		}
-		rawDict := db.Marshal()
-		dict, _ := storage.UnmarshalDictionary(rawDict)
-		return &StringVector{Codes: codes, Dict: dict, NullBitmap: nullBmp}
+		return newStringVector(db, codes, nullBmp)
 
 	case TypeFloat64:
 		out := &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}

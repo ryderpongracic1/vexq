@@ -3,6 +3,7 @@ package exec
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/ryderpongracic1/vexq/storage"
 )
@@ -222,7 +223,7 @@ func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 		out := &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
 			if !r.build.nulls[colIdx] {
-				out.Values[i] = float64FromBits(uint64(r.build.values[colIdx]))
+				out.Values[i] = math.Float64frombits(uint64(r.build.values[colIdx]))
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}

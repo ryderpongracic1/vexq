@@ -97,7 +97,11 @@ func runQuery(path, query string) error {
 	// Separator
 	var seps []string
 	for _, f := range schema.Fields {
-		seps = append(seps, strings.Repeat("-", max(len(f.Name), 4)))
+		n := len(f.Name)
+		if n < 4 {
+			n = 4
+		}
+		seps = append(seps, strings.Repeat("-", n))
 	}
 	fmt.Fprintln(tw, strings.Join(seps, "\t"))
 
@@ -121,26 +125,22 @@ func runQuery(path, query string) error {
 }
 
 func printBatch(w io.Writer, batch *exec.Batch) {
-	tw, ok := w.(*tabwriter.Writer)
-	_ = ok
-
 	rows := batch.Length
+	vals := make([]string, len(batch.Vectors))
 	if batch.SelVec != nil {
 		for _, ri := range batch.SelVec {
-			var vals []string
-			for _, vec := range batch.Vectors {
-				vals = append(vals, vecVal(vec, int(ri)))
+			for j, vec := range batch.Vectors {
+				vals[j] = vecVal(vec, int(ri))
 			}
-			fmt.Fprintln(tw, strings.Join(vals, "\t"))
+			fmt.Fprintln(w, strings.Join(vals, "\t"))
 		}
 		return
 	}
 	for i := 0; i < rows; i++ {
-		var vals []string
-		for _, vec := range batch.Vectors {
-			vals = append(vals, vecVal(vec, i))
+		for j, vec := range batch.Vectors {
+			vals[j] = vecVal(vec, i)
 		}
-		fmt.Fprintln(tw, strings.Join(vals, "\t"))
+		fmt.Fprintln(w, strings.Join(vals, "\t"))
 	}
 }
 
@@ -169,13 +169,6 @@ func vecVal(vec exec.Vector, i int) string {
 		return d.Format("2006-01-02")
 	}
 	return "?"
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // ---- fsck ------------------------------------------------------------------
