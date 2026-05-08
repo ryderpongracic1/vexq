@@ -2,5 +2,8 @@ data/*.tbl
 data/*.db
 data/*.vxq
 data/dists.dss
-vexq
-vexqgen
+/vexq
+/vexqgen
+tools/
+tpch-dbgen/
+.claude/
