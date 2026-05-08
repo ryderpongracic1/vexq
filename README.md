@@ -86,14 +86,12 @@ Requires Go 1.21+. No external runtime dependencies (SQLite is benchmark-only).
 
 ## Benchmarks
 
-TPC-H scale factor 1 (6M lineitem rows) on Apple M-series. SQLite configured with `WAL`, `NORMAL` sync, 256 MB cache, and `ANALYZE`.
-
-> Benchmarks in progress — Q1 complete, Q6 fix in progress (see below).
+TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Max. SQLite configured with `WAL`, `NORMAL` sync, 256 MB cache, and `ANALYZE`. Each benchmark run 3×; numbers are median wall time per run.
 
 | Query | Description | vexq | SQLite | Speedup |
 |-------|-------------|------|--------|---------|
-| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | TBD | TBD | TBD |
-| Q6 | Revenue forecast — scan with 5 range predicates, SUM | TBD | TBD | TBD |
+| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 693 ms | 3,320 ms | **4.8×** |
+| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 457 ms | 583 ms | **1.3×** |
 
 Run benchmarks (after generating data):
 
@@ -121,9 +119,7 @@ go test ./bench/tpch/ -bench=. -benchtime=3x -v
 | 3 | SQL parser — lexer, AST, recursive-descent | ✅ Complete |
 | 4 | Catalog + planner — logical plan, optimizer, physical plan | ✅ Complete |
 | 5 | CLI binary (`vexq`, `vexqgen`, `fsck`) | ✅ Complete |
-| 6 | TPC-H benchmark harness vs SQLite | 🔧 In progress |
-
-**Phase 6 status**: Q1 correctness verified (4 groups, counts match TPC-H reference). Q6 debugging a float comparison edge case in the filter evaluation path. Benchmark numbers pending Q6 fix.
+| 6 | TPC-H benchmark harness vs SQLite | ✅ Complete |
 
 ## Design Notes
 
