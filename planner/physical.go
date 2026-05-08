@@ -104,6 +104,43 @@ func physicalAggregate(ctx context.Context, n *LogicalAggregate) (exec.Operator,
 	}
 	schema := child.Schema()
 
+	// If any aggregate uses a complex expression (not a simple column ref),
+	// insert a Project step to compute synthetic columns for those expressions.
+	hasComplexExpr := false
+	for _, agg := range n.Aggs {
+		if agg.AggExpr != nil {
+			hasComplexExpr = true
+			break
+		}
+	}
+	if hasComplexExpr {
+		// Pass all existing columns through, then append synthetic columns.
+		projExprs := make([]exec.ProjectExpr, 0, len(schema.Fields)+len(n.Aggs))
+		for _, f := range schema.Fields {
+			idx := schema.IndexOf(f.Name)
+			projExprs = append(projExprs, exec.ProjectExpr{
+				Name: f.Name,
+				Expr: &exec.ColumnRef{Name: f.Name, Idx: idx, T: f.Type},
+			})
+		}
+		for i := range n.Aggs {
+			if n.Aggs[i].AggExpr == nil {
+				continue
+			}
+			synExpr, err := buildExecExpr(n.Aggs[i].AggExpr, schema)
+			if err != nil {
+				_ = child.Close()
+				return nil, fmt.Errorf("planner: aggregate expr %q: %w", n.Aggs[i].Alias, err)
+			}
+			projExprs = append(projExprs, exec.ProjectExpr{Name: n.Aggs[i].ColName, Expr: synExpr})
+		}
+		child, err = exec.NewProject(child, projExprs)
+		if err != nil {
+			return nil, err
+		}
+		schema = child.Schema()
+	}
+
 	// Resolve group-by column indices.
 	var groupByIdxs []int
 	for _, gbExpr := range n.GroupBy {
@@ -395,6 +432,26 @@ func buildBinExpr(x *sql.BinaryExpr, schema exec.Schema) (exec.Expr, error) {
 	}
 	// Type coercion: promote literals to match the column type.
 	l, r = coercePair(l, r)
+
+	// String equality/inequality: use StringEqExpr (dict-code fast path).
+	if (x.Op == sql.OpEQ || x.Op == sql.OpNE) &&
+		l.Type() == exec.TypeString && r.Type() == exec.TypeString {
+		cr, isCol := l.(*exec.ColumnRef)
+		lit, isLit := r.(*exec.Literal)
+		if !isCol || !isLit {
+			// Try reversed.
+			cr, isCol = r.(*exec.ColumnRef)
+			lit, isLit = l.(*exec.Literal)
+		}
+		if isCol && isLit {
+			return &exec.StringEqExpr{
+				ColIdx:  cr.Idx,
+				Literal: lit.Val.(string),
+				Negate:  x.Op == sql.OpNE,
+			}, nil
+		}
+	}
+
 	op, isArith, err := sqlOpToExecOp(x.Op)
 	if err != nil {
 		return nil, err

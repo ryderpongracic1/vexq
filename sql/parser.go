@@ -43,14 +43,20 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 	}
 	stmt.Columns = cols
 
-	// FROM.
+	// FROM (comma-separated table list).
 	if tok, _ := p.peek(); tok.Kind == TokFROM {
 		p.next()
-		ref, err := p.parseTableRef()
-		if err != nil {
-			return nil, err
+		for {
+			ref, err := p.parseTableRef()
+			if err != nil {
+				return nil, err
+			}
+			stmt.From = append(stmt.From, ref)
+			if tok, _ := p.peek(); tok.Kind != TokComma {
+				break
+			}
+			p.next() // consume comma
 		}
-		stmt.From = ref
 	}
 
 	// WHERE.

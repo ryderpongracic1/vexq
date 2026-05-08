@@ -31,8 +31,9 @@ type HashJoin struct {
 }
 
 type buildRow struct {
-	values []int64 // raw bits per column
-	nulls  []bool
+	values  []int64  // raw bits per column (non-string types)
+	strVals []string // materialized string values (populated for TypeString columns)
+	nulls   []bool
 }
 
 type joinRow struct {
@@ -167,12 +168,22 @@ func (j *HashJoin) buildHashTable(ctx context.Context) error {
 				continue
 			}
 			key := extractInt64(kv, rowIdx)
-			row := buildRow{values: make([]int64, numCols), nulls: make([]bool, numCols)}
+			row := buildRow{
+				values:  make([]int64, numCols),
+				strVals: make([]string, numCols),
+				nulls:   make([]bool, numCols),
+			}
 			for c := 0; c < numCols; c++ {
 				v := batch.Vectors[c]
 				row.nulls[c] = v.IsNull(rowIdx)
 				if !row.nulls[c] {
-					row.values[c] = extractInt64(v, rowIdx)
+					if sv, ok := v.(*StringVector); ok {
+						if sv.Dict != nil {
+							row.strVals[c] = sv.Dict.Get(sv.Codes[rowIdx])
+						}
+					} else {
+						row.values[c] = extractInt64(v, rowIdx)
+					}
 				}
 			}
 			j.hashTable[key] = append(j.hashTable[key], row)
@@ -228,7 +239,27 @@ func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 			}
 		}
 		return out
-	default:
+	case TypeDate:
+		out := &DateVector{Values: make([]int32, n), NullBitmap: make([]byte, (n+7)/8)}
+		for i, r := range rows {
+			if !r.build.nulls[colIdx] {
+				out.Values[i] = int32(r.build.values[colIdx])
+				storage.SetValidBit(out.NullBitmap, i)
+			}
+		}
+		return out
+	case TypeString:
+		db := storage.NewDictBuilder()
+		codes := make([]uint32, n)
+		nullBmp := make([]byte, (n+7)/8)
+		for i, r := range rows {
+			if !r.build.nulls[colIdx] {
+				codes[i] = db.Add(r.build.strVals[colIdx])
+				storage.SetValidBit(nullBmp, i)
+			}
+		}
+		return newStringVector(db, codes, nullBmp)
+	default: // TypeBool
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
 			if !r.build.nulls[colIdx] {
@@ -242,33 +273,59 @@ func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 
 func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n int) Vector {
 	pBatch := j.probeBatch
+	src := pBatch.Vectors[colIdx]
 	switch t {
 	case TypeInt64:
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
-		src := pBatch.Vectors[colIdx].(*Int64Vector)
+		sv := src.(*Int64Vector)
 		for i, r := range rows {
-			if !src.IsNull(r.probe) {
-				out.Values[i] = src.Values[r.probe]
+			if !sv.IsNull(r.probe) {
+				out.Values[i] = sv.Values[r.probe]
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
 		return out
 	case TypeFloat64:
 		out := &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}
-		src := pBatch.Vectors[colIdx].(*Float64Vector)
+		sv := src.(*Float64Vector)
 		for i, r := range rows {
-			if !src.IsNull(r.probe) {
-				out.Values[i] = src.Values[r.probe]
+			if !sv.IsNull(r.probe) {
+				out.Values[i] = sv.Values[r.probe]
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
 		return out
-	default:
+	case TypeDate:
+		out := &DateVector{Values: make([]int32, n), NullBitmap: make([]byte, (n+7)/8)}
+		sv := src.(*DateVector)
+		for i, r := range rows {
+			if !sv.IsNull(r.probe) {
+				out.Values[i] = sv.Values[r.probe]
+				storage.SetValidBit(out.NullBitmap, i)
+			}
+		}
+		return out
+	case TypeString:
+		sv := src.(*StringVector)
+		db := storage.NewDictBuilder()
+		codes := make([]uint32, n)
+		nullBmp := make([]byte, (n+7)/8)
+		for i, r := range rows {
+			if !sv.IsNull(r.probe) {
+				var s string
+				if sv.Dict != nil {
+					s = sv.Dict.Get(sv.Codes[r.probe])
+				}
+				codes[i] = db.Add(s)
+				storage.SetValidBit(nullBmp, i)
+			}
+		}
+		return newStringVector(db, codes, nullBmp)
+	default: // TypeBool
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
-			v := pBatch.Vectors[colIdx]
-			if !v.IsNull(r.probe) {
-				out.Values[i] = extractInt64(v, r.probe)
+			if !src.IsNull(r.probe) {
+				out.Values[i] = extractInt64(src, r.probe)
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}

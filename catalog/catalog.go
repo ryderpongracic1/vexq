@@ -69,6 +69,22 @@ func OpenSingle(ctx context.Context, name, path string) (*Catalog, error) {
 	return c, nil
 }
 
+// OpenMulti returns a catalog with multiple tables registered from .vxq file paths.
+// tables maps table name → file path.
+func OpenMulti(ctx context.Context, tables map[string]string) (*Catalog, error) {
+	c := &Catalog{tables: make(map[string]*TableEntry)}
+	for name, path := range tables {
+		r, err := storage.Open(ctx, path)
+		if err != nil {
+			return nil, fmt.Errorf("catalog: open %q: %w", path, err)
+		}
+		schema := r.Meta().Schema
+		_ = r.Close()
+		c.tables[name] = &TableEntry{Name: name, FilePath: path, Schema: schema}
+	}
+	return c, nil
+}
+
 // Register adds or replaces a table entry.
 func (c *Catalog) Register(name, path string, schema storage.Schema) {
 	c.mu.Lock()

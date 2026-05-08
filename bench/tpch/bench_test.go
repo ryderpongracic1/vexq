@@ -39,6 +39,17 @@ import (
 	vsql "github.com/ryderpongracic1/vexq/sql"
 )
 
+// ---- multi-table path helpers -----------------------------------------------
+
+func vxqPaths(t testing.TB, tables ...string) map[string]string {
+	t.Helper()
+	m := make(map[string]string, len(tables))
+	for _, table := range tables {
+		m[table] = vxqPath(t, table)
+	}
+	return m
+}
+
 // ---- paths -----------------------------------------------------------------
 
 func repoRoot(t testing.TB) string {
@@ -95,6 +106,66 @@ WHERE l_shipdate >= '1994-01-01'
   AND l_discount >= 0.05
   AND l_discount < 0.07
   AND l_quantity < 24`
+
+// Q3: Shipping Priority. 3-table join, GROUP BY, ORDER BY, LIMIT.
+const q3 = `
+SELECT l_orderkey,
+       SUM(l_extendedprice * (1 - l_discount)) AS revenue,
+       o_orderdate,
+       o_shippriority
+FROM customer, orders, lineitem
+WHERE c_mktsegment = 'BUILDING'
+  AND c_custkey = o_custkey
+  AND l_orderkey = o_orderkey
+  AND o_orderdate < '1995-03-15'
+  AND l_shipdate > '1995-03-15'
+GROUP BY l_orderkey, o_orderdate, o_shippriority
+ORDER BY revenue DESC, o_orderdate
+LIMIT 10`
+
+// Q12: Shipping Modes and Order Priority. 2-table join, CASE WHEN aggregates.
+const q12 = `
+SELECT l_shipmode,
+       SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count,
+       SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count
+FROM orders, lineitem
+WHERE o_orderkey = l_orderkey
+  AND l_shipmode IN ('MAIL', 'SHIP')
+  AND l_commitdate < l_receiptdate
+  AND l_shipdate < l_commitdate
+  AND l_receiptdate >= '1994-01-01'
+  AND l_receiptdate < '1995-01-01'
+GROUP BY l_shipmode
+ORDER BY l_shipmode`
+
+const q3SQLite = `
+SELECT l_orderkey,
+       SUM(l_extendedprice * (1 - l_discount)) AS revenue,
+       o_orderdate,
+       o_shippriority
+FROM customer, orders, lineitem
+WHERE c_mktsegment = 'BUILDING'
+  AND c_custkey = o_custkey
+  AND l_orderkey = o_orderkey
+  AND o_orderdate < '1995-03-15'
+  AND l_shipdate > '1995-03-15'
+GROUP BY l_orderkey, o_orderdate, o_shippriority
+ORDER BY revenue DESC, o_orderdate
+LIMIT 10`
+
+const q12SQLite = `
+SELECT l_shipmode,
+       SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count,
+       SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count
+FROM orders, lineitem
+WHERE o_orderkey = l_orderkey
+  AND l_shipmode IN ('MAIL', 'SHIP')
+  AND l_commitdate < l_receiptdate
+  AND l_shipdate < l_commitdate
+  AND l_receiptdate >= '1994-01-01'
+  AND l_receiptdate < '1995-01-01'
+GROUP BY l_shipmode
+ORDER BY l_shipmode`
 
 // q1SQLite and q6SQLite use exact DATE literals understood by SQLite.
 const q1SQLite = `
@@ -312,6 +383,49 @@ func runVexq(t testing.TB, table, query string) [][]string {
 	return rows
 }
 
+// runVexqMulti runs a multi-table query against the given table→path mapping.
+func runVexqMulti(t testing.TB, tables map[string]string, query string) [][]string {
+	t.Helper()
+	ctx := context.Background()
+
+	cat, err := catalog.OpenMulti(ctx, tables)
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+
+	p := vsql.NewParser(query)
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	sel := stmt.(*vsql.SelectStmt)
+
+	logical, err := planner.Build(ctx, sel, cat)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	logical = planner.Optimize(logical)
+
+	op, err := planner.Physical(ctx, logical)
+	if err != nil {
+		t.Fatalf("physical: %v", err)
+	}
+	defer op.Close()
+
+	var rows [][]string
+	for {
+		batch, err := op.Next(ctx)
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if batch == nil {
+			break
+		}
+		appendBatchRows(&rows, batch)
+	}
+	return rows
+}
+
 func appendBatchRows(out *[][]string, batch *exec.Batch) {
 	indices := make([]int, batch.Length)
 	if batch.SelVec != nil {
@@ -449,6 +563,46 @@ func TestQ6Correctness(t *testing.T) {
 	t.Logf("Q6: vexq=%s  sqlite=%s", vexqRows[0][0], sqliteRows[0][0])
 }
 
+func TestQ3Correctness(t *testing.T) {
+	tables := vxqPaths(t, "customer", "orders", "lineitem")
+	vexqRows := runVexqMulti(t, tables, q3)
+	sqliteRows := runSQLite(t, q3SQLite)
+
+	if len(vexqRows) != len(sqliteRows) {
+		t.Fatalf("Q3: vexq returned %d rows, SQLite %d rows", len(vexqRows), len(sqliteRows))
+	}
+	// Both should already be ordered by revenue DESC, o_orderdate.
+	// Compare first 3 columns: l_orderkey, revenue, o_orderdate.
+	for i := range vexqRows {
+		if vexqRows[i][0] != sqliteRows[i][0] {
+			t.Errorf("Q3 row %d l_orderkey: vexq=%s sqlite=%s", i, vexqRows[i][0], sqliteRows[i][0])
+		}
+	}
+	t.Logf("Q3 correctness OK: %d result rows", len(vexqRows))
+}
+
+func TestQ12Correctness(t *testing.T) {
+	tables := vxqPaths(t, "orders", "lineitem")
+	vexqRows := runVexqMulti(t, tables, q12)
+	sqliteRows := runSQLite(t, q12SQLite)
+
+	if len(vexqRows) != len(sqliteRows) {
+		t.Fatalf("Q12: vexq returned %d rows, SQLite %d rows", len(vexqRows), len(sqliteRows))
+	}
+	for i := range vexqRows {
+		if vexqRows[i][0] != sqliteRows[i][0] {
+			t.Errorf("Q12 row %d l_shipmode: vexq=%s sqlite=%s", i, vexqRows[i][0], sqliteRows[i][0])
+		}
+		if vexqRows[i][1] != sqliteRows[i][1] {
+			t.Errorf("Q12 row %d high_line_count: vexq=%s sqlite=%s", i, vexqRows[i][1], sqliteRows[i][1])
+		}
+		if vexqRows[i][2] != sqliteRows[i][2] {
+			t.Errorf("Q12 row %d low_line_count: vexq=%s sqlite=%s", i, vexqRows[i][2], sqliteRows[i][2])
+		}
+	}
+	t.Logf("Q12 correctness OK: %d result rows", len(vexqRows))
+}
+
 // ---- benchmarks ------------------------------------------------------------
 
 func BenchmarkVexqQ1(b *testing.B) {
@@ -509,6 +663,70 @@ func BenchmarkSQLiteQ6(b *testing.B) {
 		rows, err := db.Query(q6SQLite)
 		if err != nil {
 			b.Fatalf("sqlite Q6: %v", err)
+		}
+		drainSQLite(b, rows)
+		db.Close()
+	}
+}
+
+func BenchmarkVexqQ3(b *testing.B) {
+	tables := vxqPaths(b, "customer", "orders", "lineitem")
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cat, _ := catalog.OpenMulti(ctx, tables)
+		p := vsql.NewParser(q3)
+		stmt, _ := p.ParseStatement()
+		sel := stmt.(*vsql.SelectStmt)
+		logical, _ := planner.Build(ctx, sel, cat)
+		logical = planner.Optimize(logical)
+		op, _ := planner.Physical(ctx, logical)
+		drainOp(b, ctx, op)
+		op.Close()
+	}
+}
+
+func BenchmarkSQLiteQ3(b *testing.B) {
+	dbPath := sqliteDB(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db, _ := sql.Open("sqlite3", dbPath+"?_cache_size=-262144")
+		rows, err := db.Query(q3SQLite)
+		if err != nil {
+			b.Fatalf("sqlite Q3: %v", err)
+		}
+		drainSQLite(b, rows)
+		db.Close()
+	}
+}
+
+func BenchmarkVexqQ12(b *testing.B) {
+	tables := vxqPaths(b, "orders", "lineitem")
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cat, _ := catalog.OpenMulti(ctx, tables)
+		p := vsql.NewParser(q12)
+		stmt, _ := p.ParseStatement()
+		sel := stmt.(*vsql.SelectStmt)
+		logical, _ := planner.Build(ctx, sel, cat)
+		logical = planner.Optimize(logical)
+		op, _ := planner.Physical(ctx, logical)
+		drainOp(b, ctx, op)
+		op.Close()
+	}
+}
+
+func BenchmarkSQLiteQ12(b *testing.B) {
+	dbPath := sqliteDB(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db, _ := sql.Open("sqlite3", dbPath+"?_cache_size=-262144")
+		rows, err := db.Query(q12SQLite)
+		if err != nil {
+			b.Fatalf("sqlite Q12: %v", err)
 		}
 		drainSQLite(b, rows)
 		db.Close()

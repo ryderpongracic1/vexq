@@ -124,8 +124,9 @@ func (n *LogicalAggregate) OutputSchema() exec.Schema {
 }
 
 type AggItem struct {
-	Func    string // COUNT, SUM, AVG, MIN, MAX
-	ColName string // source column name ("" for COUNT(*))
+	Func    string   // COUNT, SUM, AVG, MIN, MAX
+	ColName string   // source column name ("" for COUNT(*) or complex expressions)
+	AggExpr sql.Expr // non-nil for complex expressions (e.g. SUM(a * (1-b)))
 	Alias   string
 	ColIdx  int // resolved during physical planning
 }

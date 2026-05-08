@@ -23,8 +23,8 @@ func TestParseSimpleSelect(t *testing.T) {
 	if len(stmt.Columns) != 2 {
 		t.Fatalf("expected 2 columns, got %d", len(stmt.Columns))
 	}
-	if stmt.From.Name != "t" {
-		t.Fatalf("expected FROM t, got %q", stmt.From.Name)
+	if stmt.From[0].Name != "t" {
+		t.Fatalf("expected FROM t, got %q", stmt.From[0].Name)
 	}
 }
 
@@ -146,8 +146,8 @@ WHERE
 	AND l_discount BETWEEN 0.05 AND 0.07
 	AND l_quantity < 24`
 	stmt := mustParse(t, q)
-	if stmt.From.Name != "lineitem" {
-		t.Fatalf("expected FROM lineitem, got %q", stmt.From.Name)
+	if stmt.From[0].Name != "lineitem" {
+		t.Fatalf("expected FROM lineitem, got %q", stmt.From[0].Name)
 	}
 	if stmt.Where == nil {
 		t.Fatal("expected WHERE clause")
