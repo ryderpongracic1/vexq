@@ -92,6 +92,10 @@ TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Max. SQLite configured with 
 |-------|-------------|------|--------|---------|
 | Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 693 ms | 3,320 ms | **4.8×** |
 | Q6 | Revenue forecast — scan with 5 range predicates, SUM | 457 ms | 583 ms | **1.3×** |
+| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 1,218 ms | 3,764 ms | **3.1×** |
+| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,903 ms | 1,130 ms | 0.6× |
+
+Q12 is currently slower than SQLite: the HashJoin build phase materialises the full orders table and SQLite benefits from its B-tree index on `o_orderkey`. Future work: index-nested-loop join and late materialisation would close this gap.
 
 Run benchmarks (after generating data):
 
@@ -100,8 +104,9 @@ Run benchmarks (after generating data):
 cd data && ../tools/dbgen -s 1 -f
 
 # Convert to .vxq
-vexqgen lineitem data/lineitem.tbl data/lineitem.vxq
-vexqgen orders   data/orders.tbl   data/orders.vxq
+vexqgen lineitem  data/lineitem.tbl  data/lineitem.vxq
+vexqgen orders    data/orders.tbl    data/orders.vxq
+vexqgen customer  data/customer.tbl  data/customer.vxq
 
 # Load SQLite baseline
 go test ./bench/tpch/ -run TestSetupSQLite -v
