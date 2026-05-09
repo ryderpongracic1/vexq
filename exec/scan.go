@@ -13,25 +13,35 @@ import (
 // TableScan reads a .vxq file and yields Batches.  It supports:
 //   - Column pruning: only reads columns listed in projectedCols.
 //   - Zone map pruning: skips entire row groups via ZonePred.
+//   - Row-group range: only scans [rgStart, rgEnd) for morsel-driven parallelism.
 type TableScan struct {
-	reader      *storage.Reader
-	schema      Schema // output schema (projected columns only)
-	colMap      []int  // colMap[i] = source column index for output column i
-	zonePred    ZonePredicate
-	rgIdx       int
-	crList      []*storage.ColumnReader
-	rgDone      bool
+	reader   *storage.Reader
+	schema   Schema // output schema (projected columns only)
+	colMap   []int  // colMap[i] = source column index for output column i
+	zonePred ZonePredicate
+	rgStart  int // inclusive
+	rgEnd    int // exclusive
+	rgIdx    int
+	crList   []*storage.ColumnReader
+	rgDone   bool
 }
 
 // ZonePredicate is called with a row group's column stats before reading it.
 // Return false to skip the row group entirely.
 type ZonePredicate func(rg *storage.RowGroupMeta) bool
 
-// NewTableScan creates a TableScan.
+// NewTableScan creates a TableScan that covers all row groups.
 //   - reader: open VXQReader (TableScan takes ownership; Close closes it)
 //   - projectedCols: column names to project (nil = all columns)
 //   - zonePred: optional zone-map predicate (nil = scan all row groups)
 func NewTableScan(reader *storage.Reader, projectedCols []string, zonePred ZonePredicate) (*TableScan, error) {
+	return NewTableScanRange(reader, projectedCols, zonePred, 0, len(reader.Meta().RowGroups))
+}
+
+// NewTableScanRange creates a TableScan limited to row groups [rgStart, rgEnd).
+// Used by morsel-driven parallel execution to assign disjoint row-group slices
+// to independent goroutines.
+func NewTableScanRange(reader *storage.Reader, projectedCols []string, zonePred ZonePredicate, rgStart, rgEnd int) (*TableScan, error) {
 	srcSchema := reader.Meta().Schema
 	var outFields []Field
 	var colMap []int
@@ -58,6 +68,9 @@ func NewTableScan(reader *storage.Reader, projectedCols []string, zonePred ZoneP
 		schema:   Schema{Fields: outFields},
 		colMap:   colMap,
 		zonePred: zonePred,
+		rgStart:  rgStart,
+		rgEnd:    rgEnd,
+		rgIdx:    rgStart,
 	}, nil
 }
 
@@ -71,7 +84,7 @@ func (s *TableScan) Next(ctx context.Context) (*Batch, error) {
 
 		// Open the current row group if needed.
 		if s.crList == nil {
-			if s.rgIdx >= len(s.reader.Meta().RowGroups) {
+			if s.rgIdx >= s.rgEnd {
 				return nil, nil // EOF
 			}
 			rg := &s.reader.Meta().RowGroups[s.rgIdx]

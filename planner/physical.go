@@ -71,6 +71,12 @@ func physicalFilter(ctx context.Context, n *LogicalFilter) (exec.Operator, error
 	if err != nil {
 		return nil, err
 	}
+	return buildFilterOp(n, child)
+}
+
+// buildFilterOp wraps an already-constructed child operator with a Filter for n.
+// Used by both physicalFilter and the parallel planner's factory closure.
+func buildFilterOp(n *LogicalFilter, child exec.Operator) (exec.Operator, error) {
 	exprTree, err := buildExecExpr(n.Predicate, child.Schema())
 	if err != nil {
 		_ = child.Close()
@@ -84,6 +90,12 @@ func physicalProject(ctx context.Context, n *LogicalProject) (exec.Operator, err
 	if err != nil {
 		return nil, err
 	}
+	return buildProjectOp(n, child)
+}
+
+// buildProjectOp wraps an already-constructed child operator with a Project for n.
+// Used by both physicalProject and the parallel planner's factory closure.
+func buildProjectOp(n *LogicalProject, child exec.Operator) (exec.Operator, error) {
 	schema := child.Schema()
 	var projExprs []exec.ProjectExpr
 	for _, pe := range n.Exprs {
@@ -102,69 +114,81 @@ func physicalAggregate(ctx context.Context, n *LogicalAggregate) (exec.Operator,
 	if err != nil {
 		return nil, err
 	}
-	schema := child.Schema()
+	child, err = buildPreProjection(n, child)
+	if err != nil {
+		_ = child.Close()
+		return nil, err
+	}
+	groupByIdxs, aggExprs, err := resolveAggConfig(n, child.Schema())
+	if err != nil {
+		_ = child.Close()
+		return nil, err
+	}
+	return exec.NewHashAggregate(child, groupByIdxs, aggExprs)
+}
 
-	// If any aggregate uses a complex expression (not a simple column ref),
-	// insert a Project step to compute synthetic columns for those expressions.
-	hasComplexExpr := false
+// buildPreProjection inserts a synthetic projection before the aggregate when any
+// AggItem uses a complex expression (not a plain column reference). In that case
+// every existing column is passed through unchanged, and each complex expression
+// is appended as a synthetic column named by AggItem.ColName.
+// If no complex expressions are present, child is returned unchanged.
+func buildPreProjection(n *LogicalAggregate, child exec.Operator) (exec.Operator, error) {
+	hasComplex := false
 	for _, agg := range n.Aggs {
 		if agg.AggExpr != nil {
-			hasComplexExpr = true
+			hasComplex = true
 			break
 		}
 	}
-	if hasComplexExpr {
-		// Pass all existing columns through, then append synthetic columns.
-		projExprs := make([]exec.ProjectExpr, 0, len(schema.Fields)+len(n.Aggs))
-		for _, f := range schema.Fields {
-			idx := schema.IndexOf(f.Name)
-			projExprs = append(projExprs, exec.ProjectExpr{
-				Name: f.Name,
-				Expr: &exec.ColumnRef{Name: f.Name, Idx: idx, T: f.Type},
-			})
-		}
-		for i := range n.Aggs {
-			if n.Aggs[i].AggExpr == nil {
-				continue
-			}
-			synExpr, err := buildExecExpr(n.Aggs[i].AggExpr, schema)
-			if err != nil {
-				_ = child.Close()
-				return nil, fmt.Errorf("planner: aggregate expr %q: %w", n.Aggs[i].Alias, err)
-			}
-			projExprs = append(projExprs, exec.ProjectExpr{Name: n.Aggs[i].ColName, Expr: synExpr})
-		}
-		child, err = exec.NewProject(child, projExprs)
-		if err != nil {
-			return nil, err
-		}
-		schema = child.Schema()
+	if !hasComplex {
+		return child, nil
 	}
+	schema := child.Schema()
+	projExprs := make([]exec.ProjectExpr, 0, len(schema.Fields)+len(n.Aggs))
+	for _, f := range schema.Fields {
+		idx := schema.IndexOf(f.Name)
+		projExprs = append(projExprs, exec.ProjectExpr{
+			Name: f.Name,
+			Expr: &exec.ColumnRef{Name: f.Name, Idx: idx, T: f.Type},
+		})
+	}
+	for i := range n.Aggs {
+		if n.Aggs[i].AggExpr == nil {
+			continue
+		}
+		synExpr, err := buildExecExpr(n.Aggs[i].AggExpr, schema)
+		if err != nil {
+			return nil, fmt.Errorf("planner: aggregate expr %q: %w", n.Aggs[i].Alias, err)
+		}
+		projExprs = append(projExprs, exec.ProjectExpr{Name: n.Aggs[i].ColName, Expr: synExpr})
+	}
+	return exec.NewProject(child, projExprs)
+}
 
-	// Resolve group-by column indices.
-	var groupByIdxs []int
+// resolveAggConfig resolves group-by column indices and aggregate descriptors
+// (including AccumType for correct parallel merge) from n given the schema that
+// will be presented to the aggregate operator (post-pre-projection if any).
+// Called by both physicalAggregate and Parallel.
+func resolveAggConfig(n *LogicalAggregate, schema exec.Schema) (groupByIdxs []int, aggExprs []exec.AggExpr, err error) {
 	for _, gbExpr := range n.GroupBy {
 		cr, ok := gbExpr.(*sql.ColumnRefExpr)
 		if !ok {
-			_ = child.Close()
-			return nil, fmt.Errorf("planner: GROUP BY only supports column references")
+			return nil, nil, fmt.Errorf("planner: GROUP BY only supports column references")
 		}
 		idx := schema.IndexOf(cr.Name)
 		if idx < 0 {
-			_ = child.Close()
-			return nil, fmt.Errorf("planner: GROUP BY column %q not found", cr.Name)
+			return nil, nil, fmt.Errorf("planner: GROUP BY column %q not found", cr.Name)
 		}
 		groupByIdxs = append(groupByIdxs, idx)
 	}
 
-	// Resolve aggregate column indices.
-	var aggExprs []exec.AggExpr
 	for i := range n.Aggs {
 		agg := &n.Aggs[i]
 		ae := exec.AggExpr{OutName: agg.Alias}
 		switch agg.Func {
 		case "COUNT":
 			ae.Kind = exec.AggCount
+			ae.AccumType = exec.TypeInt64
 			if agg.ColName == "" {
 				ae.ColIdx = -1
 			} else {
@@ -175,6 +199,7 @@ func physicalAggregate(ctx context.Context, n *LogicalAggregate) (exec.Operator,
 			ae.ColIdx = schema.IndexOf(agg.ColName)
 		case "AVG":
 			ae.Kind = exec.AggAvg
+			ae.AccumType = exec.TypeFloat64
 			ae.ColIdx = schema.IndexOf(agg.ColName)
 		case "MIN":
 			ae.Kind = exec.AggMin
@@ -183,13 +208,19 @@ func physicalAggregate(ctx context.Context, n *LogicalAggregate) (exec.Operator,
 			ae.Kind = exec.AggMax
 			ae.ColIdx = schema.IndexOf(agg.ColName)
 		default:
-			_ = child.Close()
-			return nil, fmt.Errorf("planner: unknown aggregate %q", agg.Func)
+			return nil, nil, fmt.Errorf("planner: unknown aggregate %q", agg.Func)
+		}
+		// Set AccumType for SUM/MIN/MAX based on source column type.
+		if ae.Kind == exec.AggSum || ae.Kind == exec.AggMin || ae.Kind == exec.AggMax {
+			if ae.ColIdx >= 0 && schema.Fields[ae.ColIdx].Type == exec.TypeFloat64 {
+				ae.AccumType = exec.TypeFloat64
+			} else {
+				ae.AccumType = exec.TypeInt64
+			}
 		}
 		aggExprs = append(aggExprs, ae)
 	}
-
-	return exec.NewHashAggregate(child, groupByIdxs, aggExprs)
+	return groupByIdxs, aggExprs, nil
 }
 
 func physicalSort(ctx context.Context, n *LogicalSort) (exec.Operator, error) {

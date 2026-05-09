@@ -746,6 +746,137 @@ func drainOp(b *testing.B, ctx context.Context, op exec.Operator) {
 	}
 }
 
+// ---- parallel query runner -------------------------------------------------
+
+// runVexqParallel runs a single-table query using morsel-driven parallelism.
+// numWorkers == 0 defaults to runtime.NumCPU() inside planner.Parallel.
+func runVexqParallel(t testing.TB, table, query string, numWorkers int) [][]string {
+	t.Helper()
+	ctx := context.Background()
+	path := vxqPath(t, table)
+
+	cat, err := catalog.OpenSingle(ctx, table, path)
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+
+	p := vsql.NewParser(query)
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	sel := stmt.(*vsql.SelectStmt)
+
+	logical, err := planner.Build(ctx, sel, cat)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	logical = planner.Optimize(logical)
+
+	op, err := planner.Parallel(ctx, logical, numWorkers)
+	if err != nil {
+		t.Fatalf("parallel: %v", err)
+	}
+	defer op.Close()
+
+	var rows [][]string
+	for {
+		batch, err := op.Next(ctx)
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if batch == nil {
+			break
+		}
+		appendBatchRows(&rows, batch)
+	}
+	return rows
+}
+
+// ---- parallel correctness tests --------------------------------------------
+
+func TestQ1ParallelCorrectness(t *testing.T) {
+	serial := runVexq(t, "lineitem", q1)
+	parallel := runVexqParallel(t, "lineitem", q1, runtime.NumCPU())
+
+	if len(serial) != len(parallel) {
+		t.Fatalf("Q1 parallel: serial %d rows, parallel %d rows", len(serial), len(parallel))
+	}
+	// Sort both by returnflag + linestatus for deterministic comparison.
+	sortByFirstTwo := func(rows [][]string) {
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i][0] != rows[j][0] {
+				return rows[i][0] < rows[j][0]
+			}
+			return rows[i][1] < rows[j][1]
+		})
+	}
+	sortByFirstTwo(serial)
+	sortByFirstTwo(parallel)
+
+	for i := range serial {
+		for j := range serial[i] {
+			if serial[i][j] != parallel[i][j] {
+				t.Errorf("Q1 row %d col %d: serial=%s parallel=%s", i, j, serial[i][j], parallel[i][j])
+			}
+		}
+	}
+	t.Logf("Q1 parallel correctness OK: %d rows, %d workers", len(serial), runtime.NumCPU())
+}
+
+func TestQ6ParallelCorrectness(t *testing.T) {
+	serial := runVexq(t, "lineitem", q6)
+	parallel := runVexqParallel(t, "lineitem", q6, runtime.NumCPU())
+
+	if len(serial) != 1 || len(parallel) != 1 {
+		t.Fatalf("Q6 parallel: serial %d rows, parallel %d rows", len(serial), len(parallel))
+	}
+	if serial[0][0] != parallel[0][0] {
+		t.Errorf("Q6 SUM mismatch: serial=%s parallel=%s", serial[0][0], parallel[0][0])
+	}
+	t.Logf("Q6 parallel correctness OK: serial=%s parallel=%s", serial[0][0], parallel[0][0])
+}
+
+// ---- parallel benchmarks ---------------------------------------------------
+
+func BenchmarkVexqQ1Parallel(b *testing.B) {
+	path := vxqPath(b, "lineitem")
+	ctx := context.Background()
+	workers := runtime.NumCPU()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cat, _ := catalog.OpenSingle(ctx, "lineitem", path)
+		p := vsql.NewParser(q1)
+		stmt, _ := p.ParseStatement()
+		sel := stmt.(*vsql.SelectStmt)
+		logical, _ := planner.Build(ctx, sel, cat)
+		logical = planner.Optimize(logical)
+		op, _ := planner.Parallel(ctx, logical, workers)
+		drainOp(b, ctx, op)
+		op.Close()
+	}
+}
+
+func BenchmarkVexqQ6Parallel(b *testing.B) {
+	path := vxqPath(b, "lineitem")
+	ctx := context.Background()
+	workers := runtime.NumCPU()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cat, _ := catalog.OpenSingle(ctx, "lineitem", path)
+		p := vsql.NewParser(q6)
+		stmt, _ := p.ParseStatement()
+		sel := stmt.(*vsql.SelectStmt)
+		logical, _ := planner.Build(ctx, sel, cat)
+		logical = planner.Optimize(logical)
+		op, _ := planner.Parallel(ctx, logical, workers)
+		drainOp(b, ctx, op)
+		op.Close()
+	}
+}
+
 func drainSQLite(b *testing.B, rows *sql.Rows) {
 	b.Helper()
 	defer rows.Close()
