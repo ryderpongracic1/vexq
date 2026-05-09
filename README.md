@@ -18,14 +18,16 @@ sql/           — Lexer + recursive-descent parser (Pratt precedence)
 planner/       — Logical plan builder, rule-based optimizer, physical planner
   optimizer    — Predicate pushdown, column pruning
   physical     — Zone-map predicates, logical → exec.Operator tree
+  parallel     — Morsel-driven parallel planner (planner.Parallel)
 
 exec/          — Vectorized operator pipeline
-  TableScan    — Columnar I/O with zone-map pruning and column projection
-  Filter       — Selection-vector based (no allocation on hot path)
-  Project      — Lazy materialization through selection vectors
-  HashAggregate — Hash-partitioned GROUP BY with float64-correct SUM/AVG
-  ExternalSort — In-memory sort (spill-to-disk planned for v2)
-  HashJoin     — Build/probe inner join
+  TableScan         — Columnar I/O with zone-map pruning and column projection
+  Filter            — Selection-vector based (no allocation on hot path)
+  Project           — Lazy materialization through selection vectors
+  HashAggregate     — Hash-partitioned GROUP BY with float64-correct SUM/AVG
+  ParallelHashAggregate — Fan-out across goroutines + partial-aggregate merge
+  ExternalSort      — In-memory sort (spill-to-disk planned for v2)
+  HashJoin          — Build/probe inner join
   Limit
 
 catalog/       — Table registry with lazy schema loading from .vxq footer
@@ -86,16 +88,29 @@ Requires Go 1.21+. No external runtime dependencies (SQLite is benchmark-only).
 
 ## Benchmarks
 
-TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Max. SQLite configured with `WAL`, `NORMAL` sync, 256 MB cache, and `ANALYZE`. Each benchmark run 3×; numbers are median wall time per run.
+TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Max (10 cores). SQLite configured with `WAL`, `NORMAL` sync, 256 MB cache, and `ANALYZE`. Each benchmark run 3×; numbers are median wall time per run.
+
+### Single-core
 
 | Query | Description | vexq | SQLite | Speedup |
 |-------|-------------|------|--------|---------|
-| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 693 ms | 3,320 ms | **4.8×** |
-| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 457 ms | 583 ms | **1.3×** |
+| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 733 ms | 3,320 ms | **4.5×** |
+| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 473 ms | 583 ms | **1.2×** |
 | Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 1,218 ms | 3,764 ms | **3.1×** |
 | Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,903 ms | 1,130 ms | 0.6× |
 
 Q12 is currently slower than SQLite: the HashJoin build phase materialises the full orders table and SQLite benefits from its B-tree index on `o_orderkey`. Future work: index-nested-loop join and late materialisation would close this gap.
+
+### Parallel execution (morsel-driven, 10 goroutines)
+
+`planner.Parallel()` partitions the file's row groups across `runtime.NumCPU()` goroutines. Each goroutine runs an independent `TableScan → Filter → Project → partial HashAggregate` pipeline on its slice; a merge step combines partial aggregates in the calling goroutine.
+
+| Query | vexq serial | vexq parallel | SQLite | Speedup (parallel vs SQLite) |
+|-------|------------|---------------|--------|------------------------------|
+| Q6 | 473 ms | **233 ms** | 583 ms | **2.5×** |
+| Q1† | 733 ms | 733 ms | 3,320 ms | 4.5× |
+
+† Q1 has an `ORDER BY` clause, so the root operator is a `Sort`, not an `Aggregate`. `planner.Parallel()` falls back to `planner.Physical()` for plans it cannot partition (joins, sorts at the root). Parallel execution applies to aggregate-only plans today; Q3/Q12 also fall back because they contain `HashJoin`.
 
 Run benchmarks (after generating data):
 
@@ -111,8 +126,13 @@ vexqgen customer  data/customer.tbl  data/customer.vxq
 # Load SQLite baseline
 go test ./bench/tpch/ -run TestSetupSQLite -v
 
-# Run benchmarks
+# Run all benchmarks (serial + parallel)
 go test ./bench/tpch/ -bench=. -benchtime=3x -v
+
+# Run just parallel benchmarks
+go test ./bench/tpch/ \
+  -bench="BenchmarkVexqQ1$|BenchmarkVexqQ1Parallel|BenchmarkVexqQ6$|BenchmarkVexqQ6Parallel" \
+  -benchtime=3x -v
 ```
 
 ## Progress
@@ -125,10 +145,13 @@ go test ./bench/tpch/ -bench=. -benchtime=3x -v
 | 4 | Catalog + planner — logical plan, optimizer, physical plan | ✅ Complete |
 | 5 | CLI binary (`vexq`, `vexqgen`, `fsck`) | ✅ Complete |
 | 6 | TPC-H benchmark harness vs SQLite | ✅ Complete |
+| 7 | Morsel-driven parallelism — `ParallelHashAggregate`, `planner.Parallel()` | ✅ Complete |
 
 ## Design Notes
 
-**Why pull-based (Volcano model)?** `LIMIT` and short-circuit predicates terminate naturally — when the root stops calling `Next()`, all upstream work stops with no extra machinery. Simpler to debug single-threaded, and the right foundation before adding morsel-driven parallelism later.
+**Why pull-based (Volcano model)?** `LIMIT` and short-circuit predicates terminate naturally — when the root stops calling `Next()`, all upstream work stops with no extra machinery. Simpler to debug single-threaded, and composes cleanly with the morsel-driven parallel layer above it.
+
+**How morsel-driven parallelism works.** `planner.Parallel()` detects a `LogicalAggregate → (Filter →)? Scan` plan shape and builds a `ParallelHashAggregate` that partitions the file's row groups into equal slices — one per `runtime.NumCPU()` goroutine. Each goroutine runs a fully independent `TableScan → Filter → Project → HashAggregate` pipeline on its slice, accumulates partial results locally, then sends its `HashAggregate` state on a buffered channel. The main goroutine merges all partial aggregates (correctly handling float64 SUM/MIN/MAX via IEEE-bit re-encoding and AVG via sum+count) and delegates output to a single final `HashAggregate`. No shared mutable state; synchronisation is only via the channel.
 
 **Why 1024-row batches?** An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB, fitting in L1 (typically 32 KB on modern x86). Per-batch overhead (one `Next()` call, type assertions) amortizes over 1024 rows. Same constant used by Velox, DuckDB, and Photon.
 
