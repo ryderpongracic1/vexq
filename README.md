@@ -141,10 +141,10 @@ SQLite is a B-tree row-store engine designed for OLTP: it reads full rows, appli
 
 | Query | Description | vexq | SQLite | Speedup |
 |-------|-------------|------|--------|---------|
-| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 733 ms | 3,320 ms | **4.5×** |
-| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 473 ms | 583 ms | **1.2×** |
-| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 1,218 ms | 3,764 ms | **3.1×** |
-| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,903 ms | 1,130 ms | 0.6× |
+| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 657 ms | 3,463 ms | **5.3×** |
+| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 198 ms | 599 ms | **3.0×** |
+| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 1,133 ms | 3,719 ms | **3.3×** |
+| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,643 ms | 1,073 ms | 0.65× |
 
 Q12 is currently slower than SQLite: the `HashJoin` build phase materialises the full orders table and SQLite benefits from its B-tree index on `o_orderkey`. Future work: index-nested-loop join and late materialisation would close this gap.
 
@@ -154,17 +154,16 @@ DuckDB is a state-of-the-art embedded analytical engine backed by multi-decade r
 
 | Query | vexq | DuckDB | Gap |
 |-------|------|--------|-----|
-| Q1 | 733 ms | — | — |
-| Q6 | 473 ms | — | — |
-| Q3 | 1,218 ms | — | — |
-| Q12 | 1,903 ms | — | — |
-
-*DuckDB baseline will be populated once Phase 2 benchmarks are complete.*
+| Q1 | 657 ms | 31 ms | **21×** |
+| Q6 | 198 ms | 7 ms | **28×** |
+| Q3 | 1,133 ms | 15 ms | **75×** |
+| Q12 | 1,643 ms | 15 ms | **110×** |
 
 **Why we lose (and by how much):**
-- **Q1 (GROUP BY heavy):** DuckDB uses AVX-512 horizontal SUM over 8 float64 lanes simultaneously; vexq accumulates one value per iteration. DuckDB's radix-partitioned hash aggregate also avoids the random-access hash map misses that dominate our `accumulate()` hot loop.
-- **Q6 (predicate heavy):** DuckDB generates SIMD predicate masks that evaluate 8 comparisons per instruction; our `BoolVector` loop evaluates one comparison per iteration. The gap here should be smallest because zone-map pruning is already eliminating most row groups.
-- **Q3/Q12 (join heavy):** DuckDB's hash join uses a SIMD-accelerated probe and a smarter build-side partitioning strategy. Our `HashJoin` is a straightforward in-memory build/probe.
+- **Q1 (GROUP BY, 21×):** DuckDB's radix-partitioned hash aggregate avoids random hash-map misses — each radix partition fits in L2 cache, turning the probe into a sequential scan. It also uses SIMD horizontal SUM over multiple float64 lanes simultaneously. vexq accumulates one row at a time into a Go `map[string]` that thrashes the TLB at 6M entries. The primary bottleneck is the hash-aggregate random access pattern, not compute; explicit SIMD alone would not close this gap.
+- **Q6 (predicate-heavy, 28×):** DuckDB generates SIMD predicate masks that evaluate 8 date/float comparisons per instruction and uses late materialisation — it decodes only the five filter columns first, applies the conjunctive mask, then decodes the payload columns only for surviving rows. vexq decodes all projected columns before filtering. Zone-map pruning is already eliminating most row groups; the remaining gap is per-surviving-row decode overhead.
+- **Q3 (3-table join, 75×):** DuckDB's hash join uses a SIMD-accelerated probe phase and radix-partitions the build side to keep each partition L2-resident. vexq's `HashJoin` builds a Go `map[int64][]Batch` over the full orders table (1.5M rows) and probes it with random access — each probe is a likely L3 miss on the map's underlying hash array.
+- **Q12 (2-table join + CASE WHEN, 110×):** Amplifies Q3's join penalty with a `CASE WHEN` aggregate that vexq evaluates as a branchy expression per row. DuckDB compiles queries to native code (LLVM JIT), eliminating the interpreter overhead entirely. The 110× gap is the largest because join + JIT + SIMD compose multiplicatively.
 
 ### What's left on the table
 
@@ -180,8 +179,8 @@ DuckDB is a state-of-the-art embedded analytical engine backed by multi-decade r
 
 | Query | vexq serial | vexq parallel | SQLite | Speedup (parallel vs SQLite) |
 |-------|------------|---------------|--------|------------------------------|
-| Q6 | 473 ms | **233 ms** | 583 ms | **2.5×** |
-| Q1† | 733 ms | 733 ms | 3,320 ms | 4.5× |
+| Q6 | 198 ms | **177 ms** | 599 ms | **3.4×** |
+| Q1† | 657 ms | 657 ms | 3,463 ms | 5.3× |
 
 † Q1 has an `ORDER BY` clause, so the root operator is a `Sort`, not an `Aggregate`. `planner.Parallel()` falls back to `planner.Physical()` for plans it cannot partition (joins, sorts at the root). Parallel execution applies to aggregate-only plans today; Q3/Q12 also fall back because they contain `HashJoin`.
 
@@ -202,7 +201,10 @@ go test ./bench/tpch/ -run TestSetupSQLite -v
 # Load DuckDB baseline
 go test ./bench/tpch/ -run TestSetupDuckDB -v
 
-# Run all benchmarks (serial + parallel + DuckDB)
+# Run all benchmarks (serial + parallel + SQLite + DuckDB)
+go test ./bench/tpch/ -tags duckdb -bench=. -benchtime=3x -v
+
+# Run without DuckDB (no CGO dependency)
 go test ./bench/tpch/ -bench=. -benchtime=3x -v
 
 # Run just parallel benchmarks
@@ -244,7 +246,7 @@ perf stat -e cache-misses,cache-references,branch-misses \
 | 5 | CLI binary (`vexq`, `vexqgen`, `fsck`) | ✅ Complete |
 | 6 | TPC-H benchmark harness vs SQLite | ✅ Complete |
 | 7 | Morsel-driven parallelism — `ParallelHashAggregate`, `planner.Parallel()` | ✅ Complete |
-| 8 | DuckDB honest baseline + hot-loop unrolling + work-stealing scheduler | 🔄 In Progress |
+| 8 | DuckDB honest baseline + hot-loop unrolling + work-stealing scheduler | ✅ Complete |
 
 ## Design Notes
 
