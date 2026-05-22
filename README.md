@@ -40,7 +40,7 @@ bench/tpch     — TPC-H Q1/Q3/Q6/Q12 benchmarks vs SQLite and DuckDB
 
 ### Why 1024-row batches
 
-An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB — fits in L1 cache (32 KB typical on modern x86/ARM). This means the innermost decode, filter, and aggregate loops all operate on data that is almost certainly already in L1, avoiding LLC (L3) round-trips that cost ~40 cycles each.
+An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB — well within L1 cache on every modern microarchitecture (32–48 KB on x86 Skylake+, **128 KB** on Apple M1 Pro/Max performance cores). This means the innermost decode, filter, and aggregate loops all operate on data that is almost certainly already in L1, avoiding LLC round-trips that cost ~40 cycles each.
 
 The batch size also amortizes the cost of one virtual `Next()` call across 1024 rows. A virtual dispatch on x86 is ~50 ns (indirect branch, possible iTLB miss); spread over 1024 rows that is ~0.05 ns per row — negligible. Processing row-at-a-time would spend more time dispatching than computing. This is the same constant used by Velox, DuckDB, and Photon.
 
@@ -52,7 +52,7 @@ The `TableScan` decode loops in [`exec/scan.go`](exec/scan.go) operate on tightl
 vals[i] = int64(binary.LittleEndian.Uint64(payload[i*8:]))
 ```
 
-On x86/ARM, `binary.LittleEndian.Uint64` compiles to a single `MOV` (no byte-swap). Eight consecutive values occupy exactly 64 bytes — one cache line — so the prefetcher can issue fetch requests ahead of the loop at full bandwidth. Big-endian would require a `MOV+BSWAP` pair, penalizing every decode by ~10–20%.
+On x86-64, `binary.LittleEndian.Uint64` compiles to a single `MOVQ` (no byte-swap). On ARM64 (M1 Pro), it compiles to a single `LDR`. Eight consecutive values occupy exactly 64 bytes — one cache line — so the hardware prefetcher can issue fetch requests ahead of the loop at full bandwidth. Big-endian would require a `MOVQ+BSWAP` (x86) or `LDR+REV` (ARM64) pair, penalizing every decode by ~10–20%.
 
 ### Branch-predictor friendliness
 
@@ -87,7 +87,7 @@ Custom columnar format designed for vectorized reads:
 
 - **Layout**: file header → row groups (65,536 rows each) → footer
 - **Blocks**: 1,024 rows per block with 128-byte null bitmap + typed payload + CRC32
-- **Endianness**: little-endian throughout (single `MOV` on x86/ARM vs `MOV+BSWAP` for big-endian)
+- **Endianness**: little-endian throughout (single `MOVQ`/`LDR` on x86-64/ARM64 vs `MOVQ+BSWAP`/`LDR+REV` for big-endian)
 - **String columns**: always dictionary-encoded per row group — string equality becomes integer comparison in the filter hot loop
 - **Bool columns**: run-length encoded with null sentinel
 - **Zone maps**: per-row-group min/max/sum/nullcount in footer — entire row groups skipped before any block I/O
@@ -133,7 +133,7 @@ Requires Go 1.21+. No external runtime dependencies (SQLite and DuckDB are bench
 
 ## Benchmarks
 
-TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Max (10 cores). Each benchmark run 3×; numbers are median wall time per run.
+TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Pro (10-core, 128 KB L1D per performance core, 24 MB SLC). Each benchmark run 3×; numbers are median wall time per run.
 
 ### Floor — vs SQLite (row-store OLTP)
 
@@ -255,8 +255,8 @@ perf stat -e cache-misses,cache-references,branch-misses \
 - `planner.Parallel()` ([`planner/parallel.go`](planner/parallel.go)) detects the `LogicalAggregate → (Filter →)? Scan` plan shape, resolves group-by/aggregate column indices, and builds a `PipelineFactory` closure (one independent `TableScan → Filter → Project` pipeline per call).
 - `ParallelHashAggregate.setup()` ([`exec/parallel.go`](exec/parallel.go)) handles *dynamic scheduling*: a `morselQueue` wraps an `atomic.Int64` cursor padded to its own 64-byte cache line (preventing false-sharing). Each of the `numWorkers` goroutines loops calling `q.claim(morselSize)` to atomically reserve the next chunk of row groups, runs the pipeline on that morsel, accumulates into a goroutine-local `HashAggregate`, and claims the next morsel — no coordinator, no barriers between morsels. Fast workers (low-selectivity morsels) complete early and immediately claim more work, eliminating stragglers. After all workers drain the queue, the calling goroutine merges all partial aggregates single-threadedly (correct IEEE float64 via bit-reencoding). `TableScan.Reset(rgStart, rgEnd)` allows a single open `storage.Reader` to be repositioned without reopening the file, enabling pipeline reuse across morsels within a single worker.
 
-**Why 1024-row batches?** An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB, fitting in L1 (typically 32 KB on modern x86). Per-batch overhead (one `Next()` call, type assertions) amortizes over 1024 rows. Same constant used by Velox, DuckDB, and Photon.
+**Why 1024-row batches?** An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB, fitting comfortably in L1 (32–48 KB on x86, 128 KB on Apple M1 Pro performance cores). Per-batch overhead (one `Next()` call, type assertions) amortizes over 1024 rows. Same constant used by Velox, DuckDB, and Photon.
 
 **Why selection vectors instead of filtered batches?** `Filter` writes a `[]uint16` of surviving row indices rather than allocating new vectors. Downstream operators index through the selection vector, saving allocation on the hot path and preserving the 1024-row invariant across the pipeline.
 
-**Why little-endian?** The inner loop of every `TableScan` is `binary.LittleEndian.Uint64(buf[i*8:])` — on x86/ARM this compiles to a single `MOV`; big-endian forces `MOV+BSWAP`, penalizing column reads by ~10–20%.
+**Why little-endian?** The inner loop of every `TableScan` is `binary.LittleEndian.Uint64(buf[i*8:])` — on x86-64 this compiles to a single `MOVQ`; on ARM64 (M1 Pro) a single `LDR`. Big-endian forces an extra byte-reverse (`BSWAP`/`REV`), penalizing column reads by ~10–20%.
