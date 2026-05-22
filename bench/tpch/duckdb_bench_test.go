@@ -78,6 +78,9 @@ func TestSetupDuckDB(t *testing.T) {
 				l_shipmode     VARCHAR,
 				l_comment      VARCHAR
 			)`,
+			// _extra absorbs the trailing '|' that TPC-H dbgen appends to every row.
+			// We name it in the columns spec so DuckDB parses the file correctly,
+			// then simply omit it from the SELECT list — no EXCLUDE clause needed.
 			loadSQL: `INSERT INTO lineitem
 				SELECT l_orderkey,l_partkey,l_suppkey,l_linenumber,
 				       l_quantity,l_extendedprice,l_discount,l_tax,
@@ -94,7 +97,7 @@ func TestSetupDuckDB(t *testing.T) {
 					'l_receiptdate':'VARCHAR','l_shipinstruct':'VARCHAR',
 					'l_shipmode':'VARCHAR','l_comment':'VARCHAR',
 					'_extra':'VARCHAR'
-				}) EXCLUDE (_extra)`,
+				})`,
 		},
 		{
 			name: "orders",
@@ -118,7 +121,7 @@ func TestSetupDuckDB(t *testing.T) {
 					'o_orderdate':'VARCHAR','o_orderpriority':'VARCHAR',
 					'o_clerk':'VARCHAR','o_shippriority':'INTEGER',
 					'o_comment':'VARCHAR','_extra':'VARCHAR'
-				}) EXCLUDE (_extra)`,
+				})`,
 		},
 		{
 			name: "customer",
@@ -141,7 +144,7 @@ func TestSetupDuckDB(t *testing.T) {
 					'c_phone':'VARCHAR','c_acctbal':'DOUBLE',
 					'c_mktsegment':'VARCHAR','c_comment':'VARCHAR',
 					'_extra':'VARCHAR'
-				}) EXCLUDE (_extra)`,
+				})`,
 		},
 	}
 
