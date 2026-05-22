@@ -167,6 +167,17 @@ func (h *HashAggregate) consumeAll(ctx context.Context) error {
 // Uses AggExpr.AccumType to determine numeric encoding; no child schema needed.
 func (h *HashAggregate) accumulate(batch *Batch) error {
 	n := batch.Length
+
+	// Resolve each aggregate's source vector once per batch, not once per row.
+	// batch.Vectors[ae.ColIdx] is a slice index + interface load — cheap, but
+	// multiplied by len(aggExprs) × len(indices) it becomes a non-trivial cost.
+	aggVecs := make([]Vector, len(h.aggExprs))
+	for j, ae := range h.aggExprs {
+		if ae.ColIdx >= 0 {
+			aggVecs[j] = batch.Vectors[ae.ColIdx]
+		}
+	}
+
 	var indices []int
 	if batch.SelVec != nil {
 		indices = make([]int, len(batch.SelVec))
@@ -180,12 +191,16 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 		}
 	}
 
+	// Fast path: no GROUP BY eliminates per-row map lookup (e.g. Q6 SUM with no groups).
+	if len(h.groupBy) == 0 {
+		return h.accumulateDirect(indices, aggVecs)
+	}
+
 	for _, rowIdx := range indices {
 		key := h.buildKey(batch, rowIdx)
 		accs, exists := h.groups[key]
 		if !exists {
 			accs = make([]int64, len(h.aggExprs))
-			// Initialise MIN/MAX accumulators to identity values.
 			for j, ae := range h.aggExprs {
 				switch ae.Kind {
 				case AggMin:
@@ -204,41 +219,35 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 			}
 			h.groups[key] = accs
 			h.keys = append(h.keys, key)
-			// Store a representative row sample for reconstructing group-by values.
-			if len(h.groupBy) > 0 {
-				sample := make([]groupByVal, len(h.groupBy))
-				for si, colIdx := range h.groupBy {
-					v := batch.Vectors[colIdx]
-					if v.IsNull(rowIdx) {
-						sample[si] = groupByVal{isNull: true}
-					} else if sv, ok := v.(*StringVector); ok {
-						var s string
-						if sv.Dict != nil {
-							s = sv.Dict.Get(sv.Codes[rowIdx])
-						}
-						sample[si] = groupByVal{strVal: s}
-					} else {
-						sample[si] = groupByVal{bits: uint64(extractInt64(v, rowIdx))}
+			sample := make([]groupByVal, len(h.groupBy))
+			for si, colIdx := range h.groupBy {
+				v := batch.Vectors[colIdx]
+				if v.IsNull(rowIdx) {
+					sample[si] = groupByVal{isNull: true}
+				} else if sv, ok := v.(*StringVector); ok {
+					var s string
+					if sv.Dict != nil {
+						s = sv.Dict.Get(sv.Codes[rowIdx])
 					}
+					sample[si] = groupByVal{strVal: s}
+				} else {
+					sample[si] = groupByVal{bits: uint64(extractInt64(v, rowIdx))}
 				}
-				h.samples[key] = sample
 			}
+			h.samples[key] = sample
 		}
 		h.groupCnt[key]++
 
 		for j, ae := range h.aggExprs {
+			v := aggVecs[j] // hoisted: resolved once per batch above
 			switch ae.Kind {
 			case AggCount:
 				if ae.ColIdx < 0 {
 					accs[j]++
-				} else {
-					v := batch.Vectors[ae.ColIdx]
-					if !v.IsNull(rowIdx) {
-						accs[j]++
-					}
+				} else if !v.IsNull(rowIdx) {
+					accs[j]++
 				}
 			case AggSum:
-				v := batch.Vectors[ae.ColIdx]
 				if v.IsNull(rowIdx) {
 					continue
 				}
@@ -250,11 +259,9 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 					accs[j] += extractInt64(v, rowIdx)
 				}
 			case AggAvg:
-				v := batch.Vectors[ae.ColIdx]
 				if v.IsNull(rowIdx) {
 					continue
 				}
-				// AVG always accumulates as float64 bits.
 				if fv, ok := v.(*Float64Vector); ok {
 					cur := math.Float64frombits(uint64(accs[j]))
 					accs[j] = int64(math.Float64bits(cur + fv.Values[rowIdx]))
@@ -263,7 +270,6 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 					accs[j] = int64(math.Float64bits(cur + float64(extractInt64(v, rowIdx))))
 				}
 			case AggMin:
-				v := batch.Vectors[ae.ColIdx]
 				if v.IsNull(rowIdx) {
 					continue
 				}
@@ -272,13 +278,10 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 					if math.Float64frombits(uint64(val)) < math.Float64frombits(uint64(accs[j])) {
 						accs[j] = val
 					}
-				} else {
-					if val < accs[j] {
-						accs[j] = val
-					}
+				} else if val < accs[j] {
+					accs[j] = val
 				}
 			case AggMax:
-				v := batch.Vectors[ae.ColIdx]
 				if v.IsNull(rowIdx) {
 					continue
 				}
@@ -287,9 +290,132 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 					if math.Float64frombits(uint64(val)) > math.Float64frombits(uint64(accs[j])) {
 						accs[j] = val
 					}
+				} else if val > accs[j] {
+					accs[j] = val
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// accumulateDirect handles the no-GROUP-BY case (single implicit group "").
+// Skipping per-row map lookup and key serialisation is the dominant win for
+// queries like Q6 (SUM with no GROUP BY) — the inner loop reduces to a tight
+// float64 addition or integer increment with no hash overhead.
+func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error {
+	const key = ""
+	accs, exists := h.groups[key]
+	if !exists {
+		accs = make([]int64, len(h.aggExprs))
+		for j, ae := range h.aggExprs {
+			switch ae.Kind {
+			case AggMin:
+				if ae.AccumType == TypeFloat64 {
+					accs[j] = int64(math.Float64bits(math.MaxFloat64))
 				} else {
-					if val > accs[j] {
-						accs[j] = val
+					accs[j] = math.MaxInt64
+				}
+			case AggMax:
+				if ae.AccumType == TypeFloat64 {
+					accs[j] = int64(math.Float64bits(-math.MaxFloat64))
+				} else {
+					accs[j] = math.MinInt64
+				}
+			}
+		}
+		h.groups[key] = accs
+		h.keys = append(h.keys, key)
+	}
+	h.groupCnt[key] += int64(len(indices))
+
+	for j, ae := range h.aggExprs {
+		v := aggVecs[j]
+		switch ae.Kind {
+		case AggCount:
+			if ae.ColIdx < 0 {
+				accs[j] += int64(len(indices)) // COUNT(*): no per-row null check needed
+			} else {
+				for _, rowIdx := range indices {
+					if !v.IsNull(rowIdx) {
+						accs[j]++
+					}
+				}
+			}
+		case AggSum:
+			if ae.AccumType == TypeFloat64 {
+				fv := v.(*Float64Vector)
+				cur := math.Float64frombits(uint64(accs[j]))
+				for _, rowIdx := range indices {
+					if !fv.IsNull(rowIdx) {
+						cur += fv.Values[rowIdx] // tight loop: one float64 add per row
+					}
+				}
+				accs[j] = int64(math.Float64bits(cur))
+			} else {
+				for _, rowIdx := range indices {
+					if !v.IsNull(rowIdx) {
+						accs[j] += extractInt64(v, rowIdx)
+					}
+				}
+			}
+		case AggAvg:
+			if fv, ok := v.(*Float64Vector); ok {
+				cur := math.Float64frombits(uint64(accs[j]))
+				for _, rowIdx := range indices {
+					if !fv.IsNull(rowIdx) {
+						cur += fv.Values[rowIdx]
+					}
+				}
+				accs[j] = int64(math.Float64bits(cur))
+			} else {
+				cur := math.Float64frombits(uint64(accs[j]))
+				for _, rowIdx := range indices {
+					if !v.IsNull(rowIdx) {
+						cur += float64(extractInt64(v, rowIdx))
+					}
+				}
+				accs[j] = int64(math.Float64bits(cur))
+			}
+		case AggMin:
+			if ae.AccumType == TypeFloat64 {
+				fv := v.(*Float64Vector)
+				cur := math.Float64frombits(uint64(accs[j]))
+				for _, rowIdx := range indices {
+					if !fv.IsNull(rowIdx) {
+						if fv.Values[rowIdx] < cur {
+							cur = fv.Values[rowIdx]
+						}
+					}
+				}
+				accs[j] = int64(math.Float64bits(cur))
+			} else {
+				for _, rowIdx := range indices {
+					if !v.IsNull(rowIdx) {
+						if val := extractInt64(v, rowIdx); val < accs[j] {
+							accs[j] = val
+						}
+					}
+				}
+			}
+		case AggMax:
+			if ae.AccumType == TypeFloat64 {
+				fv := v.(*Float64Vector)
+				cur := math.Float64frombits(uint64(accs[j]))
+				for _, rowIdx := range indices {
+					if !fv.IsNull(rowIdx) {
+						if fv.Values[rowIdx] > cur {
+							cur = fv.Values[rowIdx]
+						}
+					}
+				}
+				accs[j] = int64(math.Float64bits(cur))
+			} else {
+				for _, rowIdx := range indices {
+					if !v.IsNull(rowIdx) {
+						if val := extractInt64(v, rowIdx); val > accs[j] {
+							accs[j] = val
+						}
 					}
 				}
 			}

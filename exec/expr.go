@@ -146,42 +146,326 @@ func evalCmp(op BinOpKind, lv, rv Vector, n int) (*BoolVector, error) {
 		NullBitmap: make([]byte, (n+7)/8),
 		Length:     n,
 	}
-	// Propagate nulls: output row is null if either input is null.
-	for i := 0; i < n; i++ {
-		if !lv.IsNull(i) && !rv.IsNull(i) {
-			storage.SetValidBit(out.NullBitmap, i)
+	// Byte-level null propagation: a row is valid only when both inputs are
+	// non-null. Processing 8 rows per iteration avoids per-row bit extraction.
+	la, ra := lv.Nulls(), rv.Nulls()
+	for i := range out.NullBitmap {
+		lb, rb := byte(0xFF), byte(0xFF)
+		if i < len(la) {
+			lb = la[i]
 		}
+		if i < len(ra) {
+			rb = ra[i]
+		}
+		out.NullBitmap[i] = lb & rb
 	}
 
 	switch l := lv.(type) {
 	case *Int64Vector:
-		r := rv.(*Int64Vector)
-		for i := 0; i < n; i++ {
-			if storage.IsNullBit(out.NullBitmap, i) {
-				continue
-			}
-			out.Set(i, cmpInt64(op, l.Values[i], r.Values[i]))
-		}
+		evalCmpInt64(op, l.Values, rv.(*Int64Vector).Values, out, n)
 	case *Float64Vector:
-		r := rv.(*Float64Vector)
-		for i := 0; i < n; i++ {
-			if storage.IsNullBit(out.NullBitmap, i) {
-				continue
-			}
-			out.Set(i, cmpFloat64(op, l.Values[i], r.Values[i]))
-		}
+		evalCmpFloat64(op, l.Values, rv.(*Float64Vector).Values, out, n)
 	case *DateVector:
-		r := rv.(*DateVector)
-		for i := 0; i < n; i++ {
-			if storage.IsNullBit(out.NullBitmap, i) {
-				continue
-			}
-			out.Set(i, cmpInt32(op, l.Values[i], r.Values[i]))
-		}
+		evalCmpDate(op, l.Values, rv.(*DateVector).Values, out, n)
 	default:
 		return nil, fmt.Errorf("expr: cmp not supported for type %T", lv)
 	}
 	return out, nil
+}
+
+// evalCmpInt64 writes comparison results into out.Bits 8 rows at a time.
+// The switch on op is hoisted outside the inner loop — the branch predictor
+// learns it on the first iteration and incurs zero misprediction cost thereafter.
+// Each outer iteration packs 8 boolean results into one byte and applies the
+// null mask in a single AND, replacing 8 separate bit-scatter operations.
+func evalCmpInt64(op BinOpKind, lv, rv []int64, out *BoolVector, n int) {
+	bits, mask := out.Bits, out.NullBitmap
+	i := 0
+	switch op {
+	case BinEQ:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] == rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] == rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] == rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] == rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] == rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] == rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] == rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] == rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinNE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] != rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] != rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] != rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] != rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] != rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] != rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] != rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] != rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinLT:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] < rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] < rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] < rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] < rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] < rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] < rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] < rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] < rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinLE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] <= rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] <= rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] <= rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] <= rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] <= rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] <= rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] <= rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] <= rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinGT:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] > rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] > rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] > rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] > rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] > rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] > rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] > rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] > rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinGE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] >= rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] >= rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] >= rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] >= rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] >= rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] >= rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] >= rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] >= rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	}
+	for ; i < n; i++ {
+		if !storage.IsNullBit(mask, i) {
+			out.Set(i, cmpInt64(op, lv[i], rv[i]))
+		}
+	}
+}
+
+// evalCmpFloat64 mirrors evalCmpInt64 for float64 columns (Q6 discount/quantity).
+func evalCmpFloat64(op BinOpKind, lv, rv []float64, out *BoolVector, n int) {
+	bits, mask := out.Bits, out.NullBitmap
+	i := 0
+	switch op {
+	case BinEQ:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] == rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] == rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] == rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] == rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] == rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] == rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] == rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] == rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinNE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] != rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] != rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] != rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] != rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] != rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] != rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] != rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] != rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinLT:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] < rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] < rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] < rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] < rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] < rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] < rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] < rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] < rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinLE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] <= rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] <= rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] <= rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] <= rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] <= rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] <= rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] <= rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] <= rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinGT:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] > rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] > rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] > rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] > rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] > rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] > rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] > rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] > rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinGE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] >= rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] >= rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] >= rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] >= rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] >= rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] >= rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] >= rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] >= rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	}
+	for ; i < n; i++ {
+		if !storage.IsNullBit(mask, i) {
+			out.Set(i, cmpFloat64(op, lv[i], rv[i]))
+		}
+	}
+}
+
+// evalCmpDate mirrors evalCmpInt64 for int32 date columns (Q1/Q6/Q3/Q12 date predicates).
+func evalCmpDate(op BinOpKind, lv, rv []int32, out *BoolVector, n int) {
+	bits, mask := out.Bits, out.NullBitmap
+	i := 0
+	switch op {
+	case BinEQ:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] == rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] == rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] == rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] == rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] == rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] == rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] == rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] == rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinNE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] != rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] != rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] != rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] != rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] != rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] != rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] != rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] != rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinLT:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] < rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] < rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] < rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] < rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] < rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] < rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] < rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] < rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinLE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] <= rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] <= rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] <= rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] <= rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] <= rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] <= rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] <= rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] <= rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinGT:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] > rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] > rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] > rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] > rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] > rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] > rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] > rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] > rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	case BinGE:
+		for ; i+8 <= n; i += 8 {
+			b := i >> 3
+			var byte_ uint8
+			if lv[i+0] >= rv[i+0] { byte_ |= 0x01 }
+			if lv[i+1] >= rv[i+1] { byte_ |= 0x02 }
+			if lv[i+2] >= rv[i+2] { byte_ |= 0x04 }
+			if lv[i+3] >= rv[i+3] { byte_ |= 0x08 }
+			if lv[i+4] >= rv[i+4] { byte_ |= 0x10 }
+			if lv[i+5] >= rv[i+5] { byte_ |= 0x20 }
+			if lv[i+6] >= rv[i+6] { byte_ |= 0x40 }
+			if lv[i+7] >= rv[i+7] { byte_ |= 0x80 }
+			bits[b] = byte_ & mask[b]
+		}
+	}
+	for ; i < n; i++ {
+		if !storage.IsNullBit(mask, i) {
+			out.Set(i, cmpInt32(op, lv[i], rv[i]))
+		}
+	}
 }
 
 func cmpInt64(op BinOpKind, a, b int64) bool {
