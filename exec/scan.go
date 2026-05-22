@@ -173,8 +173,24 @@ func (s *TableScan) payloadToVector(
 	switch field.Type {
 	case TypeInt64:
 		vals := make([]int64, rows)
-		for i := range vals {
-			vals[i] = int64(binary.LittleEndian.Uint64(payload[i*8:]))
+		// Reslice upfront: the compiler proves all reads are in-bounds and
+		// eliminates per-iteration bounds checks. Each 8-element iteration
+		// loads exactly 64 bytes — one L1 cache line — with 8 independent
+		// MOVs the CPU can pipeline (no carried dependency chain).
+		p8 := payload[:rows*8]
+		i := 0
+		for ; i+8 <= rows; i += 8 {
+			vals[i+0] = int64(binary.LittleEndian.Uint64(p8[(i+0)*8:]))
+			vals[i+1] = int64(binary.LittleEndian.Uint64(p8[(i+1)*8:]))
+			vals[i+2] = int64(binary.LittleEndian.Uint64(p8[(i+2)*8:]))
+			vals[i+3] = int64(binary.LittleEndian.Uint64(p8[(i+3)*8:]))
+			vals[i+4] = int64(binary.LittleEndian.Uint64(p8[(i+4)*8:]))
+			vals[i+5] = int64(binary.LittleEndian.Uint64(p8[(i+5)*8:]))
+			vals[i+6] = int64(binary.LittleEndian.Uint64(p8[(i+6)*8:]))
+			vals[i+7] = int64(binary.LittleEndian.Uint64(p8[(i+7)*8:]))
+		}
+		for ; i < rows; i++ {
+			vals[i] = int64(binary.LittleEndian.Uint64(p8[i*8:]))
 		}
 		nb := make([]byte, (rows+7)/8)
 		copy(nb, nullBitmap)
@@ -182,9 +198,21 @@ func (s *TableScan) payloadToVector(
 
 	case TypeFloat64:
 		vals := make([]float64, rows)
-		for i := range vals {
-			bits := binary.LittleEndian.Uint64(payload[i*8:])
-			vals[i] = math.Float64frombits(bits)
+		// Same bounds-check elimination and cache-line stride as TypeInt64.
+		p8 := payload[:rows*8]
+		i := 0
+		for ; i+8 <= rows; i += 8 {
+			vals[i+0] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+0)*8:]))
+			vals[i+1] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+1)*8:]))
+			vals[i+2] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+2)*8:]))
+			vals[i+3] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+3)*8:]))
+			vals[i+4] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+4)*8:]))
+			vals[i+5] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+5)*8:]))
+			vals[i+6] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+6)*8:]))
+			vals[i+7] = math.Float64frombits(binary.LittleEndian.Uint64(p8[(i+7)*8:]))
+		}
+		for ; i < rows; i++ {
+			vals[i] = math.Float64frombits(binary.LittleEndian.Uint64(p8[i*8:]))
 		}
 		nb := make([]byte, (rows+7)/8)
 		copy(nb, nullBitmap)
@@ -192,8 +220,29 @@ func (s *TableScan) payloadToVector(
 
 	case TypeDate:
 		vals := make([]int32, rows)
-		for i := range vals {
-			vals[i] = int32(binary.LittleEndian.Uint32(payload[i*4:]))
+		// 4-byte values: unroll 16 per iteration to fill one 64-byte cache line.
+		p4 := payload[:rows*4]
+		i := 0
+		for ; i+16 <= rows; i += 16 {
+			vals[i+0] = int32(binary.LittleEndian.Uint32(p4[(i+0)*4:]))
+			vals[i+1] = int32(binary.LittleEndian.Uint32(p4[(i+1)*4:]))
+			vals[i+2] = int32(binary.LittleEndian.Uint32(p4[(i+2)*4:]))
+			vals[i+3] = int32(binary.LittleEndian.Uint32(p4[(i+3)*4:]))
+			vals[i+4] = int32(binary.LittleEndian.Uint32(p4[(i+4)*4:]))
+			vals[i+5] = int32(binary.LittleEndian.Uint32(p4[(i+5)*4:]))
+			vals[i+6] = int32(binary.LittleEndian.Uint32(p4[(i+6)*4:]))
+			vals[i+7] = int32(binary.LittleEndian.Uint32(p4[(i+7)*4:]))
+			vals[i+8] = int32(binary.LittleEndian.Uint32(p4[(i+8)*4:]))
+			vals[i+9] = int32(binary.LittleEndian.Uint32(p4[(i+9)*4:]))
+			vals[i+10] = int32(binary.LittleEndian.Uint32(p4[(i+10)*4:]))
+			vals[i+11] = int32(binary.LittleEndian.Uint32(p4[(i+11)*4:]))
+			vals[i+12] = int32(binary.LittleEndian.Uint32(p4[(i+12)*4:]))
+			vals[i+13] = int32(binary.LittleEndian.Uint32(p4[(i+13)*4:]))
+			vals[i+14] = int32(binary.LittleEndian.Uint32(p4[(i+14)*4:]))
+			vals[i+15] = int32(binary.LittleEndian.Uint32(p4[(i+15)*4:]))
+		}
+		for ; i < rows; i++ {
+			vals[i] = int32(binary.LittleEndian.Uint32(p4[i*4:]))
 		}
 		nb := make([]byte, (rows+7)/8)
 		copy(nb, nullBitmap)
