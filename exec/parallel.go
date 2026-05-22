@@ -4,22 +4,51 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync/atomic"
 )
 
 // PipelineFactory creates an independent scan→filter→project pipeline covering
 // row groups [rgStart, rgEnd). The caller must call Close() on the result.
 type PipelineFactory func(ctx context.Context, rgStart, rgEnd int) (Operator, error)
 
-// ParallelHashAggregate runs one independent pipeline per worker goroutine on a
-// disjoint slice of row groups, accumulates partial aggregates locally, then
-// merges all partial results in the calling goroutine.
+// morselQueue is a lock-free work queue for morsel-driven parallelism.
+// Workers call claim() to atomically reserve the next chunk of row groups.
+// The atomic counter occupies its own 64-byte cache line so contention on
+// `next` does not cause false-sharing with any other struct fields.
+type morselQueue struct {
+	next atomic.Int64 // workers atomically advance this to claim morsels
+	_    [56]byte     // padding: atomic.Int64 is 8 B; 8+56 = 64 B (one cache line)
+	end  int64        // read-only after construction; no write contention
+}
+
+// claim reserves [start, stop) row groups of the given size.
+// Returns ok=false when the queue is exhausted.
+func (q *morselQueue) claim(size int64) (start, stop int64, ok bool) {
+	start = q.next.Add(size) - size
+	if start >= q.end {
+		return 0, 0, false
+	}
+	stop = start + size
+	if stop > q.end {
+		stop = q.end
+	}
+	return start, stop, true
+}
+
+// ParallelHashAggregate runs one goroutine per worker. Each goroutine
+// dynamically claims row-group morsels from a shared atomic counter, runs an
+// independent pipeline on each morsel, and accumulates partial results locally.
+// After all workers drain the queue the calling goroutine merges the partial
+// aggregates — no shared mutable state during execution.
 //
-// Supports the same GROUP BY / aggregate semantics as HashAggregate. The
-// delegate field is populated lazily on the first Next() call.
+// Unlike the previous static-partition design, workers self-schedule: a
+// goroutine whose morsels have high filter selectivity finishes fast and claims
+// more work, eliminating stragglers caused by uneven per-row-group cost.
 type ParallelHashAggregate struct {
 	factory    PipelineFactory
 	totalRGs   int
 	numWorkers int
+	morselSize int // row groups per morsel; 0 → defaultMorselSize (1)
 	groupBy    []int
 	aggExprs   []AggExpr
 	schema     Schema
@@ -27,13 +56,19 @@ type ParallelHashAggregate struct {
 	delegate *HashAggregate // populated after setup()
 }
 
+// defaultMorselSize is one row group (65,536 rows). At SF=1 a single lineitem
+// row group takes ~5–20 ms to scan+filter — contention on the atomic counter
+// is at most ~1000 CAS ops/sec across 10 workers, negligible overhead.
+const defaultMorselSize = 1
+
 // NewParallelHashAggregate constructs a ParallelHashAggregate.
-// totalRGs is the total number of row groups in the file;
+// morselSize is the number of row groups per morsel (0 = defaultMorselSize).
 // numWorkers is capped to totalRGs if larger.
 func NewParallelHashAggregate(
 	factory PipelineFactory,
 	totalRGs int,
 	numWorkers int,
+	morselSize int,
 	groupBy []int,
 	aggExprs []AggExpr,
 	schema Schema,
@@ -44,10 +79,14 @@ func NewParallelHashAggregate(
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
+	if morselSize < 1 {
+		morselSize = defaultMorselSize
+	}
 	return &ParallelHashAggregate{
 		factory:    factory,
 		totalRGs:   totalRGs,
 		numWorkers: numWorkers,
+		morselSize: morselSize,
 		groupBy:    groupBy,
 		aggExprs:   aggExprs,
 		schema:     schema,
@@ -68,54 +107,61 @@ func (p *ParallelHashAggregate) Next(ctx context.Context) (*Batch, error) {
 func (p *ParallelHashAggregate) Close() error { return nil }
 
 func (p *ParallelHashAggregate) setup(ctx context.Context) error {
-	chunks := partitionRGs(p.totalRGs, p.numWorkers)
-	if len(chunks) == 0 {
-		// Empty table: emit a merged aggregate with zero rows.
+	if p.totalRGs == 0 {
 		merged := newPartialAggregate(p.groupBy, p.aggExprs, p.schema)
 		merged.done = true
 		p.delegate = merged
 		return nil
 	}
 
+	q := &morselQueue{end: int64(p.totalRGs)}
+
 	type workerResult struct {
 		ha  *HashAggregate
 		err error
 	}
-	ch := make(chan workerResult, len(chunks))
+	// Buffer = numWorkers so goroutines never block on send even if we return early.
+	ch := make(chan workerResult, p.numWorkers)
 
-	for _, c := range chunks {
-		go func(rgStart, rgEnd int) {
-			pipeline, err := p.factory(ctx, rgStart, rgEnd)
-			if err != nil {
-				ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): factory: %w", rgStart, rgEnd, err)}
-				return
-			}
-			defer pipeline.Close()
-
+	msize := int64(p.morselSize)
+	for range p.numWorkers {
+		go func() {
 			ha := newPartialAggregate(p.groupBy, p.aggExprs, p.schema)
 			for {
-				batch, err := pipeline.Next(ctx)
+				start, stop, ok := q.claim(msize)
+				if !ok {
+					break // queue exhausted; this worker is done
+				}
+				pipeline, err := p.factory(ctx, int(start), int(stop))
 				if err != nil {
-					ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): %w", rgStart, rgEnd, err)}
+					ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): factory: %w", start, stop, err)}
 					return
 				}
-				if batch == nil {
-					break
+				for {
+					batch, err := pipeline.Next(ctx)
+					if err != nil {
+						pipeline.Close()
+						ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): %w", start, stop, err)}
+						return
+					}
+					if batch == nil {
+						break
+					}
+					if err := ha.accumulate(batch); err != nil {
+						pipeline.Close()
+						ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): accumulate: %w", start, stop, err)}
+						return
+					}
 				}
-				if err := ha.accumulate(batch); err != nil {
-					ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): accumulate: %w", rgStart, rgEnd, err)}
-					return
-				}
+				pipeline.Close()
 			}
 			ch <- workerResult{ha: ha}
-		}(c[0], c[1])
+		}()
 	}
 
-	// Collect all worker results before merging (channel is buffered to len(chunks)
-	// so goroutines never block even if we return early on error).
-	results := make([]*HashAggregate, 0, len(chunks))
+	results := make([]*HashAggregate, 0, p.numWorkers)
 	var firstErr error
-	for range chunks {
+	for range p.numWorkers {
 		r := <-ch
 		if r.err != nil && firstErr == nil {
 			firstErr = r.err
@@ -132,7 +178,7 @@ func (p *ParallelHashAggregate) setup(ctx context.Context) error {
 	for _, ha := range results {
 		mergePartialAgg(merged, ha)
 	}
-	merged.done = true // skip consumeAll in Next()
+	merged.done = true
 	p.delegate = merged
 	return nil
 }
@@ -210,26 +256,4 @@ func mergePartialAgg(dst, src *HashAggregate) {
 		// Always sum the row counts (used for AVG finalization and correctness).
 		dst.groupCnt[key] += src.groupCnt[key]
 	}
-}
-
-// partitionRGs splits [0, total) into up to workers contiguous chunks.
-// The last chunk absorbs the remainder. Returns [][2]int of {start, end} pairs.
-func partitionRGs(total, workers int) [][2]int {
-	if total == 0 || workers == 0 {
-		return nil
-	}
-	if workers > total {
-		workers = total
-	}
-	size := total / workers
-	chunks := make([][2]int, workers)
-	for i := range chunks {
-		start := i * size
-		end := start + size
-		if i == workers-1 {
-			end = total // last chunk absorbs remainder
-		}
-		chunks[i] = [2]int{start, end}
-	}
-	return chunks
 }

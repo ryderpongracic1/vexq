@@ -242,6 +242,16 @@ func (s *TableScan) closeRowGroup() {
 	s.crList = nil
 }
 
+// Reset repositions the scan to a new row-group range without reopening the
+// underlying storage file. Used by the work-stealing morsel scheduler so a
+// single open Reader can serve multiple morsel iterations.
+func (s *TableScan) Reset(rgStart, rgEnd int) {
+	s.closeRowGroup()
+	s.rgStart = rgStart
+	s.rgEnd = rgEnd
+	s.rgIdx = rgStart
+}
+
 func (s *TableScan) Close() error {
 	s.closeRowGroup()
 	return s.reader.Close()

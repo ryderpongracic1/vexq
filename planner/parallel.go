@@ -162,7 +162,9 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		return op, nil
 	}
 
-	return exec.NewParallelHashAggregate(factory, totalRGs, numWorkers, groupByIdxs, aggExprs, outSchema), nil
+	// morselSize=0 → exec package uses defaultMorselSize (1 row group).
+	// Tune via environment or query hints in future work.
+	return exec.NewParallelHashAggregate(factory, totalRGs, numWorkers, 0, groupByIdxs, aggExprs, outSchema), nil
 }
 
 // aggOutputSchema computes the output schema of a HashAggregate without needing
