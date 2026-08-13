@@ -348,6 +348,117 @@ func TestLikeExpr(t *testing.T) {
 	}
 }
 
+// ---- Limit with selection vector -------------------------------------------
+
+func TestLimitWithSelectionVector(t *testing.T) {
+	// Write a small file with 10 rows: id=[0..9], val=[0.0, 2.5, 5.0, ...]
+	const N = 10
+	path := writeTestFile(t, N)
+	r, err := storage.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Scan all rows, apply filter id >= 5 → selects physical positions [5,6,7,8,9]
+	scan, err := exec.NewTableScan(r, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pred := &exec.BinOp{
+		Op:    exec.BinGE,
+		Left:  &exec.ColumnRef{Name: "id", Idx: 0, T: exec.TypeInt64},
+		Right: &exec.Literal{Val: int64(5), T: exec.TypeInt64},
+		T:     exec.TypeBool,
+	}
+	filter, err := exec.NewFilter(scan, pred)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Apply LIMIT 2 — should yield values at positions 5 and 6, NOT 0 and 1.
+	limit := exec.NewLimit(filter, 2)
+	defer limit.Close()
+
+	batch, err := limit.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch == nil {
+		t.Fatal("expected a batch, got nil")
+	}
+	if batch.Length != 2 {
+		t.Fatalf("expected Length=2, got %d", batch.Length)
+	}
+
+	// Read the id values through the selection vector.
+	idVec := batch.Vectors[0].(*exec.Int64Vector)
+	for i := 0; i < batch.Length; i++ {
+		idx := i
+		if batch.SelVec != nil {
+			idx = int(batch.SelVec[i])
+		}
+		got := idVec.Values[idx]
+		want := int64(5 + i) // expect id=5, id=6
+		if got != want {
+			t.Errorf("row %d: got id=%d, want id=%d", i, got, want)
+		}
+	}
+
+	// Should be exhausted after LIMIT 2.
+	batch2, err := limit.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch2 != nil {
+		t.Fatal("expected nil after limit exhausted")
+	}
+}
+
+func TestLimitWithoutFilter(t *testing.T) {
+	// Verify LIMIT without upstream filter still works correctly (regression).
+	const N = 100
+	path := writeTestFile(t, N)
+	r, err := storage.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scan, err := exec.NewTableScan(r, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	limit := exec.NewLimit(scan, 3)
+	defer limit.Close()
+
+	total := 0
+	for {
+		batch, err := limit.Next(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if batch == nil {
+			break
+		}
+		idVec := batch.Vectors[0].(*exec.Int64Vector)
+		for i := 0; i < batch.Length; i++ {
+			idx := i
+			if batch.SelVec != nil {
+				idx = int(batch.SelVec[i])
+			}
+			got := idVec.Values[idx]
+			want := int64(total + i)
+			if got != want {
+				t.Errorf("row %d: got id=%d, want id=%d", total+i, got, want)
+			}
+		}
+		total += batch.Length
+	}
+	if total != 3 {
+		t.Fatalf("expected 3 total rows, got %d", total)
+	}
+}
+
 // ---- BenchmarkScanFilterProject --------------------------------------------
 
 func BenchmarkScanFilterProject(b *testing.B) {

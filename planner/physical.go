@@ -210,6 +210,10 @@ func resolveAggConfig(n *LogicalAggregate, schema exec.Schema) (groupByIdxs []in
 		default:
 			return nil, nil, fmt.Errorf("planner: unknown aggregate %q", agg.Func)
 		}
+		// Validate that the column was found for non-COUNT(*) aggregates.
+		if ae.ColIdx == -1 && !(ae.Kind == exec.AggCount && agg.ColName == "") {
+			return nil, nil, fmt.Errorf("planner: aggregate column %q not found in schema", agg.ColName)
+		}
 		// Set AccumType for SUM/MIN/MAX based on source column type.
 		if ae.Kind == exec.AggSum || ae.Kind == exec.AggMin || ae.Kind == exec.AggMax {
 			if ae.ColIdx >= 0 && schema.Fields[ae.ColIdx].Type == exec.TypeFloat64 {

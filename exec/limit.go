@@ -7,7 +7,7 @@ import (
 
 // Limit passes at most N rows from its child.
 type Limit struct {
-	child    Operator
+	child     Operator
 	remaining int
 }
 
@@ -33,11 +33,17 @@ func (l *Limit) Next(ctx context.Context) (*Batch, error) {
 		return batch, nil
 	}
 	// Truncate the batch.
-	sel := make(SelectionVector, l.remaining)
-	for i := range sel {
-		sel[i] = uint16(i)
+	if batch.SelVec != nil {
+		// Preserve the upstream filter's selection vector — just slice it.
+		batch.SelVec = batch.SelVec[:l.remaining]
+	} else {
+		// No upstream filter; create sequential indices.
+		sel := make(SelectionVector, l.remaining)
+		for i := range sel {
+			sel[i] = uint16(i)
+		}
+		batch.SelVec = sel
 	}
-	batch.SelVec = sel
 	batch.Length = l.remaining
 	l.remaining = 0
 	return batch, nil
