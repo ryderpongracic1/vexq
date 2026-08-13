@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/ryderpongracic1/vexq/catalog"
@@ -105,5 +106,76 @@ func TestBuildHavingWithWhereKeepsSeparate(t *testing.T) {
 	_, ok = whereFilter.Child.(*LogicalScan)
 	if !ok {
 		t.Fatalf("expected WHERE child to be *LogicalScan, got %T", whereFilter.Child)
+	}
+}
+
+func TestCrossJoinReturnsError(t *testing.T) {
+	cat := mustNewCatalog()
+	cat.Register("a", "", storage.Schema{
+		Fields: []storage.Field{
+			{Name: "id", Type: storage.TypeInt64},
+			{Name: "val", Type: storage.TypeString},
+		},
+	})
+	cat.Register("b", "", storage.Schema{
+		Fields: []storage.Field{
+			{Name: "x", Type: storage.TypeInt64},
+			{Name: "y", Type: storage.TypeString},
+		},
+	})
+
+	p := sql.NewParser("SELECT * FROM a, b")
+	node, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	stmt := node.(*sql.SelectStmt)
+
+	_, err = Build(context.Background(), stmt, cat)
+	if err == nil {
+		t.Fatal("expected error for cross join (no join condition), got nil")
+	}
+
+	// Verify the error message is informative.
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "cross joins are not supported") {
+		t.Fatalf("expected error about cross joins, got: %s", errMsg)
+	}
+}
+
+func TestValidJoinStillWorks(t *testing.T) {
+	cat := mustNewCatalog()
+	cat.Register("a", "", storage.Schema{
+		Fields: []storage.Field{
+			{Name: "a_id", Type: storage.TypeInt64},
+			{Name: "val", Type: storage.TypeString},
+		},
+	})
+	cat.Register("b", "", storage.Schema{
+		Fields: []storage.Field{
+			{Name: "b_id", Type: storage.TypeInt64},
+			{Name: "name", Type: storage.TypeString},
+		},
+	})
+
+	p := sql.NewParser("SELECT * FROM a, b WHERE a_id = b_id")
+	node, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	stmt := node.(*sql.SelectStmt)
+
+	plan, err := Build(context.Background(), stmt, cat)
+	if err != nil {
+		t.Fatalf("expected valid join to succeed, got error: %v", err)
+	}
+
+	// Verify we got a join node.
+	join, ok := plan.(*LogicalJoin)
+	if !ok {
+		t.Fatalf("expected root to be *LogicalJoin, got %T", plan)
+	}
+	if join.Condition == nil {
+		t.Fatal("expected join condition to be non-nil")
 	}
 }

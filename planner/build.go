@@ -39,7 +39,11 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 		}
 	} else {
 		// Multi-table: split WHERE into join conditions and per-table filters.
-		root = buildMultiTablePlan(scans, schemas, stmt.Where)
+		var err error
+		root, err = buildMultiTablePlan(scans, schemas, stmt.Where)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// GROUP BY / aggregates.
@@ -87,7 +91,7 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 // buildMultiTablePlan builds a left-deep join tree from multiple table scans,
 // pushing single-table predicates into each scan and join conditions into
 // LogicalJoin nodes.
-func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.Expr) LogicalNode {
+func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.Expr) (LogicalNode, error) {
 	// Map column name → table index for all tables.
 	colTable := make(map[string]int)
 	for i, s := range schemas {
@@ -186,7 +190,7 @@ type joinCondPair struct {
 }
 
 // buildJoinTree builds a left-deep join tree from the given scans and join conditions.
-func buildJoinTree(scans []*LogicalScan, joinConds []sql.Expr, colTable map[string]int) LogicalNode {
+func buildJoinTree(scans []*LogicalScan, joinConds []sql.Expr, colTable map[string]int) (LogicalNode, error) {
 	// Parse join conditions into pairs.
 	pairs := make([]joinCondPair, 0, len(joinConds))
 	for _, cond := range joinConds {
@@ -234,21 +238,15 @@ func buildJoinTree(scans []*LogicalScan, joinConds []sql.Expr, colTable map[stri
 			break
 		}
 		if !joined {
-			// No join condition found — add the first unincluded table as a cross join.
+			// No join condition found — cross joins not yet supported.
 			for i := range scans {
 				if !included[i] {
-					root = &LogicalJoin{
-						Left:      root,
-						Right:     scans[i],
-						Condition: &sql.BinaryExpr{Op: sql.OpEQ, Left: &sql.IntLiteral{Value: 1}, Right: &sql.IntLiteral{Value: 1}},
-					}
-					included[i] = true
-					break
+					return nil, fmt.Errorf("planner: no join condition connects table %q to the query; cross joins are not supported", scans[i].TableName)
 				}
 			}
 		}
 	}
-	return root
+	return root, nil
 }
 
 func buildProject(child LogicalNode, stmt *sql.SelectStmt) (*LogicalProject, error) {
