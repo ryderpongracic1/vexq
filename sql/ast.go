@@ -8,12 +8,14 @@ type Node interface{ nodeTag() }
 
 // SelectStmt represents a SELECT ... FROM ... WHERE ... GROUP BY ... ORDER BY ... LIMIT ...
 type SelectStmt struct {
-	Columns []SelectColumn // projections (or * for all)
-	From    []TableRef     // one or more tables (comma-separated implicit cross join)
-	Where   Expr           // nil if absent
-	GroupBy []Expr         // nil if absent
-	OrderBy []OrderByItem
-	Limit   *int64 // nil if absent
+	Distinct bool           // SELECT DISTINCT
+	Columns  []SelectColumn // projections (or * for all)
+	From     []TableRef     // one or more tables (comma-separated implicit cross join)
+	Where    Expr           // nil if absent
+	Having   Expr           // nil if absent (post-aggregate filter)
+	GroupBy  []Expr         // nil if absent
+	OrderBy  []OrderByItem
+	Limit    *int64 // nil if absent
 }
 
 func (*SelectStmt) nodeTag() {}

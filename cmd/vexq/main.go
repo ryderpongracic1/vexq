@@ -225,16 +225,38 @@ func runFsck(path string) error {
 				colErrors++
 				continue
 			}
+
+			f := schema.Fields[col]
+
+			// Validate dictionary for string columns (once per row group).
+			if f.Type == storage.TypeString {
+				if _, dictErr := cr.Dictionary(); dictErr != nil {
+					fmt.Printf("  ERROR: row group %d col %d: dictionary: %v\n", rg, col, dictErr)
+					colErrors++
+				}
+			}
+
 			blockNum := 0
 			for {
-				_, _, _, err := cr.NextBlock(ctx)
+				_, payload, _, err := cr.NextBlock(ctx)
 				if errors.Is(err, io.EOF) {
 					break
 				}
 				if err != nil {
 					fmt.Printf("  ERROR: row group %d col %d block %d: %v\n", rg, col, blockNum, err)
 					colErrors++
+					blockNum++
+					continue
 				}
+
+				// Validate bool RLE decoding.
+				if f.Type == storage.TypeBool {
+					if _, _, _, decErr := storage.DecodeRLEBool(payload); decErr != nil {
+						fmt.Printf("  ERROR: row group %d col %d block %d: bool decode: %v\n", rg, col, blockNum, decErr)
+						colErrors++
+					}
+				}
+
 				blockNum++
 			}
 			cr.Close()

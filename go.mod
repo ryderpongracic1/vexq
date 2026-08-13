@@ -1,6 +1,6 @@
 module github.com/ryderpongracic1/vexq
 
-go 1.26.2
+go 1.22
 
 require (
 	github.com/apache/arrow-go/v18 v18.1.0 // indirect
