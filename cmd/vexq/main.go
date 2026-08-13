@@ -2,8 +2,8 @@
 //
 // Usage:
 //
-//	vexq <file.vxq> "SELECT ..."   – execute a SQL query against a .vxq file
-//	vexq fsck <file.vxq>           – validate file integrity (CRC, footer, zone maps)
+//	vexq [--workers=N] <file.vxq> [file2.vxq ...] "SELECT ..."  – execute a SQL query
+//	vexq fsck <file.vxq>                                         – validate file integrity
 package main
 
 import (
@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -34,32 +35,91 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vexq <file.vxq> \"SELECT ...\" | vexq fsck <file.vxq>")
+		return fmt.Errorf("usage: vexq [--workers=N] <file.vxq> [file2.vxq ...] \"SELECT ...\" | vexq fsck <file.vxq>")
 	}
-	if args[0] == "fsck" {
-		if len(args) < 2 {
+
+	// Parse optional flags before positional args.
+	workers := 0 // 0 = serial (default)
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--workers" && i+1 < len(args):
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return fmt.Errorf("invalid --workers value: %s", args[i+1])
+			}
+			workers = n
+			i++ // skip next arg
+		case strings.HasPrefix(args[i], "--workers="):
+			n, err := strconv.Atoi(strings.TrimPrefix(args[i], "--workers="))
+			if err != nil {
+				return fmt.Errorf("invalid --workers value: %s", args[i])
+			}
+			workers = n
+		case args[i] == "-w" && i+1 < len(args):
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return fmt.Errorf("invalid -w value: %s", args[i+1])
+			}
+			workers = n
+			i++ // skip next arg
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+
+	if len(positional) == 0 {
+		return fmt.Errorf("usage: vexq [--workers=N] <file.vxq> [file2.vxq ...] \"SELECT ...\" | vexq fsck <file.vxq>")
+	}
+
+	// Handle fsck subcommand.
+	if positional[0] == "fsck" {
+		if len(positional) < 2 {
 			return fmt.Errorf("fsck requires a .vxq file argument")
 		}
-		return runFsck(args[1])
+		return runFsck(positional[1])
 	}
-	if len(args) < 2 {
-		return fmt.Errorf("usage: vexq <file.vxq> \"SELECT ...\"")
+
+	// Need at least one file and a query string.
+	if len(positional) < 2 {
+		return fmt.Errorf("usage: vexq [--workers=N] <file.vxq> [file2.vxq ...] \"SELECT ...\"")
 	}
-	return runQuery(args[0], args[1])
+
+	// Last arg is the query, everything before is a file path.
+	query := positional[len(positional)-1]
+	files := positional[:len(positional)-1]
+
+	return runQuery(files, query, workers)
 }
 
 // ---- query -----------------------------------------------------------------
 
-func runQuery(path, query string) error {
+func runQuery(paths []string, query string, workers int) error {
 	ctx := context.Background()
 
-	// Derive table name from filename (strip extension and directory).
-	base := filepath.Base(path)
-	tableName := strings.TrimSuffix(base, filepath.Ext(base))
+	// Build table name → file path mapping from positional file args.
+	tables := make(map[string]string, len(paths))
+	for _, p := range paths {
+		base := filepath.Base(p)
+		tableName := strings.TrimSuffix(base, filepath.Ext(base))
+		if existing, dup := tables[tableName]; dup {
+			return fmt.Errorf("duplicate table name %q: %s and %s", tableName, existing, p)
+		}
+		tables[tableName] = p
+	}
 
-	cat, err := catalog.OpenSingle(ctx, tableName, path)
+	var cat *catalog.Catalog
+	var err error
+	if len(tables) == 1 {
+		// Single table: use OpenSingle for backward compatibility.
+		for name, p := range tables {
+			cat, err = catalog.OpenSingle(ctx, name, p)
+		}
+	} else {
+		cat, err = catalog.OpenMulti(ctx, tables)
+	}
 	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
+		return fmt.Errorf("open catalog: %w", err)
 	}
 
 	p := sql.NewParser(query)
@@ -78,7 +138,12 @@ func runQuery(path, query string) error {
 	}
 	logical = planner.Optimize(logical)
 
-	op, err := planner.Physical(ctx, logical)
+	var op exec.Operator
+	if workers > 0 {
+		op, err = planner.Parallel(ctx, logical, workers)
+	} else {
+		op, err = planner.Physical(ctx, logical)
+	}
 	if err != nil {
 		return fmt.Errorf("physical: %w", err)
 	}
