@@ -311,7 +311,18 @@ func physicalJoin(ctx context.Context, n *LogicalJoin) (exec.Operator, error) {
 func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 	switch x := e.(type) {
 	case *sql.ColumnRefExpr:
-		idx := schema.IndexOf(x.Name)
+		// Try qualified lookup first (table.col), then bare name.
+		idx := -1
+		if x.Table != "" {
+			idx = schema.IndexOf(x.Table + "." + x.Name)
+			if idx < 0 {
+				// Fall back to bare name — after join planning, the output
+				// schema may carry only unqualified names.
+				idx = schema.IndexOf(x.Name)
+			}
+		} else {
+			idx = schema.IndexOf(x.Name)
+		}
 		if idx < 0 {
 			return nil, fmt.Errorf("planner: column %q not found in schema", x.Name)
 		}
