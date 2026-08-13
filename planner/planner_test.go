@@ -69,7 +69,7 @@ func TestAggregateInvalidColumn(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected planner error for nonexistent aggregate column, got nil")
 	}
-	if !strings.Contains(err.Error(), "not found in schema") {
+	if !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }

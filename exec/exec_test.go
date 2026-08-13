@@ -502,3 +502,257 @@ func BenchmarkScanFilterProject(b *testing.B) {
 		_, _ = io.Discard.Write(nil)
 	}
 }
+
+// ---- Aggregate null semantics tests ----------------------------------------
+
+// makeFloat64VecWithNulls creates a Float64Vector with specified values and null positions.
+func makeFloat64VecWithNulls(vals []float64, nulls []int) *exec.Float64Vector {
+	n := len(vals)
+	bmp := storage.FullBitmap(n)
+	for _, idx := range nulls {
+		storage.SetNullBit(bmp, idx)
+	}
+	return &exec.Float64Vector{Values: vals, NullBitmap: bmp}
+}
+
+// makeInt64VecWithNulls creates an Int64Vector with specified values and null positions.
+func makeInt64VecWithNulls(vals []int64, nulls []int) *exec.Int64Vector {
+	n := len(vals)
+	bmp := storage.FullBitmap(n)
+	for _, idx := range nulls {
+		storage.SetNullBit(bmp, idx)
+	}
+	return &exec.Int64Vector{Values: vals, NullBitmap: bmp}
+}
+
+// singleBatchOp is a trivial operator that yields one batch then EOF.
+type singleBatchOp struct {
+	batch *exec.Batch
+	done  bool
+}
+
+func (s *singleBatchOp) Next(ctx context.Context) (*exec.Batch, error) {
+	if s.done {
+		return nil, nil
+	}
+	s.done = true
+	return s.batch, nil
+}
+func (s *singleBatchOp) Schema() exec.Schema { return s.batch.Schema }
+func (s *singleBatchOp) Close() error         { return nil }
+
+// emptyOp is an operator that yields no batches (empty input).
+type emptyOp struct {
+	schema exec.Schema
+}
+
+func (e *emptyOp) Next(ctx context.Context) (*exec.Batch, error) { return nil, nil }
+func (e *emptyOp) Schema() exec.Schema                           { return e.schema }
+func (e *emptyOp) Close() error                                  { return nil }
+
+func TestAvgWithNulls(t *testing.T) {
+	// AVG over [1.0, NULL, 3.0] should return 2.0 (not 1.33)
+	vec := makeFloat64VecWithNulls([]float64{1.0, 0.0, 3.0}, []int{1})
+	batch := &exec.Batch{
+		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeFloat64, Nullable: true}}},
+		Vectors: []exec.Vector{vec},
+		Length:  3,
+	}
+	child := &singleBatchOp{batch: batch}
+	agg, err := exec.NewHashAggregate(child, nil, []exec.AggExpr{
+		{Kind: exec.AggAvg, ColIdx: 0, OutName: "avg_val", AccumType: exec.TypeFloat64},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agg.Close()
+
+	result, err := agg.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("expected one output row, got nil")
+	}
+	if result.Length != 1 {
+		t.Fatalf("expected 1 row, got %d", result.Length)
+	}
+
+	fv := result.Vectors[0].(*exec.Float64Vector)
+	if fv.IsNull(0) {
+		t.Fatal("AVG should not be null when there are non-null inputs")
+	}
+	got := fv.Values[0]
+	want := 2.0 // (1.0 + 3.0) / 2 non-null values
+	if got != want {
+		t.Errorf("AVG([1, NULL, 3]) = %v, want %v", got, want)
+	}
+}
+
+func TestSumAllNull(t *testing.T) {
+	// SUM over [NULL, NULL, NULL] should return NULL
+	vec := makeFloat64VecWithNulls([]float64{0, 0, 0}, []int{0, 1, 2})
+	batch := &exec.Batch{
+		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeFloat64, Nullable: true}}},
+		Vectors: []exec.Vector{vec},
+		Length:  3,
+	}
+	child := &singleBatchOp{batch: batch}
+	agg, err := exec.NewHashAggregate(child, nil, []exec.AggExpr{
+		{Kind: exec.AggSum, ColIdx: 0, OutName: "sum_val", AccumType: exec.TypeFloat64},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agg.Close()
+
+	result, err := agg.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("expected one output row, got nil")
+	}
+
+	fv := result.Vectors[0].(*exec.Float64Vector)
+	if !fv.IsNull(0) {
+		t.Errorf("SUM over all-null should be NULL, got %v", fv.Values[0])
+	}
+}
+
+func TestMinMaxAllNull(t *testing.T) {
+	// MIN/MAX over [NULL, NULL] should return NULL
+	vec := makeInt64VecWithNulls([]int64{0, 0}, []int{0, 1})
+	batch := &exec.Batch{
+		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeInt64, Nullable: true}}},
+		Vectors: []exec.Vector{vec},
+		Length:  2,
+	}
+
+	for _, kind := range []exec.AggKind{exec.AggMin, exec.AggMax} {
+		name := "MIN"
+		if kind == exec.AggMax {
+			name = "MAX"
+		}
+		t.Run(name, func(t *testing.T) {
+			child := &singleBatchOp{batch: batch}
+			// Reset done flag for reuse
+			child.done = false
+			agg, err := exec.NewHashAggregate(child, nil, []exec.AggExpr{
+				{Kind: kind, ColIdx: 0, OutName: "agg_val", AccumType: exec.TypeInt64},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer agg.Close()
+
+			result, err := agg.Next(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result == nil {
+				t.Fatal("expected one output row")
+			}
+
+			iv := result.Vectors[0].(*exec.Int64Vector)
+			if !iv.IsNull(0) {
+				t.Errorf("%s over all-null should be NULL, got %d", name, iv.Values[0])
+			}
+		})
+	}
+}
+
+func TestEmptyTableAggregate(t *testing.T) {
+	// Global aggregate over empty input: COUNT(*)=0, SUM=NULL
+	schema := exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeFloat64, Nullable: true}}}
+	child := &emptyOp{schema: schema}
+	agg, err := exec.NewHashAggregate(child, nil, []exec.AggExpr{
+		{Kind: exec.AggCount, ColIdx: -1, OutName: "cnt", AccumType: exec.TypeInt64},
+		{Kind: exec.AggSum, ColIdx: 0, OutName: "sum_val", AccumType: exec.TypeFloat64},
+		{Kind: exec.AggAvg, ColIdx: 0, OutName: "avg_val", AccumType: exec.TypeFloat64},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agg.Close()
+
+	result, err := agg.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("global aggregate over empty input should emit one row")
+	}
+	if result.Length != 1 {
+		t.Fatalf("expected 1 row, got %d", result.Length)
+	}
+
+	// COUNT(*) should be 0, not NULL
+	cntVec := result.Vectors[0].(*exec.Int64Vector)
+	if cntVec.IsNull(0) {
+		t.Error("COUNT(*) over empty input should not be NULL")
+	}
+	if cntVec.Values[0] != 0 {
+		t.Errorf("COUNT(*) over empty input = %d, want 0", cntVec.Values[0])
+	}
+
+	// SUM should be NULL
+	sumVec := result.Vectors[1].(*exec.Float64Vector)
+	if !sumVec.IsNull(0) {
+		t.Errorf("SUM over empty input should be NULL, got %v", sumVec.Values[0])
+	}
+
+	// AVG should be NULL
+	avgVec := result.Vectors[2].(*exec.Float64Vector)
+	if !avgVec.IsNull(0) {
+		t.Errorf("AVG over empty input should be NULL, got %v", avgVec.Values[0])
+	}
+
+	// Second call should return nil (EOF)
+	result2, err := agg.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result2 != nil {
+		t.Error("second Next() should return nil after emitting the single global row")
+	}
+}
+
+func TestCountColumnWithNulls(t *testing.T) {
+	// COUNT(col) skips nulls: [1, NULL, 3, NULL, 5] → COUNT=3
+	vec := makeInt64VecWithNulls([]int64{1, 0, 3, 0, 5}, []int{1, 3})
+	batch := &exec.Batch{
+		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeInt64, Nullable: true}}},
+		Vectors: []exec.Vector{vec},
+		Length:  5,
+	}
+	child := &singleBatchOp{batch: batch}
+	agg, err := exec.NewHashAggregate(child, nil, []exec.AggExpr{
+		{Kind: exec.AggCount, ColIdx: 0, OutName: "cnt_val", AccumType: exec.TypeInt64},
+		{Kind: exec.AggCount, ColIdx: -1, OutName: "cnt_star", AccumType: exec.TypeInt64},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agg.Close()
+
+	result, err := agg.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("expected one output row")
+	}
+
+	// COUNT(col) should be 3 (skips 2 nulls)
+	cntCol := result.Vectors[0].(*exec.Int64Vector)
+	if cntCol.Values[0] != 3 {
+		t.Errorf("COUNT(col) with 2 nulls in 5 rows = %d, want 3", cntCol.Values[0])
+	}
+
+	// COUNT(*) should be 5 (counts all rows regardless of nulls)
+	cntStar := result.Vectors[1].(*exec.Int64Vector)
+	if cntStar.Values[0] != 5 {
+		t.Errorf("COUNT(*) = %d, want 5", cntStar.Values[0])
+	}
+}

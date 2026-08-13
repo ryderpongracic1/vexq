@@ -212,6 +212,12 @@ func mergePartialAgg(dst, src *HashAggregate) {
 			dst.groups[key] = copied
 			dst.keys = append(dst.keys, key)
 			dst.samples[key] = src.samples[key]
+			// Deep-copy non-null counts.
+			if srcNN := src.aggNonNull[key]; srcNN != nil {
+				copiedNN := make([]int64, len(srcNN))
+				copy(copiedNN, srcNN)
+				dst.aggNonNull[key] = copiedNN
+			}
 		} else {
 			for j, ae := range dst.aggExprs {
 				switch ae.Kind {
@@ -253,7 +259,13 @@ func mergePartialAgg(dst, src *HashAggregate) {
 				}
 			}
 		}
-		// Always sum the row counts (used for AVG finalization and correctness).
+		// Merge non-null counts.
+		if dstNN, srcNN := dst.aggNonNull[key], src.aggNonNull[key]; dstNN != nil && srcNN != nil {
+			for j := range dstNN {
+				dstNN[j] += srcNN[j]
+			}
+		}
+		// Always sum the row counts (legacy).
 		dst.groupCnt[key] += src.groupCnt[key]
 	}
 }
