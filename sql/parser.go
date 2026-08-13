@@ -36,6 +36,12 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 
 	stmt := &SelectStmt{}
 
+	// DISTINCT keyword immediately after SELECT.
+	if tok, _ := p.peek(); tok.Kind == TokDISTINCT {
+		p.next()
+		stmt.Distinct = true
+	}
+
 	// Parse column list.
 	cols, err := p.parseSelectColumns()
 	if err != nil {
@@ -82,18 +88,14 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.GroupBy = groupBy
 	}
 
-	// HAVING (parsed but attached to WHERE for now — combined with AND).
+	// HAVING — post-aggregate filter.
 	if tok, _ := p.peek(); tok.Kind == TokHAVING {
 		p.next()
 		havingExpr, err := p.parseExpr(0)
 		if err != nil {
 			return nil, err
 		}
-		if stmt.Where == nil {
-			stmt.Where = havingExpr
-		} else {
-			stmt.Where = &BinaryExpr{Op: OpAnd, Left: stmt.Where, Right: havingExpr}
-		}
+		stmt.Having = havingExpr
 	}
 
 	// ORDER BY.
@@ -132,10 +134,6 @@ func (p *Parser) parseSelectColumns() ([]SelectColumn, error) {
 		}
 
 		var sc SelectColumn
-		// DISTINCT (skip for now — treat as no-op).
-		if tok.Kind == TokDISTINCT {
-			p.next()
-		}
 
 		expr, err := p.parseExpr(0)
 		if err != nil {

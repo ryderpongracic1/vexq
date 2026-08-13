@@ -30,6 +30,8 @@ func Physical(ctx context.Context, node LogicalNode) (exec.Operator, error) {
 		return physicalLimit(ctx, n)
 	case *LogicalJoin:
 		return physicalJoin(ctx, n)
+	case *LogicalDistinct:
+		return physicalDistinct(ctx, n)
 	case nil:
 		return nil, fmt.Errorf("planner: nil logical node")
 	}
@@ -252,6 +254,14 @@ func physicalLimit(ctx context.Context, n *LogicalLimit) (exec.Operator, error) 
 		return nil, err
 	}
 	return exec.NewLimit(child, int(n.Count)), nil
+}
+
+func physicalDistinct(ctx context.Context, n *LogicalDistinct) (exec.Operator, error) {
+	child, err := Physical(ctx, n.Child)
+	if err != nil {
+		return nil, err
+	}
+	return exec.NewDistinct(child), nil
 }
 
 func physicalJoin(ctx context.Context, n *LogicalJoin) (exec.Operator, error) {
