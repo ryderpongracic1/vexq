@@ -179,3 +179,11 @@ func exprName(e sql.Expr) string {
 		return fmt.Sprintf("%T", e)
 	}
 }
+
+// LogicalDistinct deduplicates rows.
+type LogicalDistinct struct {
+	Child LogicalNode
+}
+
+func (*LogicalDistinct) logicalTag()                    {}
+func (d *LogicalDistinct) OutputSchema() exec.Schema { return d.Child.OutputSchema() }

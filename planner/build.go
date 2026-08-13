@@ -66,6 +66,11 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 		}
 	}
 
+	// DISTINCT — deduplicate after projection/aggregation but before ORDER BY/LIMIT.
+	if stmt.Distinct {
+		root = &LogicalDistinct{Child: root}
+	}
+
 	// ORDER BY.
 	if len(stmt.OrderBy) > 0 {
 		root = &LogicalSort{Child: root, OrderBy: stmt.OrderBy}
@@ -267,6 +272,9 @@ func buildAggregate(child LogicalNode, stmt *sql.SelectStmt) (*LogicalAggregate,
 		ae, ok := col.Expr.(*sql.AggFuncExpr)
 		if !ok {
 			continue // group-by columns handled separately
+		}
+		if ae.Distinct {
+			return nil, fmt.Errorf("planner: DISTINCT aggregates not yet supported (e.g. %s(DISTINCT ...))", ae.Func)
 		}
 		alias := col.Alias
 		if alias == "" {
