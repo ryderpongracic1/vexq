@@ -34,6 +34,7 @@ catalog/       — Table registry with lazy schema loading from .vxq footer
 storage/       — .vxq file format: writer, reader, block codec, zone maps
 internal/encoding — Little-endian primitives, CRC32-IEEE helpers
 bench/tpch     — TPC-H Q1/Q3/Q6/Q12 benchmarks vs SQLite and DuckDB
+bench/simd_filter — Isolated AVX2 filter kernel benchmark (ceiling measurement)
 ```
 
 ## Hardware-Level Architecture
@@ -97,15 +98,20 @@ Custom columnar format designed for vectorized reads:
 
 ```sql
 SELECT expr [AS alias], ...
-FROM table
+FROM table [alias] [, table2 [alias2], ...]
 [WHERE condition]
 [GROUP BY col, ...]
+[HAVING condition]
 [ORDER BY col [ASC|DESC], ...]
 [LIMIT n]
 
+-- Joins: implicit inner join via FROM t1, t2 WHERE t1.key = t2.key
+-- Column references: unqualified (col), qualified (table.col), aliased (alias.col)
+-- Ambiguous columns: error when an unqualified name exists in multiple tables
+-- Cross joins: explicitly rejected — every table must connect via an equi-join condition
 -- Aggregate functions: COUNT(*), COUNT(col), SUM, AVG, MIN, MAX
 -- Predicates: =, <>, <, <=, >, >=, AND, OR, NOT, BETWEEN, IN, LIKE, IS NULL
--- Expressions: arithmetic (+, -, *, /), CASE WHEN, unary minus
+-- Expressions: arithmetic (+, -, *, /), CASE WHEN, DISTINCT, unary minus
 ```
 
 ## Usage
@@ -253,6 +259,9 @@ perf stat -e cache-misses,cache-references,branch-misses \
 | 6 | TPC-H benchmark harness vs SQLite | ✅ Complete |
 | 7 | Morsel-driven parallelism — `ParallelHashAggregate`, `planner.Parallel()` | ✅ Complete |
 | 8 | DuckDB honest baseline + hot-loop unrolling + work-stealing scheduler | ✅ Complete |
+| 9 | Multi-table joins — qualified columns, alias resolution, cross-join rejection | ✅ Complete |
+| 10 | CLI multi-file queries + `--workers` parallel flag | ✅ Complete |
+| 11 | SIMD filter kernel benchmark — AVX2 ceiling measurement ([`bench/simd_filter/`](bench/simd_filter/)) | ✅ Complete |
 
 ## Design Notes
 
