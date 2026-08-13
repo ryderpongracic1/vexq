@@ -117,6 +117,12 @@ vexqgen lineitem lineitem.tbl lineitem.vxq
 # Run a query
 vexq lineitem.vxq "SELECT l_returnflag, COUNT(*) FROM lineitem GROUP BY l_returnflag"
 
+# Run a query with parallel execution (4 workers)
+vexq --workers=4 lineitem.vxq "SELECT l_returnflag, COUNT(*) FROM lineitem GROUP BY l_returnflag"
+
+# Multi-table join query
+vexq lineitem.vxq orders.vxq "SELECT o_orderkey, l_quantity FROM orders, lineitem WHERE o_orderkey = l_orderkey LIMIT 10"
+
 # Validate file integrity (CRC, footer, zone maps)
 vexq fsck lineitem.vxq
 ```

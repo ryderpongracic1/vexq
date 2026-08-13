@@ -39,7 +39,12 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 		}
 	} else {
 		// Multi-table: split WHERE into join conditions and per-table filters.
-		root = buildMultiTablePlan(scans, schemas, stmt.Where)
+		var err error
+		// Pass stmt.From so symbolTable can resolve qualified column references (table.col).
+		root, err = buildMultiTablePlan(scans, schemas, stmt.Where, stmt.From)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// GROUP BY / aggregates.
@@ -84,15 +89,139 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 	return root, nil
 }
 
+// qualifiedCol records the position of a column within the multi-table context.
+type qualifiedCol struct {
+	tableIdx int
+	colIdx   int
+}
+
+// symbolTable maps qualified "table.col" and unqualified "col" names to their
+// positions across all tables in a FROM clause.
+type symbolTable struct {
+	qualified   map[string]qualifiedCol // "tableName.colName" → location
+	unqualified map[string]qualifiedCol // "colName" → location (only if unambiguous)
+	ambiguous   map[string]bool         // "colName" → true if appears in multiple tables
+	tableNames  []string                // table name (or alias) for each index
+}
+
+// newSymbolTable builds a symbol table from the given schemas and table refs.
+func newSymbolTable(schemas []exec.Schema, tableRefs []sql.TableRef) *symbolTable {
+	st := &symbolTable{
+		qualified:   make(map[string]qualifiedCol),
+		unqualified: make(map[string]qualifiedCol),
+		ambiguous:   make(map[string]bool),
+		tableNames:  make([]string, len(schemas)),
+	}
+	for i, ref := range tableRefs {
+		name := ref.Alias
+		if name == "" {
+			name = ref.Name
+		}
+		st.tableNames[i] = name
+		for j, f := range schemas[i].Fields {
+			qc := qualifiedCol{tableIdx: i, colIdx: j}
+			st.qualified[name+"."+f.Name] = qc
+			if st.ambiguous[f.Name] {
+				continue
+			}
+			if existing, exists := st.unqualified[f.Name]; exists {
+				if existing.tableIdx != i {
+					st.ambiguous[f.Name] = true
+					delete(st.unqualified, f.Name)
+				}
+			} else {
+				st.unqualified[f.Name] = qc
+			}
+		}
+	}
+	return st
+}
+
+// resolve looks up a column reference in the symbol table.
+func (st *symbolTable) resolve(ref *sql.ColumnRefExpr) (qualifiedCol, error) {
+	if ref.Table != "" {
+		key := ref.Table + "." + ref.Name
+		qc, ok := st.qualified[key]
+		if !ok {
+			return qualifiedCol{}, fmt.Errorf("column %q not found in table %q", ref.Name, ref.Table)
+		}
+		return qc, nil
+	}
+	if st.ambiguous[ref.Name] {
+		return qualifiedCol{}, fmt.Errorf("column %q is ambiguous; qualify with table name", ref.Name)
+	}
+	qc, ok := st.unqualified[ref.Name]
+	if !ok {
+		return qualifiedCol{}, fmt.Errorf("column %q not found in any table", ref.Name)
+	}
+	return qc, nil
+}
+
+// resolveTableIdx returns the table index for a column reference.
+func (st *symbolTable) resolveTableIdx(ref *sql.ColumnRefExpr) (int, bool) {
+	qc, err := st.resolve(ref)
+	if err != nil {
+		return 0, false
+	}
+	return qc.tableIdx, true
+}
+
+// predicateColRefs collects all ColumnRefExpr nodes from an expression tree.
+func predicateColRefs(e sql.Expr) []*sql.ColumnRefExpr {
+	if e == nil {
+		return nil
+	}
+	var refs []*sql.ColumnRefExpr
+	collectColRefs(e, &refs)
+	return refs
+}
+
+func collectColRefs(e sql.Expr, out *[]*sql.ColumnRefExpr) {
+	if e == nil {
+		return
+	}
+	switch x := e.(type) {
+	case *sql.ColumnRefExpr:
+		*out = append(*out, x)
+	case *sql.BinaryExpr:
+		collectColRefs(x.Left, out)
+		collectColRefs(x.Right, out)
+	case *sql.UnaryExpr:
+		collectColRefs(x.Expr, out)
+	case *sql.IsNullExpr:
+		collectColRefs(x.Expr, out)
+	case *sql.BetweenExpr:
+		collectColRefs(x.Expr, out)
+		collectColRefs(x.Lo, out)
+		collectColRefs(x.Hi, out)
+	case *sql.InExpr:
+		collectColRefs(x.Expr, out)
+		for _, item := range x.List {
+			collectColRefs(item, out)
+		}
+	case *sql.CaseExpr:
+		for _, w := range x.Whens {
+			collectColRefs(w.Cond, out)
+			collectColRefs(w.Result, out)
+		}
+		collectColRefs(x.Else, out)
+	case *sql.AggFuncExpr:
+		collectColRefs(x.Arg, out)
+	}
+}
+
 // buildMultiTablePlan builds a left-deep join tree from multiple table scans,
 // pushing single-table predicates into each scan and join conditions into
 // LogicalJoin nodes.
-func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.Expr) LogicalNode {
-	// Map column name → table index for all tables.
-	colTable := make(map[string]int)
-	for i, s := range schemas {
-		for _, f := range s.Fields {
-			colTable[f.Name] = i
+func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.Expr, tableRefs []sql.TableRef) (LogicalNode, error) {
+	st := newSymbolTable(schemas, tableRefs)
+
+	// Validate all column references in WHERE upfront.
+	if where != nil {
+		for _, ref := range predicateColRefs(where) {
+			if _, err := st.resolve(ref); err != nil {
+				return nil, fmt.Errorf("planner: %w", err)
+			}
 		}
 	}
 
@@ -101,17 +230,16 @@ func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.
 	var joinConds []sql.Expr
 	if where != nil {
 		for _, term := range flattenAnd(where) {
-			lt, rt, ok := isEqualityJoinCond(term, colTable)
+			lt, rt, ok := isEqualityJoinCond(term, st)
 			if ok {
 				_ = lt
 				_ = rt
 				joinConds = append(joinConds, term)
 			} else {
-				// Find which table(s) this term references.
-				cols := predicateCols(term)
+				refs := predicateColRefs(term)
 				tableSet := make(map[int]bool)
-				for _, col := range cols {
-					if t, found := colTable[col]; found {
+				for _, ref := range refs {
+					if t, found := st.resolveTableIdx(ref); found {
 						tableSet[t] = true
 					}
 				}
@@ -120,10 +248,6 @@ func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.
 						perTableFilters[t] = andExpr(perTableFilters[t], term)
 					}
 				}
-				// Predicates crossing multiple tables that are not equality join
-				// conditions (e.g. l_commitdate < l_receiptdate on same table) are
-				// handled by the single-table branch above; genuine cross-table
-				// non-equality conditions are rare in TPC-H and left as future work.
 			}
 		}
 	}
@@ -135,8 +259,8 @@ func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.
 		}
 	}
 
-	// Build left-deep join tree.
-	return buildJoinTree(scans, joinConds, colTable)
+	// Build left-deep join tree; returns error for disconnected (cross-join) tables.
+	return buildJoinTree(scans, joinConds, st)
 }
 
 // flattenAnd flattens a nested AND tree into a list of terms.
@@ -161,7 +285,7 @@ func andExpr(a, b sql.Expr) sql.Expr {
 
 // isEqualityJoinCond returns true if e is a col1 = col2 predicate where col1 and
 // col2 belong to different tables.
-func isEqualityJoinCond(e sql.Expr, colTable map[string]int) (leftTable, rightTable int, ok bool) {
+func isEqualityJoinCond(e sql.Expr, st *symbolTable) (leftTable, rightTable int, ok bool) {
 	bin, isBin := e.(*sql.BinaryExpr)
 	if !isBin || bin.Op != sql.OpEQ {
 		return 0, 0, false
@@ -171,8 +295,8 @@ func isEqualityJoinCond(e sql.Expr, colTable map[string]int) (leftTable, rightTa
 	if !lok || !rok {
 		return 0, 0, false
 	}
-	lt, lfound := colTable[lCR.Name]
-	rt, rfound := colTable[rCR.Name]
+	lt, lfound := st.resolveTableIdx(lCR)
+	rt, rfound := st.resolveTableIdx(rCR)
 	if !lfound || !rfound || lt == rt {
 		return 0, 0, false
 	}
@@ -185,17 +309,20 @@ type joinCondPair struct {
 	leftCol, rightCol     string
 }
 
-// buildJoinTree builds a left-deep join tree from the given scans and join conditions.
-func buildJoinTree(scans []*LogicalScan, joinConds []sql.Expr, colTable map[string]int) LogicalNode {
+// buildJoinTree builds a left-deep join tree using symbolTable for column resolution.
+// Returns an error if tables cannot be connected (cross joins unsupported).
+func buildJoinTree(scans []*LogicalScan, joinConds []sql.Expr, st *symbolTable) (LogicalNode, error) {
 	// Parse join conditions into pairs.
 	pairs := make([]joinCondPair, 0, len(joinConds))
 	for _, cond := range joinConds {
 		bin := cond.(*sql.BinaryExpr)
 		lCR := bin.Left.(*sql.ColumnRefExpr)
 		rCR := bin.Right.(*sql.ColumnRefExpr)
+		lt, _ := st.resolveTableIdx(lCR)
+		rt, _ := st.resolveTableIdx(rCR)
 		pairs = append(pairs, joinCondPair{
-			leftTable:  colTable[lCR.Name],
-			rightTable: colTable[rCR.Name],
+			leftTable:  lt,
+			rightTable: rt,
 			leftCol:    lCR.Name,
 			rightCol:   rCR.Name,
 		})
@@ -234,21 +361,15 @@ func buildJoinTree(scans []*LogicalScan, joinConds []sql.Expr, colTable map[stri
 			break
 		}
 		if !joined {
-			// No join condition found — add the first unincluded table as a cross join.
+			// No join condition found — cross joins not yet supported.
 			for i := range scans {
 				if !included[i] {
-					root = &LogicalJoin{
-						Left:      root,
-						Right:     scans[i],
-						Condition: &sql.BinaryExpr{Op: sql.OpEQ, Left: &sql.IntLiteral{Value: 1}, Right: &sql.IntLiteral{Value: 1}},
-					}
-					included[i] = true
-					break
+					return nil, fmt.Errorf("planner: no join condition connects table %q to the query; cross joins are not supported", scans[i].TableName)
 				}
 			}
 		}
 	}
-	return root
+	return root, nil
 }
 
 func buildProject(child LogicalNode, stmt *sql.SelectStmt) (*LogicalProject, error) {
