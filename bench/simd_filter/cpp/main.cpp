@@ -121,7 +121,8 @@ static BenchResult bench_i64(const int64_t* data, size_t n, int64_t threshold,
         for (size_t off = 0; off < n; off += BATCH_SIZE) {
             size_t batch_n = std::min(BATCH_SIZE, n - off);
             sel = fn(data + off, batch_n, threshold, indices.data());
-            (void)sel;  // prevent optimizing away
+            // Compiler barrier: prevents dead-code elimination even under LTO/inlining.
+            asm volatile("" : : "r"(sel) : "memory");
         }
     }
     auto end = Clock::now();
@@ -151,7 +152,8 @@ static BenchResult bench_i32(const int32_t* data, size_t n, int32_t threshold,
         for (size_t off = 0; off < n; off += BATCH_SIZE) {
             size_t batch_n = std::min(BATCH_SIZE, n - off);
             sel = fn(data + off, batch_n, threshold, indices.data());
-            (void)sel;
+            // Compiler barrier: prevents dead-code elimination even under LTO/inlining.
+            asm volatile("" : : "r"(sel) : "memory");
         }
     }
     auto end = Clock::now();

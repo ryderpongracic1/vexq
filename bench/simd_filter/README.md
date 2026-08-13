@@ -12,6 +12,8 @@ Isolated measurement of the filter-predicate comparison + selection-vector-build
 | **C++ AVX2 int64 intrinsics** | 2.44 | **3.3×** |
 | C++ AVX2 int32 (secondary, 8 lanes) | 1.46 | 5.6× |
 
+Numbers are medians of 3 runs; roughly ±5% run-to-run variance observed on this host (an independent re-run measured 2.57 ns/row for the AVX2 int64 kernel vs the reported 2.44, i.e. 3.2–3.3× vs Go either way).
+
 **Primary kernel is int64** — this matches vexq's `Int64Vector`, which is the internal integer representation used in `evalCmpInt64` (the hot comparison loop in `exec/expr.go`). The int32 result is a secondary data point showing the benefit of 8-wide vs 4-wide SIMD lanes.
 
 ## Measurement Context

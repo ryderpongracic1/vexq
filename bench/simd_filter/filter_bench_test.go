@@ -69,6 +69,12 @@ func generateData(path string, n int) ([]int64, error) {
 // This is the same unrolled 8-at-a-time comparison loop from exec/expr.go
 // that produces a BoolVector (packed bits), followed by the BoolToSelVec
 // conversion to produce the selection vector.
+//
+// Methodology note: this benchmark holds the comparison threshold in a scalar
+// register, whereas the real engine's evalCmpInt64 loads rv[i] per element from
+// a broadcast vector. The measured Go ns/row is therefore slightly optimistic;
+// the true engine gap vs the C++ SIMD kernel may be marginally larger than
+// reported.
 
 func filterGtI64(data []int64, n int, thresh int64, bits []byte) {
 	// Exact replica of evalCmpInt64 BinGT case from exec/expr.go

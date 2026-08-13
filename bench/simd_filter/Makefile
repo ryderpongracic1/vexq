@@ -11,6 +11,9 @@
 
 CXX      := g++
 CXXFLAGS := -std=c++17 -O3 -mavx2 -Wall -Wextra
+# -mavx2 is required so explicit AVX2 intrinsics in the same binary compile;
+# -fno-tree-vectorize/-fno-tree-loop-vectorize prevent auto-vectorization of the
+# scalar functions, so scalar-novec numbers are honestly non-vectorized.
 NOVEC_FLAGS := -std=c++17 -O3 -mavx2 -fno-tree-vectorize -fno-tree-loop-vectorize -Wall -Wextra
 
 SRC      := cpp/filter_kernel.cpp cpp/main.cpp
