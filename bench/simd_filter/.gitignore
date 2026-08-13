@@ -1,0 +1,7 @@
+# Generated benchmark binaries
+filter_bench
+filter_bench_novec
+
+# Generated data files (regenerate with `make gendata`)
+bench_data_i64.bin
+bench_data_i32.bin

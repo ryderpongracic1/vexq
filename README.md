@@ -173,7 +173,7 @@ DuckDB is a state-of-the-art embedded analytical engine backed by multi-decade r
 
 ### What's left on the table
 
-- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops — likely 4–8× improvement on filter-heavy queries.
+- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops — likely 4–8× improvement on filter-heavy queries. See [`bench/simd_filter/`](bench/simd_filter/) for an isolated measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row in Go (3.3× speedup)** on the filter comparison kernel alone.
 - **Parallel hash join**: Extend `planner.Parallel()` to detect join shapes and partition the build side.
 - **Late materialization**: Avoid decoding non-predicate columns until after the filter selection vector is built — saves decode work proportional to filter selectivity.
 - **Adaptive compression**: Delta encoding for sorted integer columns (timestamps, order keys) could improve decode throughput and reduce I/O.
