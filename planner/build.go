@@ -50,6 +50,11 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 			return nil, err
 		}
 		root = agg
+
+		// HAVING — post-aggregate filter applied after aggregation.
+		if stmt.Having != nil {
+			root = &LogicalFilter{Child: root, Predicate: stmt.Having}
+		}
 	} else {
 		// Project.
 		if !isSelectStar(stmt.Columns) {
