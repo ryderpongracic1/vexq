@@ -47,10 +47,11 @@ type HashAggregate struct {
 	schema   Schema
 
 	// internal state
-	keys     []string              // serialised group-by keys in insertion order
-	groups   map[string][]int64    // key → per-aggregate accumulators
-	groupCnt map[string]int64      // key → count of rows in group (for AVG)
-	samples  map[string][]groupByVal // key → representative group-by values
+	keys       []string                // serialised group-by keys in insertion order
+	groups     map[string][]int64      // key → per-aggregate accumulators
+	groupCnt   map[string]int64        // key → count of rows in group (legacy)
+	aggNonNull map[string][]int64      // key → per-aggregate non-null input count
+	samples    map[string][]groupByVal // key → representative group-by values
 	done   bool
 	outPos int
 }
@@ -108,9 +109,10 @@ func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashA
 		groupBy:  groupBy,
 		aggExprs: resolved,
 		schema:   Schema{Fields: outFields},
-		groups:   make(map[string][]int64),
-		groupCnt: make(map[string]int64),
-		samples:  make(map[string][]groupByVal),
+		groups:     make(map[string][]int64),
+		groupCnt:   make(map[string]int64),
+		aggNonNull: make(map[string][]int64),
+		samples:    make(map[string][]groupByVal),
 	}, nil
 }
 
@@ -122,6 +124,12 @@ func (h *HashAggregate) Next(ctx context.Context) (*Batch, error) {
 			return nil, err
 		}
 		h.done = true
+
+		// Empty-input global aggregate: no GROUP BY, no rows consumed.
+		// SQL requires exactly one output row: COUNT=0, NULL for SUM/AVG/MIN/MAX.
+		if len(h.keys) == 0 && len(h.groupBy) == 0 {
+			return h.buildEmptyGlobalResult(), nil
+		}
 	}
 
 	if h.outPos >= len(h.keys) {
@@ -144,6 +152,7 @@ func (h *HashAggregate) initMaps() {
 	h.keys = nil
 	h.groups = make(map[string][]int64)
 	h.groupCnt = make(map[string]int64)
+	h.aggNonNull = make(map[string][]int64)
 	h.samples = make(map[string][]groupByVal)
 }
 
@@ -218,6 +227,7 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				}
 			}
 			h.groups[key] = accs
+			h.aggNonNull[key] = make([]int64, len(h.aggExprs))
 			h.keys = append(h.keys, key)
 			sample := make([]groupByVal, len(h.groupBy))
 			for si, colIdx := range h.groupBy {
@@ -236,21 +246,24 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 			}
 			h.samples[key] = sample
 		}
-		h.groupCnt[key]++
 
+		nonNull := h.aggNonNull[key]
 		for j, ae := range h.aggExprs {
 			v := aggVecs[j] // hoisted: resolved once per batch above
 			switch ae.Kind {
 			case AggCount:
 				if ae.ColIdx < 0 {
 					accs[j]++
+					nonNull[j]++
 				} else if !v.IsNull(rowIdx) {
 					accs[j]++
+					nonNull[j]++
 				}
 			case AggSum:
 				if v.IsNull(rowIdx) {
 					continue
 				}
+				nonNull[j]++
 				if ae.AccumType == TypeFloat64 {
 					fv := v.(*Float64Vector)
 					cur := math.Float64frombits(uint64(accs[j]))
@@ -262,6 +275,7 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				if v.IsNull(rowIdx) {
 					continue
 				}
+				nonNull[j]++
 				if fv, ok := v.(*Float64Vector); ok {
 					cur := math.Float64frombits(uint64(accs[j]))
 					accs[j] = int64(math.Float64bits(cur + fv.Values[rowIdx]))
@@ -273,6 +287,7 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				if v.IsNull(rowIdx) {
 					continue
 				}
+				nonNull[j]++
 				val := extractInt64(v, rowIdx)
 				if ae.AccumType == TypeFloat64 {
 					if math.Float64frombits(uint64(val)) < math.Float64frombits(uint64(accs[j])) {
@@ -285,6 +300,7 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				if v.IsNull(rowIdx) {
 					continue
 				}
+				nonNull[j]++
 				val := extractInt64(v, rowIdx)
 				if ae.AccumType == TypeFloat64 {
 					if math.Float64frombits(uint64(val)) > math.Float64frombits(uint64(accs[j])) {
@@ -325,9 +341,11 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 			}
 		}
 		h.groups[key] = accs
+		h.aggNonNull[key] = make([]int64, len(h.aggExprs))
 		h.keys = append(h.keys, key)
 	}
-	h.groupCnt[key] += int64(len(indices))
+
+	nonNull := h.aggNonNull[key]
 
 	for j, ae := range h.aggExprs {
 		v := aggVecs[j]
@@ -335,10 +353,12 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 		case AggCount:
 			if ae.ColIdx < 0 {
 				accs[j] += int64(len(indices)) // COUNT(*): no per-row null check needed
+				nonNull[j] += int64(len(indices))
 			} else {
 				for _, rowIdx := range indices {
 					if !v.IsNull(rowIdx) {
 						accs[j]++
+						nonNull[j]++
 					}
 				}
 			}
@@ -348,7 +368,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				cur := math.Float64frombits(uint64(accs[j]))
 				for _, rowIdx := range indices {
 					if !fv.IsNull(rowIdx) {
-						cur += fv.Values[rowIdx] // tight loop: one float64 add per row
+						cur += fv.Values[rowIdx]
+						nonNull[j]++
 					}
 				}
 				accs[j] = int64(math.Float64bits(cur))
@@ -356,6 +377,7 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				for _, rowIdx := range indices {
 					if !v.IsNull(rowIdx) {
 						accs[j] += extractInt64(v, rowIdx)
+						nonNull[j]++
 					}
 				}
 			}
@@ -365,6 +387,7 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				for _, rowIdx := range indices {
 					if !fv.IsNull(rowIdx) {
 						cur += fv.Values[rowIdx]
+						nonNull[j]++
 					}
 				}
 				accs[j] = int64(math.Float64bits(cur))
@@ -373,6 +396,7 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				for _, rowIdx := range indices {
 					if !v.IsNull(rowIdx) {
 						cur += float64(extractInt64(v, rowIdx))
+						nonNull[j]++
 					}
 				}
 				accs[j] = int64(math.Float64bits(cur))
@@ -386,6 +410,7 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 						if fv.Values[rowIdx] < cur {
 							cur = fv.Values[rowIdx]
 						}
+						nonNull[j]++
 					}
 				}
 				accs[j] = int64(math.Float64bits(cur))
@@ -395,6 +420,7 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 						if val := extractInt64(v, rowIdx); val < accs[j] {
 							accs[j] = val
 						}
+						nonNull[j]++
 					}
 				}
 			}
@@ -407,6 +433,7 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 						if fv.Values[rowIdx] > cur {
 							cur = fv.Values[rowIdx]
 						}
+						nonNull[j]++
 					}
 				}
 				accs[j] = int64(math.Float64bits(cur))
@@ -416,6 +443,7 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 						if val := extractInt64(v, rowIdx); val > accs[j] {
 							accs[j] = val
 						}
+						nonNull[j]++
 					}
 				}
 			}
@@ -472,7 +500,8 @@ func (h *HashAggregate) buildOutputBatch(keys []string) *Batch {
 	// Aggregate columns.
 	for j, ae := range h.aggExprs {
 		switch ae.Kind {
-		case AggCount, AggSum, AggMin, AggMax:
+		case AggCount:
+			// COUNT never returns NULL.
 			if ae.AccumType == TypeFloat64 {
 				fOut := &Float64Vector{Values: make([]float64, n), NullBitmap: storage.FullBitmap(n)}
 				for i, key := range keys {
@@ -486,12 +515,41 @@ func (h *HashAggregate) buildOutputBatch(keys []string) *Batch {
 				}
 				vecs[outIdx] = out
 			}
+		case AggSum, AggMin, AggMax:
+			// SUM/MIN/MAX return NULL when all inputs were null.
+			if ae.AccumType == TypeFloat64 {
+				fOut := &Float64Vector{Values: make([]float64, n), NullBitmap: storage.FullBitmap(n)}
+				for i, key := range keys {
+					if h.aggNonNull[key][j] == 0 {
+						fOut.Values[i] = 0
+						storage.SetNullBit(fOut.NullBitmap, i)
+					} else {
+						fOut.Values[i] = math.Float64frombits(uint64(h.groups[key][j]))
+					}
+				}
+				vecs[outIdx] = fOut
+			} else {
+				out := &Int64Vector{Values: make([]int64, n), NullBitmap: storage.FullBitmap(n)}
+				for i, key := range keys {
+					if h.aggNonNull[key][j] == 0 {
+						out.Values[i] = 0
+						storage.SetNullBit(out.NullBitmap, i)
+					} else {
+						out.Values[i] = h.groups[key][j]
+					}
+				}
+				vecs[outIdx] = out
+			}
 		case AggAvg:
+			// AVG divides by non-null count; returns NULL when no non-null inputs.
 			fOut := &Float64Vector{Values: make([]float64, n), NullBitmap: storage.FullBitmap(n)}
 			for i, key := range keys {
-				cnt := h.groupCnt[key]
+				cnt := h.aggNonNull[key][j]
 				if cnt > 0 {
 					fOut.Values[i] = math.Float64frombits(uint64(h.groups[key][j])) / float64(cnt)
+				} else {
+					fOut.Values[i] = 0
+					storage.SetNullBit(fOut.NullBitmap, i)
 				}
 			}
 			vecs[outIdx] = fOut
@@ -500,6 +558,30 @@ func (h *HashAggregate) buildOutputBatch(keys []string) *Batch {
 	}
 
 	return &Batch{Schema: h.schema, Vectors: vecs, Length: n}
+}
+
+// buildEmptyGlobalResult creates a single-row batch for a global aggregate
+// (no GROUP BY) that consumed zero input rows. SQL requires:
+//   - COUNT -> 0 (never NULL)
+//   - SUM/AVG/MIN/MAX -> NULL
+func (h *HashAggregate) buildEmptyGlobalResult() *Batch {
+	vecs := make([]Vector, len(h.aggExprs))
+	for j, ae := range h.aggExprs {
+		switch ae.Kind {
+		case AggCount:
+			vecs[j] = &Int64Vector{Values: []int64{0}, NullBitmap: storage.FullBitmap(1)}
+		case AggSum, AggMin, AggMax:
+			if ae.AccumType == TypeFloat64 {
+				vecs[j] = &Float64Vector{Values: []float64{0}, NullBitmap: make([]byte, 1)}
+			} else {
+				vecs[j] = &Int64Vector{Values: []int64{0}, NullBitmap: make([]byte, 1)}
+			}
+		case AggAvg:
+			vecs[j] = &Float64Vector{Values: []float64{0}, NullBitmap: make([]byte, 1)}
+		}
+	}
+	h.outPos = 1 // mark as emitted so subsequent Next returns nil
+	return &Batch{Schema: h.schema, Vectors: vecs, Length: 1}
 }
 
 // buildGroupByVector reconstructs the group-by column values from stored samples.

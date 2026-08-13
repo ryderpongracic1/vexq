@@ -184,3 +184,79 @@ ORDER BY
 		t.Fatalf("expected 2 ORDER BY items, got %d", len(stmt.OrderBy))
 	}
 }
+
+func TestParseHaving(t *testing.T) {
+	stmt := mustParse(t, "SELECT a, COUNT(*) AS cnt FROM t GROUP BY a HAVING cnt > 5")
+
+	// HAVING should be stored in stmt.Having, not stmt.Where.
+	if stmt.Having == nil {
+		t.Fatal("expected HAVING clause to be set")
+	}
+	if stmt.Where != nil {
+		t.Fatal("HAVING should not pollute stmt.Where")
+	}
+
+	// The HAVING expression should be a BinaryExpr (cnt > 5).
+	bin, ok := stmt.Having.(*BinaryExpr)
+	if !ok {
+		t.Fatalf("expected BinaryExpr for HAVING, got %T", stmt.Having)
+	}
+	if bin.Op != OpGT {
+		t.Fatalf("expected > operator, got %s", bin.Op)
+	}
+
+	// Left side should be a column reference "cnt".
+	col, ok := bin.Left.(*ColumnRefExpr)
+	if !ok {
+		t.Fatalf("expected ColumnRefExpr on left, got %T", bin.Left)
+	}
+	if col.Name != "cnt" {
+		t.Fatalf("expected column name 'cnt', got %q", col.Name)
+	}
+
+	// Right side should be integer literal 5.
+	lit, ok := bin.Right.(*IntLiteral)
+	if !ok {
+		t.Fatalf("expected IntLiteral on right, got %T", bin.Right)
+	}
+	if lit.Value != 5 {
+		t.Fatalf("expected value 5, got %d", lit.Value)
+	}
+}
+
+func TestParseHavingWithWhere(t *testing.T) {
+	stmt := mustParse(t, "SELECT a, SUM(b) AS total FROM t WHERE a > 0 GROUP BY a HAVING total > 100")
+
+	// Both WHERE and HAVING should be set independently.
+	if stmt.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	if stmt.Having == nil {
+		t.Fatal("expected HAVING clause")
+	}
+
+	// WHERE should be a > 0.
+	wBin, ok := stmt.Where.(*BinaryExpr)
+	if !ok {
+		t.Fatalf("expected BinaryExpr for WHERE, got %T", stmt.Where)
+	}
+	if wBin.Op != OpGT {
+		t.Fatalf("expected > in WHERE, got %s", wBin.Op)
+	}
+
+	// HAVING should be total > 100.
+	hBin, ok := stmt.Having.(*BinaryExpr)
+	if !ok {
+		t.Fatalf("expected BinaryExpr for HAVING, got %T", stmt.Having)
+	}
+	if hBin.Op != OpGT {
+		t.Fatalf("expected > in HAVING, got %s", hBin.Op)
+	}
+	hCol, ok := hBin.Left.(*ColumnRefExpr)
+	if !ok {
+		t.Fatalf("expected ColumnRefExpr on HAVING left, got %T", hBin.Left)
+	}
+	if hCol.Name != "total" {
+		t.Fatalf("expected 'total' in HAVING, got %q", hCol.Name)
+	}
+}

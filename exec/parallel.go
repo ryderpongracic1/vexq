@@ -212,13 +212,19 @@ func mergePartialAgg(dst, src *HashAggregate) {
 			dst.groups[key] = copied
 			dst.keys = append(dst.keys, key)
 			dst.samples[key] = src.samples[key]
+			// Deep-copy non-null counts.
+			if srcNN := src.aggNonNull[key]; srcNN != nil {
+				copiedNN := make([]int64, len(srcNN))
+				copy(copiedNN, srcNN)
+				dst.aggNonNull[key] = copiedNN
+			}
 		} else {
 			for j, ae := range dst.aggExprs {
 				switch ae.Kind {
 				case AggCount:
 					dstAccs[j] += srcAccs[j]
 				case AggSum, AggAvg:
-					// Both SUM and AVG store running sums; AVG count is in groupCnt.
+					// Both SUM and AVG store running sums; AVG count is in aggNonNull.
 					if ae.AccumType == TypeFloat64 {
 						df := math.Float64frombits(uint64(dstAccs[j]))
 						sf := math.Float64frombits(uint64(srcAccs[j]))
@@ -252,8 +258,14 @@ func mergePartialAgg(dst, src *HashAggregate) {
 					}
 				}
 			}
+			// Existing group: add this partial aggregate's non-null counts.
+			if dstNN, srcNN := dst.aggNonNull[key], src.aggNonNull[key]; dstNN != nil && srcNN != nil {
+				for j := range dstNN {
+					dstNN[j] += srcNN[j]
+				}
+			}
 		}
-		// Always sum the row counts (used for AVG finalization and correctness).
+		// Always sum the row counts (legacy).
 		dst.groupCnt[key] += src.groupCnt[key]
 	}
 }
