@@ -155,6 +155,10 @@ func (p *ParallelHashAggregate) setup(ctx context.Context) error {
 				}
 				pipeline.Close()
 			}
+			// Materialize integer-key state to string maps before merge.
+			if ha.intKey.enabled && len(ha.intKey.intKeys) > 0 {
+				ha.intKey.materializeToStringMaps(ha)
+			}
 			ch <- workerResult{ha: ha}
 		}()
 	}
