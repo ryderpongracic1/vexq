@@ -431,7 +431,11 @@ func (p *Parser) parseUnary() (Expr, error) {
 	switch tok.Kind {
 	case TokNOT:
 		p.next()
-		expr, err := p.parseUnary()
+		// NOT must bind looser than comparisons so that NOT x = y parses as
+		// NOT (x = y), not (NOT x) = y.  Use parseExpr with NOT's infix
+		// precedence (3) so the recursive call captures all operators that
+		// bind tighter (comparisons at 4–6, arithmetic at 7–8).
+		expr, err := p.parseExpr(3)
 		if err != nil {
 			return nil, err
 		}

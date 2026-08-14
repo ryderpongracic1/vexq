@@ -397,9 +397,8 @@ func buildCorpus() []queryCase {
 			query: "SELECT order_id FROM orders WHERE (status = 'alpha' OR status = 'beta') AND amount > 500.0",
 		},
 		{
-			name:     "filter_not",
-			query:    "SELECT order_id FROM orders WHERE NOT status = 'alpha'",
-			knownBug: "ENGINE BUG: exec.NotExpr.Eval panics with type assertion failure (*StringVector vs *BoolVector) when NOT is applied to a comparison expression. The physical planner wraps the comparison in NotExpr but the comparison sub-expression returns its result as a non-BoolVector intermediate. Suspected location: exec/expr.go:685 and planner/physical.go expression compilation for NOT.",
+			name:  "filter_not",
+			query: "SELECT order_id FROM orders WHERE NOT status = 'alpha'",
 		},
 
 		// --- Arithmetic and CASE WHEN ---
@@ -545,16 +544,14 @@ func buildCorpus() []queryCase {
 
 		// --- Complex: TPC-H Q1-shaped ---
 		{
-			name:     "tpch_q1_shaped",
-			query:    "SELECT status, COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM orders WHERE order_date > 18000 GROUP BY status",
-			knownBug: "ENGINE BUG: exec.evalCmp panics with type assertion when comparing a DateVector (TypeDate) against an IntLiteral. The comparison operator assumes the literal type matches the column type but DateVector stores int32 while the literal is int64. Suspected location: exec/expr.go:169 evalCmp.",
+			name:  "tpch_q1_shaped",
+			query: "SELECT status, COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM orders WHERE order_date > 18000 GROUP BY status",
 		},
 
 		// --- Complex: TPC-H Q6-shaped ---
 		{
-			name:     "tpch_q6_shaped",
-			query:    "SELECT SUM(amount) FROM orders WHERE order_date BETWEEN 16000 AND 17000 AND amount > 100.0",
-			knownBug: "ENGINE BUG: Same as tpch_q1_shaped — DateVector comparison with integer literal panics in exec/expr.go evalCmp.",
+			name:  "tpch_q6_shaped",
+			query: "SELECT SUM(amount) FROM orders WHERE order_date BETWEEN 16000 AND 17000 AND amount > 100.0",
 		},
 
 		// --- Duplicate rows + DISTINCT ---
@@ -581,7 +578,7 @@ func buildCorpus() []queryCase {
 		{
 			name:     "unary_minus",
 			query:    "SELECT order_id, -amount AS neg_amount FROM orders WHERE amount IS NOT NULL LIMIT 5",
-			knownBug: "ENGINE BUG: exec.evalArith panics with type assertion failure (Int64Vector vs Float64Vector) when applying unary minus to a Float64 column. The arithmetic evaluator assumes both operands are the same vector type. Suspected location: exec/expr.go:542 evalArith.",
+			knownBug: "BLOCKED BY PROJECT BUG: unary minus is fixed (type-matched literal), but this query triggers the separate exec.Project index-out-of-range panic when projecting arithmetic on a filtered+limited batch (same root cause as projection_arithmetic case).",
 		},
 
 		// --- NOT BETWEEN ---

@@ -351,11 +351,22 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 		if x.Op == sql.OpNot {
 			return &exec.NotExpr{Child: child}, nil
 		}
-		// Unary minus: multiply by -1.
+		// Unary minus: multiply by -1, using the correct literal type to
+		// match the operand.  evalArith requires both sides to be the same
+		// vector type, so the literal must agree with child.Type().
+		var negOne exec.Expr
+		switch child.Type() {
+		case exec.TypeFloat64:
+			negOne = &exec.Literal{Val: float64(-1), T: exec.TypeFloat64}
+		case exec.TypeInt64:
+			negOne = &exec.Literal{Val: int64(-1), T: exec.TypeInt64}
+		default:
+			return nil, fmt.Errorf("planner: unary minus not supported for type %v", child.Type())
+		}
 		return &exec.BinOp{
 			Op:    exec.BinMul,
 			Left:  child,
-			Right: &exec.Literal{Val: int64(-1), T: exec.TypeInt64},
+			Right: negOne,
 			T:     child.Type(),
 		}, nil
 
@@ -382,6 +393,9 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Coerce lo/hi literals to match the column type (e.g. int→date).
+		_, lo = coerceOneSide(child, lo)
+		_, hi = coerceOneSide(child, hi)
 		between := &exec.BetweenExpr{Child: child, Lo: lo, Hi: hi}
 		if x.Not {
 			return &exec.NotExpr{Child: between}, nil
@@ -728,6 +742,13 @@ func coerceOneSide(a, b exec.Expr) (exec.Expr, exec.Expr) {
 			}
 			days := int32(t.Sub(epoch).Hours() / 24)
 			return a, &exec.Literal{Val: days, T: exec.TypeDate}
+		}
+		// Integer literal beside a DateVector: interpret as days-since-epoch,
+		// matching DateVector's int32 storage format (same epoch as string-date
+		// coercion above).  This allows predicates like `order_date > 18000`.
+		if lit.T == exec.TypeInt64 {
+			v := lit.Val.(int64)
+			return a, &exec.Literal{Val: int32(v), T: exec.TypeDate}
 		}
 	case exec.TypeFloat64:
 		if lit.T == exec.TypeInt64 {
