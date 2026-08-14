@@ -161,10 +161,10 @@ SQLite is a B-tree row-store engine designed for OLTP: it reads full rows, appli
 
 | Query | Description | vexq | SQLite | Speedup |
 |-------|-------------|------|--------|---------|
-| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 239 ms | 2,350 ms | **9.8×** |
-| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 111 ms | 480 ms | **4.3×** |
-| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 684 ms | 3,130 ms | **4.6×** |
-| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,050 ms | 940 ms | 0.89× |
+| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 239 ms | 2,197 ms | **9.2×** |
+| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 111 ms | 408 ms | **3.7×** |
+| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 684 ms | 2,525 ms | **3.7×** |
+| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,050 ms | 724 ms | 0.69× |
 
 Q12 remains close to parity with SQLite: the `HashJoin` build phase materializes the full orders table and SQLite benefits from its B-tree index on `o_orderkey`. Future work: index-nested-loop join and late materialization would close this gap.
 
