@@ -6,19 +6,26 @@ import (
 	"runtime"
 
 	"github.com/ryderpongracic1/vexq/exec"
+	"github.com/ryderpongracic1/vexq/sql"
 	"github.com/ryderpongracic1/vexq/storage"
 )
 
-// Parallel returns a ParallelHashAggregate when the plan matches the pattern:
+// Parallel returns a ParallelHashAggregate when the plan matches one of these
+// patterns:
 //
 //	LogicalAggregate → (LogicalFilter →)? LogicalScan
+//	LogicalSort → LogicalAggregate → (LogicalFilter →)? LogicalScan
+//	LogicalLimit → LogicalSort → LogicalAggregate → (LogicalFilter →)? LogicalScan
+//
+// For Sort/Limit-wrapped shapes, the aggregate is parallelized and the merged
+// result (which is small — one row per group) is sorted/limited serially.
 //
 // It partitions the scan's row groups evenly across numWorkers goroutines,
 // each running an independent scan+filter+pre-projection pipeline, then merges
 // the partial aggregate results in the calling goroutine.
 //
 // Falls back to Physical(ctx, root) when:
-//   - root is not a LogicalAggregate
+//   - root is not a LogicalAggregate (or Sort/Limit above an aggregate)
 //   - the aggregate child (after peeling an optional LogicalFilter) is not a LogicalScan
 //     (e.g., the plan involves a HashJoin)
 //
@@ -29,10 +36,37 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 	}
 
 	// ---- Plan shape detection ------------------------------------------------
+	// Peel optional Limit → Sort above the aggregate. The aggregate output is
+	// small (one row per group), so serial sort/limit is correct and cheap.
+
+	var sortNode *LogicalSort
+	var limitNode *LogicalLimit
 
 	aggNode, ok := root.(*LogicalAggregate)
 	if !ok {
-		return Physical(ctx, root) // not an aggregate at the top
+		// Try Sort → Aggregate or Limit → Sort → Aggregate.
+		if s, ok := root.(*LogicalSort); ok {
+			if a, ok := s.Child.(*LogicalAggregate); ok {
+				sortNode = s
+				aggNode = a
+			} else {
+				return Physical(ctx, root) // sort over non-aggregate — fallback
+			}
+		} else if l, ok := root.(*LogicalLimit); ok {
+			if s, ok := l.Child.(*LogicalSort); ok {
+				if a, ok := s.Child.(*LogicalAggregate); ok {
+					limitNode = l
+					sortNode = s
+					aggNode = a
+				} else {
+					return Physical(ctx, root)
+				}
+			} else {
+				return Physical(ctx, root)
+			}
+		} else {
+			return Physical(ctx, root)
+		}
 	}
 
 	child := aggNode.Child
@@ -164,7 +198,40 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 
 	// morselSize=0 → exec package uses defaultMorselSize (1 row group).
 	// Tune via environment or query hints in future work.
-	return exec.NewParallelHashAggregate(factory, totalRGs, numWorkers, 0, groupByIdxs, aggExprs, outSchema), nil
+	var op exec.Operator = exec.NewParallelHashAggregate(factory, totalRGs, numWorkers, 0, groupByIdxs, aggExprs, outSchema)
+
+	// ---- Wrap with peeled Sort/Limit ----------------------------------------
+	// The merged aggregate output is small (one row per group), so sorting and
+	// limiting it serially is correct and cheap.
+
+	if sortNode != nil {
+		var keys []exec.SortKey
+		for _, ob := range sortNode.OrderBy {
+			cr, ok := ob.Expr.(*sql.ColumnRefExpr)
+			if !ok {
+				_ = op.Close()
+				return nil, fmt.Errorf("planner: parallel: ORDER BY only supports column references")
+			}
+			idx := outSchema.IndexOf(cr.Name)
+			if idx < 0 {
+				_ = op.Close()
+				return nil, fmt.Errorf("planner: parallel: ORDER BY column %q not found", cr.Name)
+			}
+			keys = append(keys, exec.SortKey{ColIdx: idx, Descending: ob.Descending})
+		}
+		sortOp, err := exec.NewExternalSort(op, keys)
+		if err != nil {
+			_ = op.Close()
+			return nil, fmt.Errorf("planner: parallel: sort: %w", err)
+		}
+		op = sortOp
+	}
+
+	if limitNode != nil {
+		op = exec.NewLimit(op, int(limitNode.Count))
+	}
+
+	return op, nil
 }
 
 // aggOutputSchema computes the output schema of a HashAggregate without needing
