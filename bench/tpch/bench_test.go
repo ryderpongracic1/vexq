@@ -23,10 +23,12 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -99,12 +101,11 @@ ORDER BY l_returnflag, l_linestatus`
 
 // Q6: Forecasting Revenue Change. Lineitem scan with range predicates, no GROUP BY.
 const q6 = `
-SELECT SUM(l_extendedprice)
+SELECT SUM(l_extendedprice * l_discount)
 FROM lineitem
 WHERE l_shipdate >= '1994-01-01'
   AND l_shipdate < '1995-01-01'
-  AND l_discount >= 0.05
-  AND l_discount < 0.07
+  AND l_discount BETWEEN 0.05 AND 0.07
   AND l_quantity < 24`
 
 // Q3: Shipping Priority. 3-table join, GROUP BY, ORDER BY, LIMIT.
@@ -184,12 +185,11 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus`
 
 const q6SQLite = `
-SELECT SUM(l_extendedprice)
+SELECT SUM(l_extendedprice * l_discount)
 FROM lineitem
 WHERE l_shipdate >= '1994-01-01'
   AND l_shipdate < '1995-01-01'
-  AND l_discount >= 0.05
-  AND l_discount < 0.07
+  AND l_discount BETWEEN 0.05 AND 0.07
   AND l_quantity < 24`
 
 // ---- SQLite setup ----------------------------------------------------------
@@ -559,7 +559,15 @@ func TestQ6Correctness(t *testing.T) {
 	if len(vexqRows) != 1 || len(sqliteRows) != 1 {
 		t.Fatalf("Q6: expected 1 row each; got vexq=%d sqlite=%d", len(vexqRows), len(sqliteRows))
 	}
-	// Q6 is SUM(extendedprice) — compare as floats with tolerance.
+	// Q6 is a single SUM — compare as floats with relative tolerance.
+	vf, err1 := strconv.ParseFloat(vexqRows[0][0], 64)
+	sf, err2 := strconv.ParseFloat(sqliteRows[0][0], 64)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("Q6: parse floats: vexq=%q (%v) sqlite=%q (%v)", vexqRows[0][0], err1, sqliteRows[0][0], err2)
+	}
+	if diff := math.Abs(vf-sf) / math.Abs(sf); diff > 1e-9 {
+		t.Errorf("Q6 SUM mismatch: vexq=%v sqlite=%v (rel diff %g)", vf, sf, diff)
+	}
 	t.Logf("Q6: vexq=%s  sqlite=%s", vexqRows[0][0], sqliteRows[0][0])
 }
 
