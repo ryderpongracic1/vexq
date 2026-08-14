@@ -194,7 +194,7 @@ DuckDB is a state-of-the-art embedded analytical engine backed by multi-decade r
 | Q6 | 198 ms | **177 ms** | 599 ms | **3.4×** |
 | Q1† | 657 ms | 657 ms | 3,463 ms | 5.3× |
 
-† Q1 has an `ORDER BY` clause, so the root operator is a `Sort`, not an `Aggregate`. `planner.Parallel()` falls back to `planner.Physical()` for plans it cannot partition (joins, sorts at the root). Parallel execution applies to aggregate-only plans today; Q3/Q12 also fall back because they contain `HashJoin`.
+† Q1 has an `ORDER BY` clause above the aggregate. `planner.Parallel()` now peels `Sort` (and `Limit → Sort`) at the root, parallelizes the aggregate beneath it, and sorts the small merged result serially. The timing numbers above predate this change (M1 re-measurement pending). Q3/Q12 still fall back to `planner.Physical()` because they contain `HashJoin`, which is not yet parallelized.
 
 ### Running benchmarks
 
