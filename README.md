@@ -32,6 +32,7 @@ exec/          — Vectorized operator pipeline
   ParallelHashAggregate — Work-stealing morsel scheduler + partial-aggregate merge
   ExternalSort      — In-memory sort (spill-to-disk planned for v2)
   HashJoin          — Build/probe inner join
+  ParallelHashJoinAggregate — Serial shared build + morsel-parallel probe, feeding a partial aggregate
   Limit
 
 catalog/       — Table registry with lazy schema loading from .vxq footer
@@ -216,7 +217,7 @@ Q12 remains close to parity with SQLite: the `HashJoin` build phase materializes
 
 - **Coarser-grained I/O**: The single largest serial Q6 opportunity. pprof shows ~59% of CPU samples in `pread` syscalls (~35K preads per 6M-row scan, one per block even on warm page cache). Issuing one `pread` per row group (or mmap-ing the file) would eliminate the vast majority of these syscalls, collapsing the dominant serial cost center.
 - **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops. However, pprof profiling of serial Q6 reveals filter compute is a small fraction of total execution time (~59% of samples are in `pread` syscalls); with filter being a minor contributor, AVX2 kernels alone yield only a modest end-to-end Q6 improvement despite the 3.3× kernel speedup. SIMD remains valuable for Q1-style queries where aggregation compute dominates. See [`bench/simd_filter/`](bench/simd_filter/) for the kernel measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row (3.3× speedup)**, measured on Intel Xeon 6975P-C (x86-64).
-- **Parallel hash join**: Extend `planner.Parallel()` to detect join shapes and partition the build side — would bring Q3/Q12 into the parallel path.
+- **Parallel hash join — radix partitioning and parallel build**: Phase 1 landed: `planner.Parallel()` now detects `Aggregate → HashJoin → (Filter →)? Scan` and parallelizes the **probe** side (`exec.ParallelHashJoinAggregate`), bringing Q3's and Q12's shapes into the parallel path for the first time. The build side is still materialized serially into a single shared read-only hash table, so Amdahl bounds the speedup by the build-side fraction of runtime — on a synthetic 300K-order ⋈ 1.2M-lineitem dataset the build is ~64% of serial Q12 runtime, capping speedup at ~1.6×. The two remaining wins are (a) pruning build-side columns (the optimizer currently requests every column on both sides of a join, so all 9 `orders` columns are decoded and materialized per build row) and (b) a radix-partitioned build, which would both parallelize the build phase and keep each partition L2-resident during the probe.
 - **Parallel aggregates over expressions**: Canonical Q6 (`SUM(a*b)`) currently falls back to serial; extending the parallel planner to evaluate expression aggregates per-morsel would restore Q6's parallel speedup on the canonical query.
 - **Late materialization**: Avoid decoding non-predicate columns until after the filter selection vector is built — saves decode work proportional to filter selectivity.
 - **Further GC reduction**: Extend buffer reuse from TableScan (already done) to Filter and Project operators — would improve parallel scaling toward the hardware ceiling.

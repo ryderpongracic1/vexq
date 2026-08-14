@@ -24,15 +24,27 @@ import (
 // each running an independent scan+filter+pre-projection pipeline, then merges
 // the partial aggregate results in the calling goroutine.
 //
+// Aggregates over an inner hash join are handled by tryParallelJoin
+// ([planner/parallel_join.go]), which parallelizes the probe side.
+//
 // Falls back to Physical(ctx, root) when:
 //   - root is not a LogicalAggregate (or Sort/Limit above an aggregate)
-//   - the aggregate child (after peeling an optional LogicalFilter) is not a LogicalScan
-//     (e.g., the plan involves a HashJoin)
+//   - the aggregate child (after peeling an optional LogicalFilter) is neither a
+//     LogicalScan nor a join shape tryParallelJoin recognizes
 //
 // numWorkers <= 0 defaults to runtime.NumCPU().
 func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Operator, error) {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
+	}
+
+	// Probe-side-parallel hash join (planner/parallel_join.go). Additive: it
+	// returns matched=false for every shape it does not handle, so the
+	// aggregate-over-scan detection below is unchanged.
+	if op, matched, err := tryParallelJoin(ctx, root, numWorkers); err != nil {
+		return nil, err
+	} else if matched {
+		return op, nil
 	}
 
 	// ---- Plan shape detection ------------------------------------------------

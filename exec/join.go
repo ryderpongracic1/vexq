@@ -19,6 +19,11 @@ type HashJoin struct {
 	probeKey int // column index in probe schema
 	schema   Schema
 
+	// buildSchema is the build side's schema. Held separately from build so a
+	// join can probe a prebuilt SharedHashTable with no build operator at all
+	// (see NewHashJoinShared in parallel_join.go).
+	buildSchema Schema
+
 	// build-phase hash table: serialised key → list of build row indices
 	hashTable map[int64][]buildRow
 	buildDone bool
@@ -58,12 +63,13 @@ func NewHashJoin(build, probe Operator, buildKeyIdx, probeKeyIdx int) (*HashJoin
 	outFields = append(outFields, pSchema.Fields...)
 
 	return &HashJoin{
-		build:     build,
-		probe:     probe,
-		buildKey:  buildKeyIdx,
-		probeKey:  probeKeyIdx,
-		schema:    Schema{Fields: outFields},
-		hashTable: make(map[int64][]buildRow),
+		build:       build,
+		probe:       probe,
+		buildKey:    buildKeyIdx,
+		probeKey:    probeKeyIdx,
+		buildSchema: bSchema,
+		schema:      Schema{Fields: outFields},
+		hashTable:   make(map[int64][]buildRow),
 	}, nil
 }
 
@@ -137,10 +143,18 @@ func (j *HashJoin) Next(ctx context.Context) (*Batch, error) {
 }
 
 func (j *HashJoin) buildHashTable(ctx context.Context) error {
-	bSchema := j.build.Schema()
-	numCols := len(bSchema.Fields)
+	return buildHashTableFrom(ctx, j.build, j.buildKey, len(j.buildSchema.Fields), j.hashTable)
+}
+
+// buildHashTableFrom drains src and inserts every row into table, keyed by the
+// int64 representation of column keyIdx. Rows whose key is NULL are dropped —
+// an inner equi-join can never match them.
+//
+// Shared by HashJoin's own build phase and by BuildSharedHashTable, so serial
+// and parallel execution materialise byte-identical build rows.
+func buildHashTableFrom(ctx context.Context, src Operator, keyIdx, numCols int, table map[int64][]buildRow) error {
 	for {
-		batch, err := j.build.Next(ctx)
+		batch, err := src.Next(ctx)
 		if err != nil {
 			return fmt.Errorf("exec: hash join: build: %w", err)
 		}
@@ -163,7 +177,7 @@ func (j *HashJoin) buildHashTable(ctx context.Context) error {
 		}
 
 		for _, rowIdx := range indices {
-			kv := batch.Vectors[j.buildKey]
+			kv := batch.Vectors[keyIdx]
 			if kv.IsNull(rowIdx) {
 				continue
 			}
@@ -186,7 +200,7 @@ func (j *HashJoin) buildHashTable(ctx context.Context) error {
 					}
 				}
 			}
-			j.hashTable[key] = append(j.hashTable[key], row)
+			table[key] = append(table[key], row)
 		}
 	}
 }
@@ -202,7 +216,7 @@ func (j *HashJoin) emitMatches() *Batch {
 	rows := j.matchBuf[j.matchPos:end]
 	j.matchPos = end
 
-	bSchema := j.build.Schema()
+	bSchema := j.buildSchema
 	pSchema := j.probe.Schema()
 	n := len(rows)
 
@@ -334,6 +348,10 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 }
 
 func (j *HashJoin) Close() error {
-	_ = j.build.Close()
+	// build is nil when probing a SharedHashTable — the table is owned by the
+	// ParallelHashJoinAggregate that built it, not by this join.
+	if j.build != nil {
+		_ = j.build.Close()
+	}
 	return j.probe.Close()
 }
