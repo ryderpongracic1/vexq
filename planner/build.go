@@ -54,11 +54,25 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 		if err != nil {
 			return nil, err
 		}
-		root = agg
 
 		// HAVING — post-aggregate filter applied after aggregation.
+		// If the HAVING predicate contains aggregate function expressions
+		// (e.g. COUNT(*) > 3), we rewrite them to column references that
+		// point at matching output columns of the aggregate. If no match
+		// exists in the SELECT list, we add a hidden aggregate and strip
+		// it with a projection after the filter.
 		if stmt.Having != nil {
-			root = &LogicalFilter{Child: root, Predicate: stmt.Having}
+			origAggCount := len(agg.Aggs)
+			rewritten := rewriteHavingAggs(stmt.Having, agg)
+			root = agg
+			root = &LogicalFilter{Child: root, Predicate: rewritten}
+			// If hidden aggregates were added, project them away so the
+			// output schema matches what the user's SELECT requested.
+			if len(agg.Aggs) > origAggCount {
+				root = buildHavingProjection(root, agg, origAggCount)
+			}
+		} else {
+			root = agg
 		}
 	} else {
 		// Project.
@@ -489,4 +503,130 @@ func resolveExprType(expr sql.Expr, schema Schema) DataType {
 		}
 	}
 	return TypeInt64
+}
+
+// rewriteHavingAggs walks a HAVING expression tree and replaces every
+// AggFuncExpr with a ColumnRefExpr pointing to a matching aggregate output
+// column. If no matching aggregate exists in the SELECT list, a hidden
+// aggregate is appended to the LogicalAggregate node.
+func rewriteHavingAggs(expr sql.Expr, agg *LogicalAggregate) sql.Expr {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case *sql.AggFuncExpr:
+		// Find a matching aggregate in the existing list.
+		alias := findMatchingAgg(e, agg.Aggs)
+		if alias != "" {
+			return &sql.ColumnRefExpr{Name: alias}
+		}
+		// No match — add a hidden aggregate.
+		alias = fmt.Sprintf("_having_agg_%d", len(agg.Aggs))
+		colName := ""
+		var aggExpr sql.Expr
+		if e.Arg != nil {
+			switch arg := e.Arg.(type) {
+			case *sql.StarExpr:
+				// COUNT(*) — no source column.
+			case *sql.ColumnRefExpr:
+				colName = arg.Name
+			default:
+				colName = alias
+				aggExpr = e.Arg
+			}
+		}
+		agg.Aggs = append(agg.Aggs, AggItem{
+			Func:    e.Func,
+			ColName: colName,
+			AggExpr: aggExpr,
+			Alias:   alias,
+		})
+		return &sql.ColumnRefExpr{Name: alias}
+
+	case *sql.BinaryExpr:
+		return &sql.BinaryExpr{
+			Op:    e.Op,
+			Left:  rewriteHavingAggs(e.Left, agg),
+			Right: rewriteHavingAggs(e.Right, agg),
+		}
+	case *sql.UnaryExpr:
+		return &sql.UnaryExpr{
+			Op:   e.Op,
+			Expr: rewriteHavingAggs(e.Expr, agg),
+		}
+	case *sql.IsNullExpr:
+		return &sql.IsNullExpr{
+			Expr:  rewriteHavingAggs(e.Expr, agg),
+			IsNot: e.IsNot,
+		}
+	case *sql.BetweenExpr:
+		return &sql.BetweenExpr{
+			Expr: rewriteHavingAggs(e.Expr, agg),
+			Lo:   rewriteHavingAggs(e.Lo, agg),
+			Hi:   rewriteHavingAggs(e.Hi, agg),
+			Not:  e.Not,
+		}
+	default:
+		// Literals, column references, etc. — return unchanged.
+		return expr
+	}
+}
+
+// findMatchingAgg checks if an AggFuncExpr structurally matches any existing
+// AggItem. A match means same function name and same argument structure.
+func findMatchingAgg(ae *sql.AggFuncExpr, aggs []AggItem) string {
+	for _, a := range aggs {
+		if a.Func != ae.Func {
+			continue
+		}
+		// Match argument structure.
+		if ae.Arg == nil {
+			// COUNT(*) with nil arg — matches COUNT with no source column.
+			if a.ColName == "" && a.AggExpr == nil {
+				return a.Alias
+			}
+			continue
+		}
+		switch arg := ae.Arg.(type) {
+		case *sql.StarExpr:
+			if a.ColName == "" && a.AggExpr == nil {
+				return a.Alias
+			}
+		case *sql.ColumnRefExpr:
+			if a.ColName == arg.Name && a.AggExpr == nil {
+				return a.Alias
+			}
+		default:
+			// Complex expression — structural match against AggExpr.
+			// For now, only match if both are the exact same pointer
+			// (which they will be if the optimizer didn't clone).
+			// In practice, HAVING expressions with complex args that aren't
+			// in SELECT will create hidden aggregates, which is correct.
+			if a.AggExpr == arg {
+				return a.Alias
+			}
+		}
+	}
+	return ""
+}
+
+// buildHavingProjection creates a LogicalProject that strips hidden aggregate
+// columns from the output. It projects only the GROUP BY columns plus the
+// original aggregates (those before the hidden ones were appended).
+func buildHavingProjection(child LogicalNode, agg *LogicalAggregate, origAggCount int) *LogicalProject {
+	childSchema := child.OutputSchema()
+	var items []ProjectItem
+	// The output schema of LogicalAggregate is: [group-by columns...] [aggregate columns...]
+	// We want to project everything except the hidden aggregates (indices after origAggCount).
+	numGroupBy := len(agg.GroupBy)
+	numOrigCols := numGroupBy + origAggCount
+	for i := 0; i < numOrigCols; i++ {
+		f := childSchema.Fields[i]
+		items = append(items, ProjectItem{
+			Alias: f.Name,
+			Expr:  &sql.ColumnRefExpr{Name: f.Name},
+			Type:  f.Type,
+		})
+	}
+	return &LogicalProject{Child: child, Exprs: items}
 }
