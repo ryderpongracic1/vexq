@@ -89,7 +89,13 @@ func pruneColumns(node LogicalNode, needed []string) LogicalNode {
 			cols = append(cols, predicateCols(gb)...)
 		}
 		for _, agg := range n.Aggs {
-			if agg.ColName != "" {
+			if agg.AggExpr != nil {
+				// Complex expression (e.g. SUM(price * discount)): collect the
+				// real source columns referenced by the expression, not the
+				// synthetic column name (_agg_0) which only exists after
+				// buildPreProjection materializes it.
+				cols = append(cols, predicateCols(agg.AggExpr)...)
+			} else if agg.ColName != "" {
 				cols = append(cols, agg.ColName)
 			}
 		}

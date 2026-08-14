@@ -320,3 +320,172 @@ func TestParallelFallback_NonAggregateSortFallback(t *testing.T) {
 		t.Fatalf("expected 10 rows from LIMIT 10, got %d", len(rows))
 	}
 }
+
+// ---- Regression tests for aggregate-over-expression fallback ----------------
+// These tests verify that planner.Parallel silently falls back to serial
+// execution (via Physical) when aggregates reference computed expressions
+// (e.g. SUM(price * discount)) rather than erroring with '_agg_0 not found'.
+
+// writeAggExprFile creates a 3-column (price float64, discount float64, qty int64)
+// .vxq file with multiple row groups for parallel eligibility.
+func writeAggExprFile(t *testing.T, rowGroups int) string {
+	t.Helper()
+	schema := storage.Schema{Fields: []storage.Field{
+		{Name: "price", Type: storage.TypeFloat64},
+		{Name: "discount", Type: storage.TypeFloat64},
+		{Name: "qty", Type: storage.TypeInt64},
+	}}
+	path := filepath.Join(t.TempDir(), "lineitem.vxq")
+	w, err := storage.NewWriter(path, schema)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	for rg := 0; rg < rowGroups; rg++ {
+		n := storage.RowGroupRows
+		prices := make([]float64, n)
+		discounts := make([]float64, n)
+		qtys := make([]int64, n)
+		for i := 0; i < n; i++ {
+			prices[i] = float64(100 + (rg*n+i)%50)
+			discounts[i] = float64((rg*n+i)%10) * 0.01
+			qtys[i] = int64(1 + (rg*n+i)%20)
+		}
+		_ = w.BeginRowGroup(n)
+		_ = w.AppendColumn(context.Background(), 0, nil, prices)
+		_ = w.AppendColumn(context.Background(), 1, nil, discounts)
+		_ = w.AppendColumn(context.Background(), 2, nil, qtys)
+		_ = w.EndRowGroup()
+	}
+	if err := w.Finish(context.Background()); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	return path
+}
+
+// TestParallelFallback_AggOverExpr verifies that Parallel silently falls back
+// when the aggregate references a computed expression (SUM(price * discount)).
+// Previously this would error with: 'column "_agg_0" not found'.
+func TestParallelFallback_AggOverExpr(t *testing.T) {
+	path := writeAggExprFile(t, 3)
+	cat, err := catalog.OpenSingle(context.Background(), "lineitem", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "SUM of multiplication",
+			query: `SELECT SUM(price * discount) AS revenue FROM lineitem`,
+		},
+		{
+			name:  "SUM of multiplication with WHERE",
+			query: `SELECT SUM(price * discount) AS revenue FROM lineitem WHERE discount > 0.03`,
+		},
+		{
+			name:  "multiple agg-over-expr",
+			query: `SELECT SUM(price * discount) AS rev, COUNT(*) AS cnt FROM lineitem`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logical := buildPlan(t, tc.query, cat)
+			op, err := planner.Parallel(context.Background(), logical, 4)
+			if err != nil {
+				t.Fatalf("Parallel should fall back, got error: %v", err)
+			}
+			rows := drainResults(t, op)
+			if len(rows) == 0 {
+				t.Fatal("expected at least one result row")
+			}
+		})
+	}
+}
+
+// TestParallelFallback_AggOverExpr_MatchesSerial verifies that the fallback
+// produces results identical to explicitly calling Physical.
+func TestParallelFallback_AggOverExpr_MatchesSerial(t *testing.T) {
+	path := writeAggExprFile(t, 3)
+	cat, err := catalog.OpenSingle(context.Background(), "lineitem", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "SUM expr no filter",
+			query: `SELECT SUM(price * discount) AS revenue FROM lineitem`,
+		},
+		{
+			name:  "SUM expr with filter",
+			query: `SELECT SUM(price * discount) AS revenue FROM lineitem WHERE discount > 0.03`,
+		},
+		{
+			name:  "SUM expr with ORDER BY (via physical fallback)",
+			query: `SELECT SUM(price * discount) AS revenue FROM lineitem`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Serial path.
+			logical := buildPlan(t, tc.query, cat)
+			serialOp, err := planner.Physical(context.Background(), logical)
+			if err != nil {
+				t.Fatalf("Physical: %v", err)
+			}
+			serialRows := drainResults(t, serialOp)
+
+			// Parallel path (should fall back to serial).
+			logical = buildPlan(t, tc.query, cat)
+			parallelOp, err := planner.Parallel(context.Background(), logical, 4)
+			if err != nil {
+				t.Fatalf("Parallel: %v", err)
+			}
+			parallelRows := drainResults(t, parallelOp)
+
+			// Compare results.
+			if len(serialRows) != len(parallelRows) {
+				t.Fatalf("row count mismatch: serial=%d parallel=%d", len(serialRows), len(parallelRows))
+			}
+			for i := range serialRows {
+				for c := range serialRows[i] {
+					s := fmt.Sprintf("%v", serialRows[i][c])
+					p := fmt.Sprintf("%v", parallelRows[i][c])
+					if s != p {
+						t.Errorf("row %d col %d: serial=%v parallel=%v", i, c, serialRows[i][c], parallelRows[i][c])
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestParallelStillParallelizes_SimpleAgg verifies that simple aggregates
+// (without computed expressions) still use the parallel path.
+func TestParallelStillParallelizes_SimpleAgg(t *testing.T) {
+	path := writeMultiRGFile(t)
+	cat, err := catalog.OpenSingle(context.Background(), "t", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This query uses plain column references, so it should parallelize.
+	logical := buildPlan(t, `SELECT grp, SUM(val) AS total FROM t GROUP BY grp`, cat)
+	op, err := planner.Parallel(context.Background(), logical, 4)
+	if err != nil {
+		t.Fatalf("Parallel: %v", err)
+	}
+	defer op.Close()
+
+	// Verify it's a ParallelHashAggregate (not a fallback HashAggregate).
+	if _, ok := op.(*exec.ParallelHashAggregate); !ok {
+		t.Fatalf("expected *exec.ParallelHashAggregate for simple agg, got %T (fallback should not trigger)", op)
+	}
+}
