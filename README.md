@@ -163,6 +163,8 @@ DuckDB is a state-of-the-art embedded analytical engine: SIMD intrinsics, a cost
 
 The table below decomposes the gap into **per-core execution efficiency** (single-threaded DuckDB vs vexq serial) and **total throughput** (DuckDB all-cores vs vexq serial). This decomposition separates SIMD/JIT advantages from parallelism, which is the more informative comparison for a from-scratch engine.
 
+Note: this comparison runs DuckDB on ARM64, where its strongest x86 SIMD paths (AVX-512) are unavailable; an x86 comparison would likely widen DuckDB's per-core advantage. The comparison is same-machine and therefore fair, but the 1.5× Q1 figure should be read with that context.
+
 | Query | vexq serial | DuckDB (1 thread) | DuckDB (14 threads) | Per-core gap | Total gap |
 |-------|-------------|-------------------|---------------------|:------------:|:---------:|
 | Q1 | 239 ms | 159 ms | 25 ms | **1.5×** | **10×** |
@@ -184,10 +186,12 @@ The table below decomposes the gap into **per-core execution efficiency** (singl
 
 The benchmarks moved from Apple M1 Pro (10-core) to Apple M4 Pro (14-core). Using SQLite as a platform-neutral control (same workload, no code changes between runs): Q1 3,463→2,197 ms (1.58×), Q6 599→408 ms (1.47×), Q3 3,719→2,525 ms (1.47×), Q12 1,073→724 ms (1.48×). The hardware is worth roughly 1.5×. Normalizing vexq's improvements against this:
 
+This normalization is approximate: SQLite is a pointer-chasing B-tree row-store dominated by memory latency, while vexq is a streaming columnar scanner — the two do not scale identically across microarchitectures, so the ~1.5× hardware factor is a rough correction rather than an exact one.
+
 | Query | Raw improvement | Hardware factor | Software-only improvement |
 |-------|----------------|-----------------|---------------------------|
-| Q1 | 2.75× (657→239) | ÷1.58 | **1.74×** (aggregate intkey optimization) |
-| Q6 | 1.78× (198→111) | ÷1.47 | **1.21×** (decode buffer reuse) |
+| Q1 | 2.75× (657→239) | ÷1.58 | **1.74×** (aggregate intkey rework + decode-buffer reuse; both landed in this window; credit not separable without an ablation) |
+| Q6 | 1.78× (198→111) | ÷1.47 | **1.21×** (decode-buffer reuse + aggregate intkey rework; both landed in this window; credit not separable without an ablation) |
 | Q3 | 1.66× (1133→684) | ÷1.47 | **1.13×** (minor — no join changes) |
 | Q12 | 1.56× (1643→1050) | ÷1.48 | **1.06×** (no targeted optimization) |
 
@@ -208,7 +212,7 @@ Q12 remains close to parity with SQLite: the `HashJoin` build phase materializes
 
 ### What's left on the table
 
-- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops — likely 1.5–2× end-to-end improvement on filter-heavy queries (filter is roughly 50–60% of Q6 serial time; a 3.3× kernel speedup yields ~1.8× end-to-end via Amdahl). See [`bench/simd_filter/`](bench/simd_filter/) for the kernel measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row (3.3× speedup)**, measured on Intel Xeon 6975P-C (x86-64).
+- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops — likely 1.5–2× end-to-end improvement on filter-heavy queries (filter is an estimated 50–60% of Q6 serial time (pprof measurement pending); a 3.3× kernel speedup yields ~1.8× end-to-end via Amdahl). See [`bench/simd_filter/`](bench/simd_filter/) for the kernel measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row (3.3× speedup)**, measured on Intel Xeon 6975P-C (x86-64).
 - **Parallel hash join**: Extend `planner.Parallel()` to detect join shapes and partition the build side — would bring Q3/Q12 into the parallel path.
 - **Late materialization**: Avoid decoding non-predicate columns until after the filter selection vector is built — saves decode work proportional to filter selectivity.
 - **Further GC reduction**: Extend buffer reuse from TableScan (already done) to Filter and Project operators — would improve parallel scaling toward the hardware ceiling.
@@ -223,14 +227,16 @@ Q12 remains close to parity with SQLite: the `HashJoin` build phase materializes
 | Q1 | 239 ms | **129 ms** | **1.85×** | Sort-peeling: parallel aggregate, serial 4-row sort |
 | Q6 | 111 ms | **96 ms** | **1.16×** | GC-limited — remaining per-batch allocations in filter/project |
 
-Q3/Q12 fall back to `planner.Physical()` because they contain `HashJoin`, which is not yet parallelized. Parallel scaling is currently limited by Go GC pressure: decode-buffer reuse in `TableScan` reduced GC cycles by 30%, but small per-batch allocations in downstream operators remain. On 14 cores, the Amdahl-derived parallelizable fraction is ~15% (Q6) and ~49% (Q1), yielding efficiencies of 8% and 13% respectively (speedup ÷ N).
+Q3/Q12 fall back to `planner.Physical()` because they contain `HashJoin`, which is not yet parallelized. Parallel scaling is currently limited by Go GC pressure: decode-buffer reuse in `TableScan` reduced GC cycles by 30%, but small per-batch allocations in downstream operators remain. With GC on, parallel efficiency (speedup ÷ N) is 8% (Q6) and 13% (Q1). The ablation below shows this is not a fixed serial-fraction limit: GC overhead grows with worker count (more goroutines allocating → more GC cycles and STW time), which is why an Amdahl model cannot fit these numbers — the ablation exceeds the ceiling any fitted serial fraction would imply.
 
-Ablation with `GOGC=off` proves this is GC pressure, not contention: Q6 parallel drops from 96 ms to 29 ms (3.8× scaling), Q1 from 129 ms to 43 ms (5.6× scaling). The morsel scheduler scales correctly once GC is removed — the remaining gap to linear is memory-bandwidth saturation at 14 active decode pipelines.
+Ablation with `GOGC=off` proves this is GC pressure, not contention: Q6 parallel drops from 96 ms to 29 ms (3.8× scaling), Q1 from 129 ms to 43 ms (5.6× scaling). The morsel scheduler scales correctly once GC is removed — the remaining gap to linear is most plausibly P/E-core asymmetry: the M4 Pro's 14 cores are 10 performance + 4 efficiency cores, and runtime.NumCPU() spawns 14 workers, four of which land on E-cores with a fraction of P-core throughput. Against a realistic 10-P-core ceiling, Q1's scaling is ~56% efficiency. A worker-count sweep (1→14 under GOGC=off) to demonstrate this empirically is a pending measurement. It is explicitly not memory bandwidth: Q6 decodes ~288 MB in 29 ms (~10 GB/s), under 5% of the platform's available bandwidth.
 
 | Query | Parallel (GC on) | Parallel (GOGC=off) | Scaling (GOGC=off) |
 |-------|-----------------|--------------------:|-------------------:|
 | Q1 | 129 ms | 43 ms | **5.6×** |
 | Q6 | 96 ms | 29 ms | **3.8×** |
+
+These scaling figures divide parallel (GOGC=off) by serial (GC on) and therefore bundle the GC-removal speedup into the parallel speedup; the like-for-like control (serial under GOGC=off) is a pending measurement and will lower these figures somewhat. GOGC=off is a diagnostic, not a production configuration — unbounded heap growth is not viable. The realistic mitigations are the buffer-reuse work already applied to TableScan (extending to Filter/Project), and GOMEMLIMIT as a bounded middle ground.
 
 ### Running benchmarks
 
