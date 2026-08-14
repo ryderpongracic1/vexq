@@ -407,9 +407,8 @@ func buildCorpus() []queryCase {
 			query: "SELECT order_id, amount * 1.1 AS with_tax FROM orders WHERE amount IS NOT NULL LIMIT 10",
 		},
 		{
-			name:     "case_when",
-			query:    `SELECT order_id, CASE WHEN amount > 5000.0 THEN 'high' WHEN amount > 1000.0 THEN 'medium' ELSE 'low' END AS tier FROM orders WHERE amount IS NOT NULL LIMIT 10`,
-			knownBug: "ENGINE BUG: String literals are not supported in CASE WHEN result expressions. Engine returns 'expr: string literal Eval not supported (compare via BinOp)'. Suspected location: exec/expr.go string literal evaluation path.",
+			name:  "case_when",
+			query: `SELECT order_id, CASE WHEN amount > 5000.0 THEN 'high' WHEN amount > 1000.0 THEN 'medium' ELSE 'low' END AS tier FROM orders WHERE amount IS NOT NULL LIMIT 10`,
 		},
 
 		// --- Aggregates: basic ---

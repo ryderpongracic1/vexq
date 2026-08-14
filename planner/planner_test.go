@@ -73,3 +73,35 @@ func TestAggregateInvalidColumn(t *testing.T) {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }
+
+func TestCaseWhenMixedTypesError(t *testing.T) {
+	// CASE WHEN val > 5.0 THEN 'high' ELSE 42 END should produce a planner error
+	// because string and int types cannot be mixed in CASE branches.
+	path := writeTestFile(t, 10)
+	cat, err := catalog.OpenSingle(ctx, "test", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	query := `SELECT CASE WHEN val > 5.0 THEN 'high' ELSE 42 END FROM test`
+	p := sql.NewParser(query)
+	node, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	stmt := node.(*sql.SelectStmt)
+
+	logical, err := planner.Build(ctx, stmt, cat)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	logical = planner.Optimize(logical)
+
+	_, err = planner.Physical(ctx, logical)
+	if err == nil {
+		t.Fatal("expected planner error for mixed-type CASE branches, got nil")
+	}
+	if !strings.Contains(err.Error(), "CASE") || !strings.Contains(err.Error(), "common type") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
