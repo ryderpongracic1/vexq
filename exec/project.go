@@ -17,9 +17,9 @@ type ProjectExpr struct {
 // produces a new Batch with the results.  It respects SelVec from upstream
 // Filter operators by materialising only the selected rows.
 type Project struct {
-	child   Operator
-	exprs   []ProjectExpr
-	schema  Schema
+	child  Operator
+	exprs  []ProjectExpr
+	schema Schema
 }
 
 func NewProject(child Operator, exprs []ProjectExpr) (*Project, error) {
@@ -48,25 +48,64 @@ func (p *Project) Next(ctx context.Context) (*Batch, error) {
 		return nil, nil
 	}
 
+	// Save the original logical length and selection vector.
+	origLen := batch.Length
+	origSel := batch.SelVec
+
+	// When a SelVec is active, expressions like Literal.Eval use batch.Length
+	// to size broadcast vectors.  But ColumnRef.Eval returns the raw physical
+	// vector (full block size).  The mismatch causes index-out-of-range in
+	// evalArith when the literal vector is shorter than the column vector.
+	//
+	// Fix: temporarily set batch.Length to the physical row count so all
+	// expression evaluators produce consistently-sized vectors.  Then
+	// materialize the selected rows afterward.
+	if origSel != nil {
+		batch.Length = physicalLen(batch)
+	}
+
 	outVecs := make([]Vector, len(p.exprs))
 	for i, pe := range p.exprs {
 		raw, err := pe.Expr.Eval(ctx, batch)
 		if err != nil {
+			// Restore batch before returning.
+			batch.Length = origLen
+			batch.SelVec = origSel
 			return nil, fmt.Errorf("exec: project: eval %q: %w", pe.Name, err)
 		}
-		// If there's a selection vector, materialise only selected rows.
-		if batch.SelVec != nil {
-			raw = materialize(raw, batch.SelVec)
+		// If there's a selection vector, materialise only selected rows into
+		// freshly allocated vectors (important: output must not alias reused
+		// scan buffers from TableScan).
+		if origSel != nil {
+			raw = materialize(raw, origSel)
 		}
 		outVecs[i] = raw
 	}
 
-	outLen := batch.Length
+	// Restore the input batch (defensive; callers should not reuse it, but
+	// this keeps the contract clean).
+	batch.Length = origLen
+	batch.SelVec = origSel
+
+	outLen := origLen
+	if origSel != nil {
+		outLen = len(origSel)
+	}
 	return &Batch{
 		Schema:  p.schema,
 		Vectors: outVecs,
 		Length:  outLen,
+		// No SelVec on output: rows are already materialized.
 	}, nil
+}
+
+// physicalLen returns the number of rows in the raw underlying vectors.
+// This is the true allocation size, independent of any selection vector.
+func physicalLen(b *Batch) int {
+	if len(b.Vectors) > 0 {
+		return b.Vectors[0].Len()
+	}
+	return b.Length
 }
 
 func (p *Project) Close() error { return p.child.Close() }
