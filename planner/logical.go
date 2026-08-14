@@ -3,8 +3,6 @@
 package planner
 
 import (
-	"fmt"
-
 	"github.com/ryderpongracic1/vexq/exec"
 	"github.com/ryderpongracic1/vexq/sql"
 	"github.com/ryderpongracic1/vexq/storage"
@@ -165,6 +163,11 @@ func (n *LogicalJoin) OutputSchema() exec.Schema {
 }
 
 // exprName returns a best-effort string name for an expression (for schema purposes).
+//
+// Simple column and star arguments keep the historical FUNC_col / FUNC_* header
+// form (SUM_l_quantity, COUNT_*) so existing output is unchanged. Anything else
+// — an aggregate over a computed expression, or an unaliased expression
+// projection — renders as readable SQL rather than a Go type name.
 func exprName(e sql.Expr) string {
 	switch x := e.(type) {
 	case *sql.ColumnRefExpr:
@@ -172,12 +175,18 @@ func exprName(e sql.Expr) string {
 	case *sql.StarExpr:
 		return "*"
 	case *sql.AggFuncExpr:
-		if x.Arg != nil {
-			return x.Func + "_" + exprName(x.Arg)
+		if x.Arg == nil {
+			return x.Func
 		}
-		return x.Func
+		switch arg := x.Arg.(type) {
+		case *sql.ColumnRefExpr:
+			return x.Func + "_" + arg.Name
+		case *sql.StarExpr:
+			return x.Func + "_*"
+		}
+		return sql.FormatExpr(x)
 	default:
-		return fmt.Sprintf("%T", e)
+		return sql.FormatExpr(e)
 	}
 }
 
