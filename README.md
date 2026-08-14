@@ -1,5 +1,7 @@
 # vexq
 
+[![CI](https://github.com/ryderpongracic1/vexq/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderpongracic1/vexq/actions/workflows/ci.yml)
+
 Built a vectorized analytical SQL execution engine in Go using columnar storage, dictionary encoding, zone maps, and morsel-driven parallel execution; implemented vectorized Volcano operators and a custom query parsing pipeline.
 
 ## Overview

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Build the C++ AVX2 filter kernel to verify it compiles.
+      # We do NOT run it — GitHub runners may lack AVX2 at runtime,
+      # and benchmark results on shared CI hardware are meaningless.
+      - name: Build SIMD filter kernel (C++)
+        run: make -C bench/simd_filter build
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # go test ./... is safe here:
+      # - bench/tpch imports go-sqlite3 (cgo) but tests t.Skip when
+      #   TPC-H data files are absent — no data is checked in.
+      # - duckdb_bench_test.go is gated behind //go:build duckdb
+      #   and excluded from the default build.
+      # - bench/simd_filter is package main with TestMain; its Go
+      #   benchmarks generate synthetic data on the fly if missing.
+      - name: Test
+        run: go test ./... -race -count=1
