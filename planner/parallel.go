@@ -84,6 +84,20 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		return Physical(ctx, root) // unsupported shape — fallback
 	}
 
+	// Fall back to serial execution if any aggregate uses a computed expression
+	// (e.g. SUM(price * discount)). The optimizer's pruneColumns places the
+	// synthetic column name (_agg_0) into LogicalScan.NeededCols, but that column
+	// does not exist in the physical file — it is materialized by
+	// buildPreProjection after the scan. The parallel factory would need to
+	// resolve the real source columns from AggExpr, scan those, and apply
+	// buildPreProjection in each worker pipeline. Until that is implemented,
+	// serial execution via Physical handles this correctly.
+	for i := range aggNode.Aggs {
+		if aggNode.Aggs[i].AggExpr != nil {
+			return Physical(ctx, root)
+		}
+	}
+
 	// ---- Row group count -----------------------------------------------------
 
 	r, err := storage.Open(ctx, scanNode.FilePath)
