@@ -446,14 +446,12 @@ func buildCorpus() []queryCase {
 
 		// --- HAVING ---
 		{
-			name:     "having_count",
-			query:    "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status HAVING COUNT(*) > 30",
-			knownBug: "ENGINE BUG: planner does not support AggFuncExpr in HAVING clause. HAVING COUNT(*) > 30 fails with 'unsupported expression type *sql.AggFuncExpr'. The planner only supports column references in HAVING predicates, not aggregate re-evaluation. Suspected location: planner/physical.go expression compilation.",
+			name:  "having_count",
+			query: "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status HAVING COUNT(*) > 30",
 		},
 		{
-			name:     "having_filters_all",
-			query:    "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status HAVING COUNT(*) > 9999",
-			knownBug: "ENGINE BUG: Same as having_count — HAVING does not support aggregate expressions.",
+			name:  "having_filters_all",
+			query: "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status HAVING COUNT(*) > 9999",
 		},
 
 		// --- DISTINCT ---
@@ -513,9 +511,8 @@ func buildCorpus() []queryCase {
 			query: "SELECT orders.order_id, items.quantity FROM orders, items WHERE orders.order_id = items.order_id AND items.quantity > 10 LIMIT 15",
 		},
 		{
-			name:     "join_aggregate",
-			query:    "SELECT orders.order_id, COUNT(*) AS item_count FROM orders, items WHERE orders.order_id = items.order_id GROUP BY orders.order_id HAVING COUNT(*) > 3",
-			knownBug: "ENGINE BUG: Same as having_count — HAVING does not support aggregate expressions (AggFuncExpr).",
+			name:  "join_aggregate",
+			query: "SELECT orders.order_id, COUNT(*) AS item_count FROM orders, items WHERE orders.order_id = items.order_id GROUP BY orders.order_id HAVING COUNT(*) > 3",
 		},
 
 		// --- Error cases ---
