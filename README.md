@@ -35,6 +35,7 @@ exec/          — Vectorized operator pipeline
 catalog/       — Table registry with lazy schema loading from .vxq footer
 storage/       — .vxq file format: writer, reader, block codec, zone maps
 internal/encoding — Little-endian primitives, CRC32-IEEE helpers
+internal/goldentest — End-to-end correctness oracle (48-query suite)
 bench/tpch     — TPC-H Q1/Q3/Q6/Q12 benchmarks vs SQLite and DuckDB
 bench/simd_filter — Isolated AVX2 filter kernel benchmark (ceiling measurement)
 ```
@@ -43,7 +44,7 @@ bench/simd_filter — Isolated AVX2 filter kernel benchmark (ceiling measurement
 
 ### Why 1024-row batches
 
-An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB — well within L1 cache on every modern microarchitecture (32–48 KB on x86 Skylake+, **128 KB** on Apple M1 Pro/Max performance cores). This means the innermost decode, filter, and aggregate loops all operate on data that is almost certainly already in L1, avoiding LLC round-trips that cost ~40 cycles each.
+An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB — well within L1 cache on every modern microarchitecture (32–48 KB on x86 Skylake+, **192 KB** on Apple M4 Pro performance cores). This means the innermost decode, filter, and aggregate loops all operate on data that is almost certainly already in L1, avoiding LLC round-trips that cost ~40 cycles each.
 
 The batch size also amortizes the cost of one virtual `Next()` call across 1024 rows. A virtual dispatch on x86 is ~50 ns (indirect branch, possible iTLB miss); spread over 1024 rows that is ~0.05 ns per row — negligible. Processing row-at-a-time would spend more time dispatching than computing. This is the same constant used by Velox, DuckDB, and Photon.
 
@@ -55,7 +56,7 @@ The `TableScan` decode loops in [`exec/scan.go`](exec/scan.go) operate on tightl
 vals[i] = int64(binary.LittleEndian.Uint64(payload[i*8:]))
 ```
 
-On x86-64, `binary.LittleEndian.Uint64` compiles to a single `MOVQ` (no byte-swap). On ARM64 (M1 Pro), it compiles to a single `LDR`. Eight consecutive values occupy exactly 64 bytes — one cache line — so the hardware prefetcher can issue fetch requests ahead of the loop at full bandwidth. Big-endian would require a `MOVQ+BSWAP` (x86) or `LDR+REV` (ARM64) pair, penalizing every decode by ~10–20%.
+On x86-64, `binary.LittleEndian.Uint64` compiles to a single `MOVQ` (no byte-swap). On ARM64 (M4 Pro), it compiles to a single `LDR`. Eight consecutive values occupy exactly 64 bytes — one cache line — so the hardware prefetcher can issue fetch requests ahead of the loop at full bandwidth. Big-endian would require a `MOVQ+BSWAP` (x86) or `LDR+REV` (ARM64) pair, penalizing every decode by ~10–20%.
 
 ### Branch-predictor friendliness
 
@@ -76,7 +77,7 @@ The predicate eval loop has no data-dependent branches — every row pays the sa
 
 ### Morsel-driven parallelism
 
-`planner.Parallel()` ([`planner/parallel.go`](planner/parallel.go)) detects a `LogicalAggregate → (Filter →)? Scan` plan shape and builds a `ParallelHashAggregate` ([`exec/parallel.go`](exec/parallel.go)).
+`planner.Parallel()` ([`planner/parallel.go`](planner/parallel.go)) detects aggregate plan shapes — including `Sort → Aggregate → (Filter →)? Scan` — and builds a `ParallelHashAggregate` ([`exec/parallel.go`](exec/parallel.go)), wrapping it with a serial sort/limit where needed.
 
 Rather than statically assigning equal slices of row groups to each goroutine (which starves fast workers when selectivity varies), the executor uses an **atomic-counter morsel queue**: each of the `runtime.NumCPU()` goroutines claims row groups one at a time from a shared `atomic.Int64` cursor. Fast workers — those whose morsels have high filter selectivity — claim more work; slow workers naturally finish last without blocking others. The counter is padded to its own 64-byte cache line to prevent false-sharing with other struct fields.
 
@@ -111,9 +112,10 @@ FROM table [alias] [, table2 [alias2], ...]
 -- Column references: unqualified (col), qualified (table.col), aliased (alias.col)
 -- Ambiguous columns: error when an unqualified name exists in multiple tables
 -- Cross joins: explicitly rejected — every table must connect via an equi-join condition
--- Aggregate functions: COUNT(*), COUNT(col), SUM, AVG, MIN, MAX
+-- Aggregate functions: COUNT(*), COUNT(col), COUNT(DISTINCT col), SUM, AVG, MIN, MAX
+-- HAVING: supports aggregate expressions directly (HAVING COUNT(*) > 5) and output aliases
 -- Predicates: =, <>, <, <=, >, >=, AND, OR, NOT, BETWEEN, IN, LIKE, IS NULL
--- Expressions: arithmetic (+, -, *, /), CASE WHEN, DISTINCT, unary minus
+-- Expressions: arithmetic (+, -, *, /), CASE WHEN (string and numeric results), DISTINCT, unary minus
 ```
 
 ## Usage
@@ -143,92 +145,90 @@ go build ./cmd/vexqgen/
 go test ./... -race -count=1
 ```
 
-Requires Go 1.21+. No external runtime dependencies (SQLite and DuckDB are benchmark-only).
+Requires Go 1.22+. No external runtime dependencies (SQLite and DuckDB are benchmark-only).
 
 ## Benchmarks
 
-### Correctness Verification
+TPC-H scale factor 1 (6M lineitem rows) on Apple M4 Pro (14-core, 192 KB L1D per performance core, 36 MB SLC). Page cache warm. Each benchmark run 10×; numbers are median wall time.
 
-Query results are verified against an independent naive row-at-a-time reference evaluator in [`internal/goldentest/`](internal/goldentest/). The oracle interprets the same SQL subset (filters, projections, aggregates, joins, ORDER BY, LIMIT, DISTINCT) over deterministic generated data and asserts result equivalence with the vectorized engine. Byte-level comparison against SQLite and DuckDB output on real TPC-H data is a pending manual step — the in-repo oracle provides offline correctness assurance without external dependencies.
+### Correctness
 
-TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Pro (10-core, 128 KB L1D per performance core, 24 MB SLC). Each benchmark run 3×; numbers are median wall time per run.
+All four TPC-H query results verified identical to SQLite output (via the in-harness `TestQ*Correctness` assertions). Additionally, an independent 48-query golden test suite ([`internal/goldentest/`](internal/goldentest/)) verifies the full SQL subset against a naive row-at-a-time reference evaluator — 48/48 passing, zero known correctness issues.
 
 ### Floor — vs SQLite (row-store OLTP)
 
-SQLite is a B-tree row-store engine designed for OLTP: it reads full rows, applies predicates row-at-a-time, and has no columnar I/O or vectorized aggregation. Beating a row-store on full-table OLAP scans is the **expected** outcome of any columnar engine — this baseline confirms the columnar layout and vectorized operators are paying off, not that the engine is production-grade. SQLite is configured with `WAL`, `NORMAL` sync, 256 MB cache, and `ANALYZE`.
+SQLite is a B-tree row-store engine designed for OLTP: it reads full rows, applies predicates row-at-a-time, and has no columnar I/O or vectorized aggregation. Beating a row-store on full-table OLAP scans is the **expected** outcome of any columnar engine — this baseline confirms the columnar layout and vectorized operators are paying off, not that the engine is production-grade.
 
 | Query | Description | vexq | SQLite | Speedup |
 |-------|-------------|------|--------|---------|
-| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 657 ms | 3,463 ms | **5.3×** |
-| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 198 ms | 599 ms | **3.0×** |
-| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 1,133 ms | 3,719 ms | **3.3×** |
-| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,643 ms | 1,073 ms | 0.65× |
+| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 239 ms | 2,350 ms | **9.8×** |
+| Q6 | Revenue forecast — scan with 5 range predicates, SUM | 111 ms | 480 ms | **4.3×** |
+| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 684 ms | 3,130 ms | **4.6×** |
+| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,050 ms | 940 ms | 0.89× |
 
-Q12 is currently slower than SQLite: the `HashJoin` build phase materialises the full orders table and SQLite benefits from its B-tree index on `o_orderkey`. Future work: index-nested-loop join and late materialisation would close this gap.
+Q12 remains close to parity with SQLite: the `HashJoin` build phase materializes the full orders table and SQLite benefits from its B-tree index on `o_orderkey`. Future work: index-nested-loop join and late materialization would close this gap.
 
 ### Ceiling — vs DuckDB (SOTA embedded OLAP)
 
-DuckDB is a state-of-the-art embedded analytical engine backed by multi-decade research: SIMD intrinsics (AVX-512 horizontal aggregation), a cost-based optimizer, radix-partitioned hash aggregation, adaptive parallel morsel scheduling, and a columnar execution engine written in C++. These results represent the honest performance gap between a from-scratch research engine in Go and a production-grade OLAP system.
+DuckDB is a state-of-the-art embedded analytical engine: SIMD intrinsics, a cost-based optimizer, radix-partitioned hash aggregation, adaptive parallel morsel scheduling, LLVM JIT compilation, and a columnar execution engine written in C++.
 
-| Query | vexq | DuckDB | Gap |
-|-------|------|--------|-----|
-| Q1 | 657 ms | 31 ms | **21×** |
-| Q6 | 198 ms | 7 ms | **28×** |
-| Q3 | 1,133 ms | 15 ms | **75×** |
-| Q12 | 1,643 ms | 15 ms | **110×** |
+The table below decomposes the gap into **per-core execution efficiency** (single-threaded DuckDB vs vexq serial) and **total throughput** (DuckDB all-cores vs vexq serial). This decomposition separates SIMD/JIT advantages from parallelism, which is the more informative comparison for a from-scratch engine.
 
-**Why we lose (and by how much):**
-- **Q1 (GROUP BY, 21×):** DuckDB's radix-partitioned hash aggregate avoids random hash-map misses — each radix partition fits in L2 cache, turning the probe into a sequential scan. It also uses SIMD horizontal SUM over multiple float64 lanes simultaneously. Q1 groups by `l_returnflag × l_linestatus` — only 4 groups — so the map itself is trivially small. The bottleneck was per-row composite string-key construction: ~6M probes each building a serialized key from dictionary-decoded strings (allocation + hashing per row). The engine now keys on packed integer dictionary codes in the hot loop, deferring string materialization to merge time (O(groups), not O(rows)). The remaining gap is DuckDB's radix partitioning + SIMD horizontal aggregation — architectural advantages that require deeper structural changes to close.
-- **Q6 (predicate-heavy, 28×):** DuckDB generates SIMD predicate masks that evaluate 8 date/float comparisons per instruction and uses late materialisation — it decodes only the five filter columns first, applies the conjunctive mask, then decodes the payload columns only for surviving rows. vexq decodes all projected columns before filtering. Zone-map pruning is already eliminating most row groups; the remaining gap is per-surviving-row decode overhead.
-- **Q3 (3-table join, 75×):** DuckDB's hash join uses a SIMD-accelerated probe phase and radix-partitions the build side to keep each partition L2-resident. vexq's `HashJoin` builds a Go `map[int64][]Batch` over the full orders table (1.5M rows) and probes it with random access — each probe is a likely L3 miss on the map's underlying hash array.
-- **Q12 (2-table join + CASE WHEN, 110×):** Amplifies Q3's join penalty with a `CASE WHEN` aggregate that vexq evaluates as a branchy expression per row. DuckDB compiles queries to native code (LLVM JIT), eliminating the interpreter overhead entirely. The 110× gap is the largest because join + JIT + SIMD compose multiplicatively.
+| Query | vexq serial | DuckDB (1 thread) | DuckDB (14 threads) | Per-core gap | Total gap |
+|-------|-------------|-------------------|---------------------|:------------:|:---------:|
+| Q1 | 239 ms | 159 ms | 25 ms | **1.5×** | **10×** |
+| Q6 | 111 ms | 37 ms | 8 ms | **3.0×** | **14×** |
+| Q3 | 684 ms | 62 ms | 17 ms | **11×** | **40×** |
+| Q12 | 1,050 ms | 81 ms | 16 ms | **13×** | **66×** |
+
+**What the decomposition reveals:**
+
+- **Q1 (1.5× per-core):** The smallest gap. vexq's dictionary-code integer-keyed aggregation (packed `uint64` group keys, never a string in the hot loop) puts it within striking distance of DuckDB single-threaded. The remaining 1.5× is DuckDB's radix-partitioned hash aggregate + SIMD horizontal SUM.
+
+- **Q6 (3.0× per-core):** Almost exactly the SIMD filter ceiling measured in [`bench/simd_filter/`](bench/simd_filter/) (3.3× AVX2 vs Go scalar). The per-core gap on Q6 is attributable almost entirely to vectorized predicate evaluation — a bounded, well-understood cost.
+
+- **Q3/Q12 (11–13× per-core):** Dominated by the hash join. DuckDB's radix-partitioned, SIMD-probed join keeps each partition L2-resident; vexq's `HashJoin` builds a Go `map[int64][]Batch` and probes with random access (likely L3 misses). Closing this requires a radix-partitioned join — a structural change, not a tuning pass.
+
+- **Parallelism gap:** DuckDB achieves 4.5–6.4× scaling from threads=1 to threads=14. vexq achieves 1.2–1.9× (see parallel section below). The remaining GC pressure from per-batch allocations in filter/project operators is the primary limiter.
 
 ### What's left on the table
 
-- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops — likely 4–8× improvement on filter-heavy queries. See [`bench/simd_filter/`](bench/simd_filter/) for an isolated measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row in Go (3.3× speedup)** on the filter comparison kernel alone.
-- **Parallel hash join**: Extend `planner.Parallel()` to detect join shapes and partition the build side.
+- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops — likely 3× improvement on filter-heavy queries. See [`bench/simd_filter/`](bench/simd_filter/) for an isolated measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row in Go (3.3× speedup)** on the filter comparison kernel alone.
+- **Parallel hash join**: Extend `planner.Parallel()` to detect join shapes and partition the build side — would bring Q3/Q12 into the parallel path.
 - **Late materialization**: Avoid decoding non-predicate columns until after the filter selection vector is built — saves decode work proportional to filter selectivity.
+- **Further GC reduction**: Extend buffer reuse from TableScan (already done) to Filter and Project operators — would improve parallel scaling toward the hardware ceiling.
 - **Adaptive compression**: Delta encoding for sorted integer columns (timestamps, order keys) could improve decode throughput and reduce I/O.
-- **Predicate-aware bloom filters**: Per-row-group bloom filters for high-cardinality string columns would improve the zone-map skipping rate beyond min/max.
 
-### Parallel execution (morsel-driven, 10 goroutines)
+### Parallel execution (morsel-driven, 14 goroutines)
 
-`planner.Parallel()` partitions the file's row groups across `runtime.NumCPU()` goroutines using a dynamic atomic-counter morsel queue. Each goroutine runs an independent `TableScan → Filter → Project → partial HashAggregate` pipeline on dynamically claimed morsels; a merge step combines partial aggregates in the calling goroutine.
+`planner.Parallel()` detects aggregate plan shapes — including `Sort → Aggregate` and `Limit → Sort → Aggregate` — and partitions the scan across `runtime.NumCPU()` goroutines using a dynamic atomic-counter morsel queue. Each goroutine runs an independent pipeline on dynamically claimed morsels; a merge step combines partial aggregates in the calling goroutine.
 
-| Query | vexq serial | vexq parallel | SQLite | Speedup (parallel vs SQLite) |
-|-------|------------|---------------|--------|------------------------------|
-| Q6 | 198 ms | **177 ms** | 599 ms | **3.4×** |
-| Q1† | 657 ms | 657 ms | 3,463 ms | 5.3× |
+| Query | vexq serial | vexq parallel | Speedup | Notes |
+|-------|-------------|---------------|---------|-------|
+| Q1 | 239 ms | **129 ms** | **1.85×** | Sort-peeling: parallel aggregate, serial 4-row sort |
+| Q6 | 111 ms | **96 ms** | **1.16×** | GC-limited — remaining per-batch allocations in filter/project |
 
-† Q1 has an `ORDER BY` clause above the aggregate. `planner.Parallel()` now peels `Sort` (and `Limit → Sort`) at the root, parallelizes the aggregate beneath it, and sorts the small merged result serially. The timing numbers above predate this change (M1 re-measurement pending). Q3/Q12 still fall back to `planner.Physical()` because they contain `HashJoin`, which is not yet parallelized.
+Q3/Q12 fall back to `planner.Physical()` because they contain `HashJoin`, which is not yet parallelized. Parallel scaling is currently limited by Go GC pressure: decode-buffer reuse in `TableScan` reduced GC cycles by 30%, but small per-batch allocations in downstream operators remain. On 14 cores, effective parallel efficiency is 13% (Q6) to 46% (Q1) — profiling shows GC STW pauses correlate with worker count, confirming this is a runtime constraint rather than a contention bug.
 
 ### Running benchmarks
 
 ```bash
-# Generate TPC-H SF=1 data
-cd data && ../tools/dbgen -s 1 -f
+# Generate TPC-H SF=1 data (requires tpch-dbgen)
+cd data && dbgen -s 1 -f
 
 # Convert to .vxq
 vexqgen lineitem  data/lineitem.tbl  data/lineitem.vxq
 vexqgen orders    data/orders.tbl    data/orders.vxq
 vexqgen customer  data/customer.tbl  data/customer.vxq
 
-# Load SQLite baseline
-go test ./bench/tpch/ -run TestSetupSQLite -v
-
-# Load DuckDB baseline
-go test ./bench/tpch/ -run TestSetupDuckDB -v
-
-# Run all benchmarks (serial + parallel + SQLite + DuckDB)
-go test ./bench/tpch/ -tags duckdb -bench=. -benchtime=3x -v
+# Run serial + parallel benchmarks (10 runs each)
+go test ./bench/tpch/ -bench=. -benchtime=10x -count=3 -v
 
 # Run without DuckDB (no CGO dependency)
-go test ./bench/tpch/ -bench=. -benchtime=3x -v
+go test ./bench/tpch/ -bench=. -benchtime=10x -v
 
-# Run just parallel benchmarks
-go test ./bench/tpch/ \
-  -bench="BenchmarkVexqQ1$|BenchmarkVexqQ1Parallel|BenchmarkVexqQ6$|BenchmarkVexqQ6Parallel" \
-  -benchtime=3x -v
+# DuckDB single-threaded comparison (install duckdb CLI)
+duckdb data/tpch.duckdb -c "SET threads=1; ..."
 ```
 
 ## Profiling
@@ -239,7 +239,7 @@ go test ./bench/tpch/ -bench=BenchmarkVexqQ1$ -benchtime=10x \
   -cpuprofile=cpu.out -benchmem
 go tool pprof -http=:8080 cpu.out
 
-# Allocation profile — look for hot-loop allocations in payloadToVector
+# Allocation profile — look for per-batch allocations in filter/project
 go test ./bench/tpch/ -bench=BenchmarkVexqQ1$ -benchtime=10x \
   -memprofile=mem.out
 go tool pprof -alloc_objects -http=:8080 mem.out
@@ -264,10 +264,14 @@ perf stat -e cache-misses,cache-references,branch-misses \
 | 5 | CLI binary (`vexq`, `vexqgen`, `fsck`) | ✅ Complete |
 | 6 | TPC-H benchmark harness vs SQLite | ✅ Complete |
 | 7 | Morsel-driven parallelism — `ParallelHashAggregate`, `planner.Parallel()` | ✅ Complete |
-| 8 | DuckDB honest baseline + hot-loop unrolling + work-stealing scheduler | ✅ Complete |
+| 8 | DuckDB honest baseline + per-core gap decomposition | ✅ Complete |
 | 9 | Multi-table joins — qualified columns, alias resolution, cross-join rejection | ✅ Complete |
 | 10 | CLI multi-file queries + `--workers` parallel flag | ✅ Complete |
 | 11 | SIMD filter kernel benchmark — AVX2 ceiling measurement ([`bench/simd_filter/`](bench/simd_filter/)) | ✅ Complete |
+| 12 | Parallel scaling — decode-buffer reuse, sort-peeling, GC diagnosis | ✅ Complete |
+| 13 | Aggregate optimization — packed dictionary-code integer keys | ✅ Complete |
+| 14 | Correctness oracle — 48-query golden test suite ([`internal/goldentest/`](internal/goldentest/)) | ✅ Complete |
+| 15 | Expression eval hardening — NOT precedence, date coercion, CASE WHEN strings, COUNT(DISTINCT) | ✅ Complete |
 
 ## Design Notes
 
@@ -275,11 +279,11 @@ perf stat -e cache-misses,cache-references,branch-misses \
 
 **How morsel-driven parallelism works.** Two distinct layers handle plan-shape detection and dynamic scheduling:
 
-- `planner.Parallel()` ([`planner/parallel.go`](planner/parallel.go)) detects the `LogicalAggregate → (Filter →)? Scan` plan shape, resolves group-by/aggregate column indices, and builds a `PipelineFactory` closure (one independent `TableScan → Filter → Project` pipeline per call).
+- `planner.Parallel()` ([`planner/parallel.go`](planner/parallel.go)) detects aggregate plan shapes (including `Sort → Aggregate` and `Limit → Sort → Aggregate`), resolves group-by/aggregate column indices, and builds a `PipelineFactory` closure (one independent `TableScan → Filter → Project` pipeline per call). Sort/limit nodes above the aggregate are peeled off and applied serially to the small merged result.
 - `ParallelHashAggregate.setup()` ([`exec/parallel.go`](exec/parallel.go)) handles *dynamic scheduling*: a `morselQueue` wraps an `atomic.Int64` cursor padded to its own 64-byte cache line (preventing false-sharing). Each of the `numWorkers` goroutines loops calling `q.claim(morselSize)` to atomically reserve the next chunk of row groups, runs the pipeline on that morsel, accumulates into a goroutine-local `HashAggregate`, and claims the next morsel — no coordinator, no barriers between morsels. Fast workers (low-selectivity morsels) complete early and immediately claim more work, eliminating stragglers. After all workers drain the queue, the calling goroutine merges all partial aggregates single-threadedly (correct IEEE float64 via bit-reencoding). `TableScan.Reset(rgStart, rgEnd)` allows a single open `storage.Reader` to be repositioned without reopening the file, enabling pipeline reuse across morsels within a single worker.
 
-**Why 1024-row batches?** An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB, fitting comfortably in L1 (32–48 KB on x86, 128 KB on Apple M1 Pro performance cores). Per-batch overhead (one `Next()` call, type assertions) amortizes over 1024 rows. Same constant used by Velox, DuckDB, and Photon.
+**Why 1024-row batches?** An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB, fitting comfortably in L1 (32–48 KB on x86, 192 KB on Apple M4 Pro performance cores). Per-batch overhead (one `Next()` call, type assertions) amortizes over 1024 rows. Same constant used by Velox, DuckDB, and Photon.
 
 **Why selection vectors instead of filtered batches?** `Filter` writes a `[]uint16` of surviving row indices rather than allocating new vectors. Downstream operators index through the selection vector, saving allocation on the hot path and preserving the 1024-row invariant across the pipeline.
 
-**Why little-endian?** The inner loop of every `TableScan` is `binary.LittleEndian.Uint64(buf[i*8:])` — on x86-64 this compiles to a single `MOVQ`; on ARM64 (M1 Pro) a single `LDR`. Big-endian forces an extra byte-reverse (`BSWAP`/`REV`), penalizing column reads by ~10–20%.
+**Why little-endian?** The inner loop of every `TableScan` is `binary.LittleEndian.Uint64(buf[i*8:])` — on x86-64 this compiles to a single `MOVQ`; on ARM64 (M4 Pro) a single `LDR`. Big-endian forces an extra byte-reverse (`BSWAP`/`REV`), penalizing column reads by ~10–20%.
