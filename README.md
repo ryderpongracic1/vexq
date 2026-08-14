@@ -145,6 +145,10 @@ Requires Go 1.21+. No external runtime dependencies (SQLite and DuckDB are bench
 
 ## Benchmarks
 
+### Correctness Verification
+
+Query results are verified against an independent naive row-at-a-time reference evaluator in [`internal/goldentest/`](internal/goldentest/). The oracle interprets the same SQL subset (filters, projections, aggregates, joins, ORDER BY, LIMIT, DISTINCT) over deterministic generated data and asserts result equivalence with the vectorized engine. Byte-level comparison against SQLite and DuckDB output on real TPC-H data is a pending manual step — the in-repo oracle provides offline correctness assurance without external dependencies.
+
 TPC-H scale factor 1 (6M lineitem rows) on Apple M1 Pro (10-core, 128 KB L1D per performance core, 24 MB SLC). Each benchmark run 3×; numbers are median wall time per run.
 
 ### Floor — vs SQLite (row-store OLTP)
