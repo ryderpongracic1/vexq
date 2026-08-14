@@ -71,6 +71,11 @@ func (db *DictBuilder) Lookup(s string) (uint32, bool) {
 // Len returns the number of distinct entries.
 func (db *DictBuilder) Len() int { return len(db.keys) }
 
+// GetByCode returns the string for a given code. Panics if code is out of range.
+func (db *DictBuilder) GetByCode(code uint32) string {
+	return db.keys[code]
+}
+
 // Marshal serialises the dictionary:
 //
 //	[4B num_entries][num_entries × 4B offset][4B total_len][data bytes][4B CRC32]
@@ -222,7 +227,10 @@ func DecodeRLEBool(data []byte) (values []bool, nullBitmap []byte, rows int, err
 	}
 	runCount, rest := enc.ReadUint32(payload)
 	total := 0
-	type run struct{ length uint32; val byte }
+	type run struct {
+		length uint32
+		val    byte
+	}
 	runs := make([]run, runCount)
 	for i := uint32(0); i < runCount; i++ {
 		if len(rest) < 5 {

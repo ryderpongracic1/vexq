@@ -42,7 +42,7 @@ type groupByVal struct {
 // It accumulates all input before emitting any output (unbounded memory in v1).
 type HashAggregate struct {
 	child    Operator
-	groupBy  []int   // column indices in the child schema
+	groupBy  []int // column indices in the child schema
 	aggExprs []AggExpr
 	schema   Schema
 
@@ -52,8 +52,13 @@ type HashAggregate struct {
 	groupCnt   map[string]int64        // key → count of rows in group (legacy)
 	aggNonNull map[string][]int64      // key → per-aggregate non-null input count
 	samples    map[string][]groupByVal // key → representative group-by values
-	done   bool
-	outPos int
+	done       bool
+	outPos     int
+
+	// Integer-key fast path: eliminates string allocation in the hot loop
+	// when all GROUP BY columns are dict-encoded strings.
+	intKey        intKeyState
+	intKeyDecided bool // true once we've checked the first batch
 }
 
 func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashAggregate, error) {
@@ -105,10 +110,10 @@ func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashA
 	}
 
 	return &HashAggregate{
-		child:    child,
-		groupBy:  groupBy,
-		aggExprs: resolved,
-		schema:   Schema{Fields: outFields},
+		child:      child,
+		groupBy:    groupBy,
+		aggExprs:   resolved,
+		schema:     Schema{Fields: outFields},
 		groups:     make(map[string][]int64),
 		groupCnt:   make(map[string]int64),
 		aggNonNull: make(map[string][]int64),
@@ -154,6 +159,8 @@ func (h *HashAggregate) initMaps() {
 	h.groupCnt = make(map[string]int64)
 	h.aggNonNull = make(map[string][]int64)
 	h.samples = make(map[string][]groupByVal)
+	h.intKeyDecided = false
+	h.intKey = intKeyState{}
 }
 
 func (h *HashAggregate) consumeAll(ctx context.Context) error {
@@ -164,12 +171,17 @@ func (h *HashAggregate) consumeAll(ctx context.Context) error {
 			return fmt.Errorf("exec: hash agg: %w", err)
 		}
 		if batch == nil {
-			return nil
+			break
 		}
 		if err := h.accumulate(batch); err != nil {
 			return fmt.Errorf("exec: hash agg: %w", err)
 		}
 	}
+	// Materialize integer-key results into string-key maps for output.
+	if h.intKey.enabled && len(h.intKey.intKeys) > 0 {
+		h.intKey.materializeToStringMaps(h)
+	}
+	return nil
 }
 
 // accumulate processes one batch into the hash aggregate maps.
@@ -203,6 +215,20 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 	// Fast path: no GROUP BY eliminates per-row map lookup (e.g. Q6 SUM with no groups).
 	if len(h.groupBy) == 0 {
 		return h.accumulateDirect(indices, aggVecs)
+	}
+
+	// Integer-key fast path: when all GROUP BY columns are dict-encoded strings,
+	// key on packed global dictionary codes instead of building composite string keys.
+	if !h.intKeyDecided {
+		h.intKeyDecided = true
+		if canUseIntKey(batch, h.groupBy) {
+			h.intKey.enabled = true
+			h.intKey.init(len(h.groupBy))
+		}
+	}
+
+	if h.intKey.enabled {
+		return h.accumulateIntKey(batch, indices, aggVecs)
 	}
 
 	for _, rowIdx := range indices {
