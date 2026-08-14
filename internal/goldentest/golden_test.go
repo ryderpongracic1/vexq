@@ -575,9 +575,8 @@ func buildCorpus() []queryCase {
 
 		// --- Unary minus ---
 		{
-			name:     "unary_minus",
-			query:    "SELECT order_id, -amount AS neg_amount FROM orders WHERE amount IS NOT NULL LIMIT 5",
-			knownBug: "BLOCKED BY PROJECT BUG: unary minus is fixed (type-matched literal), but this query triggers the separate exec.Project index-out-of-range panic when projecting arithmetic on a filtered+limited batch (same root cause as projection_arithmetic case).",
+			name:  "unary_minus",
+			query: "SELECT order_id, -amount AS neg_amount FROM orders WHERE amount IS NOT NULL LIMIT 5",
 		},
 
 		// --- NOT BETWEEN ---
