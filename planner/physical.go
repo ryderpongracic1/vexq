@@ -186,10 +186,14 @@ func resolveAggConfig(n *LogicalAggregate, schema exec.Schema) (groupByIdxs []in
 
 	for i := range n.Aggs {
 		agg := &n.Aggs[i]
-		ae := exec.AggExpr{OutName: agg.Alias}
+		ae := exec.AggExpr{OutName: agg.Alias, Distinct: agg.Distinct}
 		switch agg.Func {
 		case "COUNT":
-			ae.Kind = exec.AggCount
+			if agg.Distinct {
+				ae.Kind = exec.AggCountDistinct
+			} else {
+				ae.Kind = exec.AggCount
+			}
 			ae.AccumType = exec.TypeInt64
 			if agg.ColName == "" {
 				ae.ColIdx = -1

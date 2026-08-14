@@ -50,13 +50,13 @@ type LogicalFilter struct {
 	Predicate sql.Expr
 }
 
-func (*LogicalFilter) logicalTag() {}
+func (*LogicalFilter) logicalTag()                 {}
 func (n *LogicalFilter) OutputSchema() exec.Schema { return n.Child.OutputSchema() }
 
 // LogicalProject evaluates a list of named expressions.
 type LogicalProject struct {
-	Child   LogicalNode
-	Exprs   []ProjectItem
+	Child LogicalNode
+	Exprs []ProjectItem
 }
 
 func (*LogicalProject) logicalTag() {}
@@ -76,9 +76,9 @@ type ProjectItem struct {
 
 // LogicalAggregate groups and aggregates.
 type LogicalAggregate struct {
-	Child    LogicalNode
-	GroupBy  []sql.Expr
-	Aggs     []AggItem
+	Child   LogicalNode
+	GroupBy []sql.Expr
+	Aggs    []AggItem
 }
 
 func (*LogicalAggregate) logicalTag() {}
@@ -124,20 +124,21 @@ func (n *LogicalAggregate) OutputSchema() exec.Schema {
 }
 
 type AggItem struct {
-	Func    string   // COUNT, SUM, AVG, MIN, MAX
-	ColName string   // source column name ("" for COUNT(*) or complex expressions)
-	AggExpr sql.Expr // non-nil for complex expressions (e.g. SUM(a * (1-b)))
-	Alias   string
-	ColIdx  int // resolved during physical planning
+	Func     string   // COUNT, SUM, AVG, MIN, MAX
+	ColName  string   // source column name ("" for COUNT(*) or complex expressions)
+	AggExpr  sql.Expr // non-nil for complex expressions (e.g. SUM(a * (1-b)))
+	Alias    string
+	ColIdx   int  // resolved during physical planning
+	Distinct bool // true for COUNT(DISTINCT col)
 }
 
 // LogicalSort sorts the output.
 type LogicalSort struct {
-	Child    LogicalNode
-	OrderBy  []sql.OrderByItem
+	Child   LogicalNode
+	OrderBy []sql.OrderByItem
 }
 
-func (*LogicalSort) logicalTag() {}
+func (*LogicalSort) logicalTag()                 {}
 func (n *LogicalSort) OutputSchema() exec.Schema { return n.Child.OutputSchema() }
 
 // LogicalLimit limits output rows.
@@ -146,7 +147,7 @@ type LogicalLimit struct {
 	Count int64
 }
 
-func (*LogicalLimit) logicalTag() {}
+func (*LogicalLimit) logicalTag()                 {}
 func (n *LogicalLimit) OutputSchema() exec.Schema { return n.Child.OutputSchema() }
 
 // LogicalJoin is an inner join.
@@ -185,5 +186,5 @@ type LogicalDistinct struct {
 	Child LogicalNode
 }
 
-func (*LogicalDistinct) logicalTag()                    {}
+func (*LogicalDistinct) logicalTag()                 {}
 func (d *LogicalDistinct) OutputSchema() exec.Schema { return d.Child.OutputSchema() }
