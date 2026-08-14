@@ -14,6 +14,18 @@ import (
 //   - Column pruning: only reads columns listed in projectedCols.
 //   - Zone map pruning: skips entire row groups via ZonePred.
 //   - Row-group range: only scans [rgStart, rgEnd) for morsel-driven parallelism.
+//
+// Buffer ownership contract: TableScan reuses internal decode buffers across
+// blocks. Each call to Next() overwrites the previous batch's vector data.
+// Callers MUST fully consume or copy batch data before calling Next() again.
+// This contract is satisfied by:
+//   - Filter: creates a SelVec referencing the same batch (no retained refs).
+//   - Project: materializes new vectors from Eval results (copies selected data).
+//   - HashAggregate: extracts scalar values into accumulator maps (no retained refs).
+//
+// This design eliminates ~35K allocations per full scan (6 cols × 64 blocks/rg
+// × 92 rg), reducing GC pressure from ~238 cycles to near-zero for parallel
+// morsel-driven execution.
 type TableScan struct {
 	reader   *storage.Reader
 	schema   Schema // output schema (projected columns only)
@@ -24,6 +36,109 @@ type TableScan struct {
 	rgIdx    int
 	crList   []*storage.ColumnReader
 	rgDone   bool
+
+	// Reusable decode buffers — allocated once per column, reused across blocks.
+	// Each entry corresponds to a projected column (same index as colMap/schema).
+	bufs *scanBuffers
+}
+
+// scanBuffers holds reusable decode buffers for a TableScan. One buffer set
+// per projected column, allocated on first use and reused across all subsequent
+// blocks. This eliminates per-block allocations in the decode hot path.
+type scanBuffers struct {
+	int64Bufs   [][]int64   // one per projected INT64 column
+	float64Bufs [][]float64 // one per projected FLOAT64 column
+	int32Bufs   [][]int32   // one per projected DATE column
+	uint32Bufs  [][]uint32  // one per projected STRING column (dict codes)
+	nullBufs    [][]byte    // one per projected column (null bitmap)
+
+	// colBufIdx maps each projected column to its type-specific buffer index.
+	// e.g., if col 0 is INT64, col 1 is FLOAT64, col 2 is INT64:
+	//   colBufIdx = [0, 0, 1] (col0 → int64Bufs[0], col1 → float64Bufs[0], col2 → int64Bufs[1])
+	colBufIdx []int
+}
+
+// initScanBuffers allocates the buffer structure for the given schema.
+// The actual slice capacity is allocated lazily on first use (when we know rows).
+func initScanBuffers(schema Schema) *scanBuffers {
+	sb := &scanBuffers{
+		colBufIdx: make([]int, len(schema.Fields)),
+	}
+	var nInt64, nFloat64, nInt32, nUint32 int
+	for i, f := range schema.Fields {
+		switch f.Type {
+		case TypeInt64:
+			sb.colBufIdx[i] = nInt64
+			nInt64++
+		case TypeFloat64:
+			sb.colBufIdx[i] = nFloat64
+			nFloat64++
+		case TypeDate:
+			sb.colBufIdx[i] = nInt32
+			nInt32++
+		case TypeString:
+			sb.colBufIdx[i] = nUint32
+			nUint32++
+		default:
+			sb.colBufIdx[i] = -1 // bool and others: not pooled
+		}
+	}
+	sb.int64Bufs = make([][]int64, nInt64)
+	sb.float64Bufs = make([][]float64, nFloat64)
+	sb.int32Bufs = make([][]int32, nInt32)
+	sb.uint32Bufs = make([][]uint32, nUint32)
+	sb.nullBufs = make([][]byte, len(schema.Fields))
+	return sb
+}
+
+// getInt64Buf returns a reusable int64 buffer of exactly `rows` elements.
+func (sb *scanBuffers) getInt64Buf(colIdx, rows int) []int64 {
+	idx := sb.colBufIdx[colIdx]
+	if cap(sb.int64Bufs[idx]) >= rows {
+		return sb.int64Bufs[idx][:rows]
+	}
+	sb.int64Bufs[idx] = make([]int64, rows)
+	return sb.int64Bufs[idx]
+}
+
+// getFloat64Buf returns a reusable float64 buffer of exactly `rows` elements.
+func (sb *scanBuffers) getFloat64Buf(colIdx, rows int) []float64 {
+	idx := sb.colBufIdx[colIdx]
+	if cap(sb.float64Bufs[idx]) >= rows {
+		return sb.float64Bufs[idx][:rows]
+	}
+	sb.float64Bufs[idx] = make([]float64, rows)
+	return sb.float64Bufs[idx]
+}
+
+// getInt32Buf returns a reusable int32 buffer of exactly `rows` elements.
+func (sb *scanBuffers) getInt32Buf(colIdx, rows int) []int32 {
+	idx := sb.colBufIdx[colIdx]
+	if cap(sb.int32Bufs[idx]) >= rows {
+		return sb.int32Bufs[idx][:rows]
+	}
+	sb.int32Bufs[idx] = make([]int32, rows)
+	return sb.int32Bufs[idx]
+}
+
+// getUint32Buf returns a reusable uint32 buffer of exactly `rows` elements.
+func (sb *scanBuffers) getUint32Buf(colIdx, rows int) []uint32 {
+	idx := sb.colBufIdx[colIdx]
+	if cap(sb.uint32Bufs[idx]) >= rows {
+		return sb.uint32Bufs[idx][:rows]
+	}
+	sb.uint32Bufs[idx] = make([]uint32, rows)
+	return sb.uint32Bufs[idx]
+}
+
+// getNullBuf returns a reusable null bitmap buffer for the given column.
+func (sb *scanBuffers) getNullBuf(colIdx, rows int) []byte {
+	need := (rows + 7) / 8
+	if cap(sb.nullBufs[colIdx]) >= need {
+		return sb.nullBufs[colIdx][:need]
+	}
+	sb.nullBufs[colIdx] = make([]byte, need)
+	return sb.nullBufs[colIdx]
 }
 
 // ZonePredicate is called with a row group's column stats before reading it.
@@ -136,6 +251,11 @@ func (s *TableScan) readBlock(ctx context.Context) (*Batch, bool, error) {
 		return nil, true, nil
 	}
 
+	// Lazily initialize reusable decode buffers on first block read.
+	if s.bufs == nil {
+		s.bufs = initScanBuffers(s.schema)
+	}
+
 	vectors := make([]Vector, len(s.crList))
 	var batchLen int
 
@@ -152,7 +272,7 @@ func (s *TableScan) readBlock(ctx context.Context) (*Batch, bool, error) {
 		}
 
 		field := s.schema.Fields[i]
-		vec, err := s.payloadToVector(field, nullBitmap, payload, rows, cr)
+		vec, err := s.payloadToVector(field, nullBitmap, payload, rows, cr, i)
 		if err != nil {
 			return nil, false, err
 		}
@@ -168,11 +288,11 @@ func (s *TableScan) readBlock(ctx context.Context) (*Batch, bool, error) {
 
 func (s *TableScan) payloadToVector(
 	field Field, nullBitmap, payload []byte, rows int,
-	cr *storage.ColumnReader,
+	cr *storage.ColumnReader, colIdx int,
 ) (Vector, error) {
 	switch field.Type {
 	case TypeInt64:
-		vals := make([]int64, rows)
+		vals := s.bufs.getInt64Buf(colIdx, rows)
 		// Reslice upfront: the compiler proves all reads are in-bounds and
 		// eliminates per-iteration bounds checks. Each 8-element iteration
 		// loads exactly 64 bytes — one L1 cache line — with 8 independent
@@ -192,12 +312,12 @@ func (s *TableScan) payloadToVector(
 		for ; i < rows; i++ {
 			vals[i] = int64(binary.LittleEndian.Uint64(p8[i*8:]))
 		}
-		nb := make([]byte, (rows+7)/8)
+		nb := s.bufs.getNullBuf(colIdx, rows)
 		copy(nb, nullBitmap)
 		return &Int64Vector{Values: vals, NullBitmap: nb}, nil
 
 	case TypeFloat64:
-		vals := make([]float64, rows)
+		vals := s.bufs.getFloat64Buf(colIdx, rows)
 		// Same bounds-check elimination and cache-line stride as TypeInt64.
 		p8 := payload[:rows*8]
 		i := 0
@@ -214,12 +334,12 @@ func (s *TableScan) payloadToVector(
 		for ; i < rows; i++ {
 			vals[i] = math.Float64frombits(binary.LittleEndian.Uint64(p8[i*8:]))
 		}
-		nb := make([]byte, (rows+7)/8)
+		nb := s.bufs.getNullBuf(colIdx, rows)
 		copy(nb, nullBitmap)
 		return &Float64Vector{Values: vals, NullBitmap: nb}, nil
 
 	case TypeDate:
-		vals := make([]int32, rows)
+		vals := s.bufs.getInt32Buf(colIdx, rows)
 		// 4-byte values: unroll 16 per iteration to fill one 64-byte cache line.
 		p4 := payload[:rows*4]
 		i := 0
@@ -244,11 +364,12 @@ func (s *TableScan) payloadToVector(
 		for ; i < rows; i++ {
 			vals[i] = int32(binary.LittleEndian.Uint32(p4[i*4:]))
 		}
-		nb := make([]byte, (rows+7)/8)
+		nb := s.bufs.getNullBuf(colIdx, rows)
 		copy(nb, nullBitmap)
 		return &DateVector{Values: vals, NullBitmap: nb}, nil
 
 	case TypeBool:
+		// Bool uses RLE decoding — not pooled (variable-length output).
 		vals, nulls, _, err := storage.DecodeRLEBool(payload)
 		if err != nil {
 			return nil, fmt.Errorf("exec: scan: decode bool: %w", err)
@@ -265,11 +386,11 @@ func (s *TableScan) payloadToVector(
 		return bv, nil
 
 	case TypeString:
-		codes := make([]uint32, rows)
+		codes := s.bufs.getUint32Buf(colIdx, rows)
 		for i := range codes {
 			codes[i] = binary.LittleEndian.Uint32(payload[i*4:])
 		}
-		nb := make([]byte, (rows+7)/8)
+		nb := s.bufs.getNullBuf(colIdx, rows)
 		copy(nb, nullBitmap)
 		dict, err := cr.Dictionary()
 		if err != nil {
