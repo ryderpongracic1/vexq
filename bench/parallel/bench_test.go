@@ -56,10 +56,23 @@ var syntheticSchema = storage.Schema{
 }
 
 // Q6-shaped query: multi-predicate filter + SUM aggregate (no GROUP BY).
-// Uses SUM(l_extendedprice) to match the plan shape that planner.Parallel supports
-// (the pre-projection for compound expressions is orthogonal to the scaling issue).
+// Uses SUM(l_extendedprice) — a simple-column aggregate. Retained as the
+// like-for-like baseline for the GC-scaling measurements that predate parallel
+// support for expression aggregates.
 // Date literals are strings: the planner coerces them to date comparisons.
 const q6Query = `SELECT SUM(l_extendedprice) AS revenue
+FROM lineitem
+WHERE l_shipdate >= '1994-01-01'
+  AND l_shipdate < '1995-01-01'
+  AND l_discount >= 0.05
+  AND l_discount <= 0.07
+  AND l_quantity < 24`
+
+// q6CanonicalQuery is the canonical TPC-H Q6 aggregate: SUM over a computed
+// expression. The parallel planner materializes the expression per morsel via
+// the same pre-projection the serial planner applies, so this shape now
+// parallelizes rather than falling back to serial.
+const q6CanonicalQuery = `SELECT SUM(l_extendedprice * l_discount) AS revenue
 FROM lineitem
 WHERE l_shipdate >= '1994-01-01'
   AND l_shipdate < '1995-01-01'
@@ -166,8 +179,8 @@ func generateData(path string) {
 	}
 }
 
-// runSerial executes the query using planner.Physical (serial).
-func runSerial(tb testing.TB, path string) float64 {
+// runSerial executes query using planner.Physical (serial).
+func runSerial(tb testing.TB, path, query string) float64 {
 	tb.Helper()
 	ctx := context.Background()
 
@@ -176,7 +189,7 @@ func runSerial(tb testing.TB, path string) float64 {
 		tb.Fatalf("catalog: %v", err)
 	}
 
-	p := vsql.NewParser(q6Query)
+	p := vsql.NewParser(query)
 	stmt, err := p.ParseStatement()
 	if err != nil {
 		tb.Fatalf("parse: %v", err)
@@ -214,8 +227,8 @@ func runSerial(tb testing.TB, path string) float64 {
 	return revenue
 }
 
-// runParallel executes the query using planner.Parallel with numWorkers.
-func runParallel(tb testing.TB, path string, numWorkers int) float64 {
+// runParallel executes query using planner.Parallel with numWorkers.
+func runParallel(tb testing.TB, path, query string, numWorkers int) float64 {
 	tb.Helper()
 	ctx := context.Background()
 
@@ -224,7 +237,7 @@ func runParallel(tb testing.TB, path string, numWorkers int) float64 {
 		tb.Fatalf("catalog: %v", err)
 	}
 
-	p := vsql.NewParser(q6Query)
+	p := vsql.NewParser(query)
 	stmt, err := p.ParseStatement()
 	if err != nil {
 		tb.Fatalf("parse: %v", err)
@@ -261,12 +274,12 @@ func runParallel(tb testing.TB, path string, numWorkers int) float64 {
 	return revenue
 }
 
-// BenchmarkQ6Serial benchmarks serial Q6 execution.
+// BenchmarkQ6Serial benchmarks serial Q6 execution (simple-column aggregate).
 func BenchmarkQ6Serial(b *testing.B) {
 	path := ensureData(b)
 	b.ResetTimer()
 	for range b.N {
-		runSerial(b, path)
+		runSerial(b, path, q6Query)
 	}
 }
 
@@ -276,7 +289,43 @@ func BenchmarkQ6Parallel(b *testing.B) {
 	numWorkers := runtime.NumCPU()
 	b.ResetTimer()
 	for range b.N {
-		runParallel(b, path, numWorkers)
+		runParallel(b, path, q6Query, numWorkers)
+	}
+}
+
+// BenchmarkQ6CanonicalSerial benchmarks serial execution of the canonical Q6
+// aggregate over an expression, SUM(l_extendedprice * l_discount).
+func BenchmarkQ6CanonicalSerial(b *testing.B) {
+	path := ensureData(b)
+	b.ResetTimer()
+	for range b.N {
+		runSerial(b, path, q6CanonicalQuery)
+	}
+}
+
+// BenchmarkQ6CanonicalParallel benchmarks parallel execution of the canonical Q6
+// aggregate over an expression with runtime.NumCPU() workers. Before per-morsel
+// expression evaluation this fell back to serial and matched
+// BenchmarkQ6CanonicalSerial exactly.
+func BenchmarkQ6CanonicalParallel(b *testing.B) {
+	path := ensureData(b)
+	numWorkers := runtime.NumCPU()
+	b.ResetTimer()
+	for range b.N {
+		runParallel(b, path, q6CanonicalQuery, numWorkers)
+	}
+}
+
+// BenchmarkQ6CanonicalWorkers sweeps worker counts for the canonical Q6
+// aggregate, showing how expression-aggregate scaling responds to added workers.
+func BenchmarkQ6CanonicalWorkers(b *testing.B) {
+	path := ensureData(b)
+	for _, workers := range []int{1, 2, 4, 8, 16} {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			for range b.N {
+				runParallel(b, path, q6CanonicalQuery, workers)
+			}
+		})
 	}
 }
 
@@ -284,15 +333,54 @@ func BenchmarkQ6Parallel(b *testing.B) {
 // identical results on the synthetic dataset.
 func TestSerialParallelEquivalence(t *testing.T) {
 	path := ensureData(t)
-	serialResult := runSerial(t, path)
-	parallelResult := runParallel(t, path, runtime.NumCPU())
 
-	// Float64 results should be very close (within floating point tolerance).
-	// Parallel accumulates partial sums in different order → small FP drift.
-	diff := math.Abs(serialResult - parallelResult)
-	relDiff := diff / math.Max(math.Abs(serialResult), 1.0)
-	if relDiff > 1e-6 {
-		t.Fatalf("serial (%g) != parallel (%g), relative diff %g", serialResult, parallelResult, relDiff)
+	for name, query := range map[string]string{
+		"simple column aggregate": q6Query,
+		"canonical Q6 expression": q6CanonicalQuery,
+	} {
+		t.Run(name, func(t *testing.T) {
+			serialResult := runSerial(t, path, query)
+			parallelResult := runParallel(t, path, query, runtime.NumCPU())
+
+			// Float64 results should be very close (within floating point tolerance).
+			// Parallel accumulates partial sums in different order → small FP drift.
+			diff := math.Abs(serialResult - parallelResult)
+			relDiff := diff / math.Max(math.Abs(serialResult), 1.0)
+			if relDiff > 1e-6 {
+				t.Fatalf("serial (%g) != parallel (%g), relative diff %g", serialResult, parallelResult, relDiff)
+			}
+			t.Logf("serial=%.6f, parallel=%.6f, relDiff=%.2e", serialResult, parallelResult, relDiff)
+		})
 	}
-	t.Logf("serial=%.6f, parallel=%.6f, relDiff=%.2e", serialResult, parallelResult, relDiff)
+}
+
+// TestCanonicalQ6UsesParallelPath asserts the canonical Q6 shape is genuinely
+// parallelized rather than silently falling back to serial execution — the
+// measurement in BenchmarkQ6CanonicalParallel is only meaningful if it is.
+func TestCanonicalQ6UsesParallelPath(t *testing.T) {
+	ctx := context.Background()
+	path := ensureData(t)
+
+	cat, err := catalog.OpenSingle(ctx, "lineitem", path)
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	p := vsql.NewParser(q6CanonicalQuery)
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	logical, err := planner.Build(ctx, stmt.(*vsql.SelectStmt), cat)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	op, err := planner.Parallel(ctx, planner.Optimize(logical), runtime.NumCPU())
+	if err != nil {
+		t.Fatalf("parallel: %v", err)
+	}
+	defer op.Close()
+
+	if _, ok := op.(*exec.ParallelHashAggregate); !ok {
+		t.Fatalf("canonical Q6 must use the parallel path, got %T", op)
+	}
 }

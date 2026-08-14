@@ -54,6 +54,13 @@ type ParallelHashAggregate struct {
 	schema     Schema
 
 	delegate *HashAggregate // populated after setup()
+
+	// emptyGlobalPending is set by setup() when this is an ungrouped aggregate
+	// that consumed no rows. SQL requires exactly one output row in that case
+	// (COUNT=0, NULL for SUM/AVG/MIN/MAX). HashAggregate.Next only emits it on
+	// the transition out of !done, which a pre-merged delegate never makes, so
+	// the parallel path has to emit it here.
+	emptyGlobalPending bool
 }
 
 // defaultMorselSize is one row group (65,536 rows). At SF=1 a single lineitem
@@ -101,6 +108,10 @@ func (p *ParallelHashAggregate) Next(ctx context.Context) (*Batch, error) {
 			return nil, err
 		}
 	}
+	if p.emptyGlobalPending {
+		p.emptyGlobalPending = false
+		return p.delegate.buildEmptyGlobalResult(), nil
+	}
 	return p.delegate.Next(ctx)
 }
 
@@ -111,6 +122,7 @@ func (p *ParallelHashAggregate) setup(ctx context.Context) error {
 		merged := newPartialAggregate(p.groupBy, p.aggExprs, p.schema)
 		merged.done = true
 		p.delegate = merged
+		p.emptyGlobalPending = len(p.groupBy) == 0
 		return nil
 	}
 
@@ -184,6 +196,8 @@ func (p *ParallelHashAggregate) setup(ctx context.Context) error {
 	}
 	merged.done = true
 	p.delegate = merged
+	// No group survived and there is no GROUP BY: emit the one-row empty result.
+	p.emptyGlobalPending = len(merged.keys) == 0 && len(p.groupBy) == 0
 	return nil
 }
 

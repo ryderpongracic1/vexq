@@ -24,10 +24,28 @@ import (
 // each running an independent scan+filter+pre-projection pipeline, then merges
 // the partial aggregate results in the calling goroutine.
 //
+// Aggregates over computed expressions (e.g. SUM(price * discount), the
+// canonical TPC-H Q6 shape) are parallelized: each worker pipeline ends with
+// the same pre-projection that the serial planner applies, materializing the
+// expression into a synthetic column per morsel before local accumulation. The
+// expression is row-local, so evaluating it per morsel is equivalent to
+// evaluating it over the whole scan.
+//
+// Float64 SUM/AVG results agree with serial execution to within IEEE-754
+// rounding rather than bit-for-bit: partitioning changes the order of float
+// additions, and float addition is not associative. This is a property of any
+// partitioned float reduction and already applies to the simple-column parallel
+// path; integer SUM/MIN/MAX and COUNT are exact. The project's correctness
+// standard for float aggregates is the 1e-9 relative tolerance used by
+// internal/goldentest.
+//
 // Falls back to Physical(ctx, root) when:
 //   - root is not a LogicalAggregate (or Sort/Limit above an aggregate)
 //   - the aggregate child (after peeling an optional LogicalFilter) is not a LogicalScan
 //     (e.g., the plan involves a HashJoin)
+//   - any aggregate uses DISTINCT (partial distinct counts cannot be summed)
+//   - the pipeline schema or aggregate configuration cannot be resolved, in
+//     which case Physical is the authoritative implementation
 //
 // numWorkers <= 0 defaults to runtime.NumCPU().
 func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Operator, error) {
@@ -84,20 +102,6 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		return Physical(ctx, root) // unsupported shape — fallback
 	}
 
-	// Fall back to serial execution if any aggregate uses a computed expression
-	// (e.g. SUM(price * discount)). The optimizer's pruneColumns places the
-	// synthetic column name (_agg_0) into LogicalScan.NeededCols, but that column
-	// does not exist in the physical file — it is materialized by
-	// buildPreProjection after the scan. The parallel factory would need to
-	// resolve the real source columns from AggExpr, scan those, and apply
-	// buildPreProjection in each worker pipeline. Until that is implemented,
-	// serial execution via Physical handles this correctly.
-	for i := range aggNode.Aggs {
-		if aggNode.Aggs[i].AggExpr != nil {
-			return Physical(ctx, root)
-		}
-	}
-
 	// ---- Row group count -----------------------------------------------------
 
 	r, err := storage.Open(ctx, scanNode.FilePath)
@@ -112,70 +116,19 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		return Physical(ctx, root)
 	}
 
-	// ---- Pre-projection schema detection ------------------------------------
-	// Build one temporary pipeline (covering row group [0,1)) to get the schema
-	// that the aggregate sees after scan + filter + optional pre-projection.
-	// This is needed to resolve group-by and aggregate column indices correctly.
-
-	zonePred := buildZonePredicate(scanNode.Predicate, scanNode.Schema)
-
-	tempR, err := storage.Open(ctx, scanNode.FilePath)
-	if err != nil {
-		return nil, fmt.Errorf("planner: parallel: temp open %q: %w", scanNode.FilePath, err)
-	}
-	endRG := totalRGs
-	if endRG > 1 {
-		endRG = 1
-	}
-	tempScan, err := exec.NewTableScanRange(tempR, scanNode.NeededCols, zonePred, 0, endRG)
-	if err != nil {
-		_ = tempR.Close()
-		return nil, fmt.Errorf("planner: parallel: temp scan: %w", err)
-	}
-
-	var tempOp exec.Operator = tempScan
-	if filtNode != nil {
-		tempOp, err = buildFilterOp(filtNode, tempOp)
-		if err != nil {
-			return nil, fmt.Errorf("planner: parallel: temp filter: %w", err)
-		}
-	}
-
-	// Apply pre-projection (if any complex aggregate expressions) to get the
-	// correct post-projection schema for index resolution below.
-	tempOp, err = buildPreProjection(aggNode, tempOp)
-	if err != nil {
-		_ = tempOp.Close()
-		return nil, fmt.Errorf("planner: parallel: temp pre-projection: %w", err)
-	}
-	pipelineSchema := tempOp.Schema()
-	_ = tempOp.Close()
-
-	// ---- Resolve aggregate config -------------------------------------------
-
-	groupByIdxs, aggExprs, err := resolveAggConfig(aggNode, pipelineSchema)
-	if err != nil {
-		return nil, fmt.Errorf("planner: parallel: %w", err)
-	}
-
-	// Fall back to serial execution if any aggregate uses DISTINCT.
-	// Partial COUNT(DISTINCT) counts from workers cannot be summed — the correct
-	// approach requires shipping per-group value sets and unioning them at merge,
-	// which is too invasive for the current mergePartialAgg ([]int64 accumulators).
-	// Serial execution is correct; parallel COUNT(DISTINCT) is a future improvement.
-	for _, ae := range aggExprs {
-		if ae.Kind == exec.AggCountDistinct {
-			return Physical(ctx, root)
-		}
-	}
-
-	// Compute the output schema (mirrors NewHashAggregate's logic).
-	outSchema := aggOutputSchema(aggNode, pipelineSchema, groupByIdxs, aggExprs)
-
 	// ---- Factory closure ----------------------------------------------------
 	// Each call to factory(ctx, rgStart, rgEnd) builds an independent pipeline:
 	//   TableScanRange → ScanPredFilter? → Filter? → PreProjection?
-	// This is called once per worker goroutine inside ParallelHashAggregate.setup.
+	// This is called once per morsel inside ParallelHashAggregate.setup, and once
+	// here to probe the pipeline's output schema.
+	//
+	// PreProjection is what makes aggregates over expressions parallel-safe: it
+	// materializes each AggItem.AggExpr (e.g. price * discount) into the
+	// synthetic column that resolveAggConfig resolved against, per morsel. The
+	// expression is row-local, so a worker computing it over its own morsels is
+	// equivalent to the serial planner computing it over the whole scan.
+
+	zonePred := buildZonePredicate(scanNode.Predicate, scanNode.Schema)
 
 	factory := func(fCtx context.Context, rgStart, rgEnd int) (exec.Operator, error) {
 		fr, err := storage.Open(fCtx, scanNode.FilePath)
@@ -220,6 +173,48 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		}
 		return op, nil
 	}
+
+	// ---- Pipeline schema detection ------------------------------------------
+	// Probe the factory over a single row group to learn the schema the
+	// aggregate will see — after scan, filters and any pre-projection. Group-by
+	// and aggregate column indices are resolved against that schema, so it must
+	// come from the same construction path the workers use.
+	//
+	// A probe failure means this plan cannot be described to the parallel
+	// aggregate, so fall back to Physical: it is the authoritative
+	// implementation and will either execute the plan or report the real error.
+	// This keeps planner-detection gaps (for example a scan column list naming a
+	// column the file does not contain) degrading to serial execution instead of
+	// surfacing as a query error.
+
+	// totalRGs >= 1 here, so a single-row-group probe range is always valid.
+	probe, err := factory(ctx, 0, 1)
+	if err != nil {
+		return Physical(ctx, root)
+	}
+	pipelineSchema := probe.Schema()
+	_ = probe.Close()
+
+	// ---- Resolve aggregate config -------------------------------------------
+
+	groupByIdxs, aggExprs, err := resolveAggConfig(aggNode, pipelineSchema)
+	if err != nil {
+		return Physical(ctx, root)
+	}
+
+	// Fall back to serial execution if any aggregate uses DISTINCT.
+	// Partial COUNT(DISTINCT) counts from workers cannot be summed — the correct
+	// approach requires shipping per-group value sets and unioning them at merge,
+	// which is too invasive for the current mergePartialAgg ([]int64 accumulators).
+	// Serial execution is correct; parallel COUNT(DISTINCT) is a future improvement.
+	for _, ae := range aggExprs {
+		if ae.Kind == exec.AggCountDistinct {
+			return Physical(ctx, root)
+		}
+	}
+
+	// Compute the output schema (mirrors NewHashAggregate's logic).
+	outSchema := aggOutputSchema(aggNode, pipelineSchema, groupByIdxs, aggExprs)
 
 	// morselSize=0 → exec package uses defaultMorselSize (1 row group).
 	// Tune via environment or query hints in future work.
