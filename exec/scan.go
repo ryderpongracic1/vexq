@@ -26,6 +26,11 @@ import (
 // This design eliminates ~35K allocations per full scan (6 cols × 64 blocks/rg
 // × 92 rg), reducing GC pressure from ~238 cycles to near-zero for parallel
 // morsel-driven execution.
+//
+// I/O granularity: storage.ColumnReader buffers a whole column section per row
+// group, so opening a row group costs about one read per projected column
+// rather than one per 1024-row block. Pruned row groups are skipped before any
+// ColumnReader is opened, so they still cost zero reads.
 type TableScan struct {
 	reader   *storage.Reader
 	schema   Schema // output schema (projected columns only)
