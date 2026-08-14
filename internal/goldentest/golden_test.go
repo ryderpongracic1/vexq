@@ -403,9 +403,8 @@ func buildCorpus() []queryCase {
 
 		// --- Arithmetic and CASE WHEN ---
 		{
-			name:     "projection_arithmetic",
-			query:    "SELECT order_id, amount * 1.1 AS with_tax FROM orders WHERE amount IS NOT NULL LIMIT 10",
-			knownBug: "ENGINE BUG: exec.Project panics with index out of range when projecting arithmetic on a filtered+limited result. The Project operator accesses vector indices beyond the batch Length when a selection vector is active. Suspected location: exec/project.go compact path.",
+			name:  "projection_arithmetic",
+			query: "SELECT order_id, amount * 1.1 AS with_tax FROM orders WHERE amount IS NOT NULL LIMIT 10",
 		},
 		{
 			name:     "case_when",
