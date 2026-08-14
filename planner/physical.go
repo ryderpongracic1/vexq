@@ -550,6 +550,16 @@ func buildBinExpr(x *sql.BinaryExpr, schema exec.Schema) (exec.Expr, error) {
 		if l.Type() == exec.TypeFloat64 || r.Type() == exec.TypeFloat64 {
 			resultType = exec.TypeFloat64
 		}
+		// Mixed-type coercion: wrap the int64 side in a cast so evalArith
+		// always receives operands of matching type.
+		if resultType == exec.TypeFloat64 {
+			if l.Type() == exec.TypeInt64 {
+				l = &exec.CastIntToFloatExpr{Inner: l}
+			}
+			if r.Type() == exec.TypeInt64 {
+				r = &exec.CastIntToFloatExpr{Inner: r}
+			}
+		}
 	}
 	return &exec.BinOp{Op: op, Left: l, Right: r, T: resultType}, nil
 }

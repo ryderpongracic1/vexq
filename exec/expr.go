@@ -93,6 +93,37 @@ func (l *Literal) Eval(_ context.Context, b *Batch) (Vector, error) {
 	}
 }
 
+// ---- CastIntToFloatExpr -----------------------------------------------------
+
+// CastIntToFloatExpr wraps an int64-returning expression and converts its
+// output to a Float64Vector.  Used by the planner to promote int64 operands
+// in mixed-type arithmetic so evalArith always receives matching types.
+type CastIntToFloatExpr struct {
+	Inner Expr
+}
+
+func (c *CastIntToFloatExpr) Type() DataType { return TypeFloat64 }
+
+func (c *CastIntToFloatExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
+	v, err := c.Inner.Eval(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+	iv, ok := v.(*Int64Vector)
+	if !ok {
+		return nil, fmt.Errorf("expr: CastIntToFloat: expected *Int64Vector, got %T", v)
+	}
+	n := iv.Len()
+	out := &Float64Vector{
+		Values:     make([]float64, n),
+		NullBitmap: iv.NullBitmap,
+	}
+	for i := 0; i < n; i++ {
+		out.Values[i] = float64(iv.Values[i])
+	}
+	return out, nil
+}
+
 // ---- BinOpKind --------------------------------------------------------------
 
 type BinOpKind uint8
@@ -818,7 +849,10 @@ func cmpInt32(op BinOpKind, a, b int32) bool {
 func evalArith(op BinOpKind, lv, rv Vector, n int) (Vector, error) {
 	switch l := lv.(type) {
 	case *Int64Vector:
-		r := rv.(*Int64Vector)
+		r, ok := rv.(*Int64Vector)
+		if !ok {
+			return nil, fmt.Errorf("expr: arithmetic type mismatch: left is *Int64Vector but right is %T (missing plan-time coercion?)", rv)
+		}
 		out := &Int64Vector{
 			Values:     make([]int64, n),
 			NullBitmap: make([]byte, (n+7)/8),
@@ -832,7 +866,10 @@ func evalArith(op BinOpKind, lv, rv Vector, n int) (Vector, error) {
 		}
 		return out, nil
 	case *Float64Vector:
-		r := rv.(*Float64Vector)
+		r, ok := rv.(*Float64Vector)
+		if !ok {
+			return nil, fmt.Errorf("expr: arithmetic type mismatch: left is *Float64Vector but right is %T (missing plan-time coercion?)", rv)
+		}
 		out := &Float64Vector{
 			Values:     make([]float64, n),
 			NullBitmap: make([]byte, (n+7)/8),
