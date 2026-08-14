@@ -186,84 +186,180 @@ func evalCmpInt64(op BinOpKind, lv, rv []int64, out *BoolVector, n int) {
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] == rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] == rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] == rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] == rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] == rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] == rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] == rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] == rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] == rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] == rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] == rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] == rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] == rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] == rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] == rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] == rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinNE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] != rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] != rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] != rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] != rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] != rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] != rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] != rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] != rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] != rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] != rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] != rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] != rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] != rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] != rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] != rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] != rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinLT:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] < rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] < rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] < rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] < rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] < rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] < rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] < rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] < rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] < rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] < rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] < rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] < rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] < rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] < rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] < rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] < rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinLE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] <= rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] <= rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] <= rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] <= rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] <= rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] <= rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] <= rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] <= rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] <= rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] <= rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] <= rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] <= rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] <= rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] <= rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] <= rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] <= rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinGT:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] > rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] > rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] > rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] > rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] > rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] > rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] > rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] > rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] > rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] > rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] > rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] > rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] > rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] > rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] > rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] > rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinGE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] >= rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] >= rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] >= rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] >= rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] >= rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] >= rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] >= rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] >= rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] >= rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] >= rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] >= rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] >= rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] >= rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] >= rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] >= rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] >= rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	}
@@ -283,84 +379,180 @@ func evalCmpFloat64(op BinOpKind, lv, rv []float64, out *BoolVector, n int) {
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] == rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] == rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] == rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] == rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] == rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] == rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] == rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] == rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] == rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] == rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] == rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] == rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] == rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] == rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] == rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] == rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinNE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] != rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] != rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] != rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] != rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] != rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] != rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] != rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] != rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] != rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] != rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] != rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] != rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] != rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] != rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] != rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] != rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinLT:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] < rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] < rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] < rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] < rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] < rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] < rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] < rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] < rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] < rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] < rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] < rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] < rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] < rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] < rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] < rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] < rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinLE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] <= rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] <= rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] <= rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] <= rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] <= rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] <= rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] <= rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] <= rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] <= rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] <= rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] <= rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] <= rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] <= rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] <= rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] <= rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] <= rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinGT:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] > rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] > rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] > rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] > rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] > rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] > rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] > rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] > rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] > rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] > rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] > rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] > rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] > rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] > rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] > rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] > rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinGE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] >= rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] >= rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] >= rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] >= rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] >= rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] >= rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] >= rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] >= rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] >= rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] >= rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] >= rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] >= rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] >= rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] >= rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] >= rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] >= rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	}
@@ -380,84 +572,180 @@ func evalCmpDate(op BinOpKind, lv, rv []int32, out *BoolVector, n int) {
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] == rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] == rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] == rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] == rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] == rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] == rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] == rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] == rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] == rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] == rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] == rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] == rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] == rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] == rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] == rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] == rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinNE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] != rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] != rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] != rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] != rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] != rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] != rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] != rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] != rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] != rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] != rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] != rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] != rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] != rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] != rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] != rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] != rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinLT:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] < rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] < rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] < rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] < rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] < rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] < rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] < rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] < rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] < rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] < rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] < rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] < rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] < rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] < rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] < rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] < rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinLE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] <= rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] <= rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] <= rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] <= rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] <= rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] <= rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] <= rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] <= rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] <= rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] <= rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] <= rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] <= rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] <= rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] <= rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] <= rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] <= rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinGT:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] > rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] > rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] > rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] > rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] > rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] > rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] > rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] > rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] > rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] > rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] > rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] > rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] > rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] > rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] > rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] > rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	case BinGE:
 		for ; i+8 <= n; i += 8 {
 			b := i >> 3
 			var byte_ uint8
-			if lv[i+0] >= rv[i+0] { byte_ |= 0x01 }
-			if lv[i+1] >= rv[i+1] { byte_ |= 0x02 }
-			if lv[i+2] >= rv[i+2] { byte_ |= 0x04 }
-			if lv[i+3] >= rv[i+3] { byte_ |= 0x08 }
-			if lv[i+4] >= rv[i+4] { byte_ |= 0x10 }
-			if lv[i+5] >= rv[i+5] { byte_ |= 0x20 }
-			if lv[i+6] >= rv[i+6] { byte_ |= 0x40 }
-			if lv[i+7] >= rv[i+7] { byte_ |= 0x80 }
+			if lv[i+0] >= rv[i+0] {
+				byte_ |= 0x01
+			}
+			if lv[i+1] >= rv[i+1] {
+				byte_ |= 0x02
+			}
+			if lv[i+2] >= rv[i+2] {
+				byte_ |= 0x04
+			}
+			if lv[i+3] >= rv[i+3] {
+				byte_ |= 0x08
+			}
+			if lv[i+4] >= rv[i+4] {
+				byte_ |= 0x10
+			}
+			if lv[i+5] >= rv[i+5] {
+				byte_ |= 0x20
+			}
+			if lv[i+6] >= rv[i+6] {
+				byte_ |= 0x40
+			}
+			if lv[i+7] >= rv[i+7] {
+				byte_ |= 0x80
+			}
 			bits[b] = byte_ & mask[b]
 		}
 	}
@@ -682,7 +970,10 @@ func (n *NotExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if err != nil {
 		return nil, err
 	}
-	rv := cv.(*BoolVector)
+	rv, ok := cv.(*BoolVector)
+	if !ok {
+		return nil, fmt.Errorf("expr: NOT requires a boolean operand, got %T", cv)
+	}
 	for i := 0; i < (rv.Length+7)/8; i++ {
 		rv.Bits[i] ^= rv.NullBitmap[i] // only flip bits that are valid (not null)
 	}
@@ -865,8 +1156,8 @@ func likeMatchRec(p, s string) bool {
 
 // BetweenExpr implements BETWEEN lo AND hi (inclusive).
 type BetweenExpr struct {
-	Child    Expr
-	Lo, Hi   Expr
+	Child  Expr
+	Lo, Hi Expr
 }
 
 func (e *BetweenExpr) Type() DataType { return TypeBool }
