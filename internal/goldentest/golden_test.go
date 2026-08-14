@@ -561,9 +561,8 @@ func buildCorpus() []queryCase {
 
 		// --- COUNT(DISTINCT) ---
 		{
-			name:     "count_distinct",
-			query:    "SELECT COUNT(DISTINCT status) FROM orders",
-			knownBug: "ENGINE LIMITATION: planner explicitly rejects DISTINCT aggregates with 'DISTINCT aggregates not yet supported'. This is a documented limitation, not a silent wrong-result bug.",
+			name:  "count_distinct",
+			query: "SELECT COUNT(DISTINCT status) FROM orders",
 		},
 
 		// --- Multi-key ORDER BY ---

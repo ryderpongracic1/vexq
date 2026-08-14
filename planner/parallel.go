@@ -144,6 +144,17 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		return nil, fmt.Errorf("planner: parallel: %w", err)
 	}
 
+	// Fall back to serial execution if any aggregate uses DISTINCT.
+	// Partial COUNT(DISTINCT) counts from workers cannot be summed — the correct
+	// approach requires shipping per-group value sets and unioning them at merge,
+	// which is too invasive for the current mergePartialAgg ([]int64 accumulators).
+	// Serial execution is correct; parallel COUNT(DISTINCT) is a future improvement.
+	for _, ae := range aggExprs {
+		if ae.Kind == exec.AggCountDistinct {
+			return Physical(ctx, root)
+		}
+	}
+
 	// Compute the output schema (mirrors NewHashAggregate's logic).
 	outSchema := aggOutputSchema(aggNode, pipelineSchema, groupByIdxs, aggExprs)
 

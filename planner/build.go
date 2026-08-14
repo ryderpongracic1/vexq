@@ -3,6 +3,7 @@ package planner
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/ryderpongracic1/vexq/catalog"
 	"github.com/ryderpongracic1/vexq/exec"
@@ -395,7 +396,10 @@ func buildAggregate(child LogicalNode, stmt *sql.SelectStmt) (*LogicalAggregate,
 			continue // group-by columns handled separately
 		}
 		if ae.Distinct {
-			return nil, fmt.Errorf("planner: DISTINCT aggregates not yet supported (e.g. %s(DISTINCT ...))", ae.Func)
+			fn := strings.ToUpper(ae.Func)
+			if fn != "COUNT" {
+				return nil, fmt.Errorf("planner: %s(DISTINCT ...) is not supported; only COUNT(DISTINCT col) is implemented", ae.Func)
+			}
 		}
 		alias := col.Alias
 		if alias == "" {
@@ -418,7 +422,7 @@ func buildAggregate(child LogicalNode, stmt *sql.SelectStmt) (*LogicalAggregate,
 			}
 		}
 		_ = schema
-		aggs = append(aggs, AggItem{Func: ae.Func, ColName: colName, AggExpr: aggExpr, Alias: alias})
+		aggs = append(aggs, AggItem{Func: ae.Func, ColName: colName, AggExpr: aggExpr, Alias: alias, Distinct: ae.Distinct})
 	}
 	return &LogicalAggregate{
 		Child:   child,

@@ -18,6 +18,7 @@ const (
 	AggAvg
 	AggMin
 	AggMax
+	AggCountDistinct // COUNT(DISTINCT col)
 )
 
 // AggExpr describes one aggregate function in the output.
@@ -25,6 +26,7 @@ type AggExpr struct {
 	Kind      AggKind
 	ColIdx    int      // source column index (-1 for COUNT(*))
 	OutName   string   // output column name
+	Distinct  bool     // true for COUNT(DISTINCT col)
 	AccumType DataType // type of bits stored in the groups accumulator:
 	// TypeInt64   for COUNT, SUM/MIN/MAX over integer/date columns
 	// TypeFloat64 for SUM/MIN/MAX over float64 columns, and always for AVG
@@ -59,6 +61,15 @@ type HashAggregate struct {
 	// when all GROUP BY columns are dict-encoded strings.
 	intKey        intKeyState
 	intKeyDecided bool // true once we've checked the first batch
+
+	// COUNT(DISTINCT) state: per-group, per-aggregate distinct value sets.
+	// Only allocated for aggregates with Kind == AggCountDistinct.
+	// Key: group key (string); Value: set of distinct values seen.
+	// For int/date/float columns: map[int64]struct{} (raw bits).
+	// For string columns: map[string]struct{} (resolved string values).
+	distinctInts map[string][]map[int64]struct{}
+	distinctStrs map[string][]map[string]struct{}
+	hasDistinct  bool // true if any aggExpr has Distinct=true
 }
 
 func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashAggregate, error) {
@@ -78,14 +89,18 @@ func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashA
 	// Copy aggExprs so we can fill in AccumType without mutating the caller's slice.
 	resolved := make([]AggExpr, len(aggExprs))
 	copy(resolved, aggExprs)
+	hasDistinct := false
 	for i := range resolved {
 		ae := &resolved[i]
 		var t DataType
 		switch ae.Kind {
-		case AggCount:
+		case AggCount, AggCountDistinct:
 			t = TypeInt64
 			if ae.AccumType == 0 {
 				ae.AccumType = TypeInt64
+			}
+			if ae.Kind == AggCountDistinct {
+				hasDistinct = true
 			}
 		case AggSum, AggMin, AggMax:
 			if ae.ColIdx < 0 {
@@ -110,14 +125,17 @@ func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashA
 	}
 
 	return &HashAggregate{
-		child:      child,
-		groupBy:    groupBy,
-		aggExprs:   resolved,
-		schema:     Schema{Fields: outFields},
-		groups:     make(map[string][]int64),
-		groupCnt:   make(map[string]int64),
-		aggNonNull: make(map[string][]int64),
-		samples:    make(map[string][]groupByVal),
+		child:        child,
+		groupBy:      groupBy,
+		aggExprs:     resolved,
+		schema:       Schema{Fields: outFields},
+		groups:       make(map[string][]int64),
+		groupCnt:     make(map[string]int64),
+		aggNonNull:   make(map[string][]int64),
+		samples:      make(map[string][]groupByVal),
+		hasDistinct:  hasDistinct,
+		distinctInts: make(map[string][]map[int64]struct{}),
+		distinctStrs: make(map[string][]map[string]struct{}),
 	}, nil
 }
 
@@ -161,6 +179,10 @@ func (h *HashAggregate) initMaps() {
 	h.samples = make(map[string][]groupByVal)
 	h.intKeyDecided = false
 	h.intKey = intKeyState{}
+	if h.hasDistinct {
+		h.distinctInts = make(map[string][]map[int64]struct{})
+		h.distinctStrs = make(map[string][]map[string]struct{})
+	}
 }
 
 func (h *HashAggregate) consumeAll(ctx context.Context) error {
@@ -219,9 +241,11 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 
 	// Integer-key fast path: when all GROUP BY columns are dict-encoded strings,
 	// key on packed global dictionary codes instead of building composite string keys.
+	// Disabled when DISTINCT aggregates are present because the intkey path's
+	// []int64 accumulators cannot hold per-group distinct value sets.
 	if !h.intKeyDecided {
 		h.intKeyDecided = true
-		if canUseIntKey(batch, h.groupBy) {
+		if !h.hasDistinct && canUseIntKey(batch, h.groupBy) {
 			h.intKey.enabled = true
 			h.intKey.init(len(h.groupBy))
 		}
@@ -271,6 +295,25 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				}
 			}
 			h.samples[key] = sample
+			// Initialize distinct sets for this new group.
+			if h.hasDistinct {
+				intSets := make([]map[int64]struct{}, len(h.aggExprs))
+				strSets := make([]map[string]struct{}, len(h.aggExprs))
+				for j, ae := range h.aggExprs {
+					if ae.Kind == AggCountDistinct {
+						if ae.ColIdx >= 0 {
+							vec := aggVecs[j]
+							if _, isStr := vec.(*StringVector); isStr {
+								strSets[j] = make(map[string]struct{})
+							} else {
+								intSets[j] = make(map[int64]struct{})
+							}
+						}
+					}
+				}
+				h.distinctInts[key] = intSets
+				h.distinctStrs[key] = strSets
+			}
 		}
 
 		nonNull := h.aggNonNull[key]
@@ -284,6 +327,27 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				} else if !v.IsNull(rowIdx) {
 					accs[j]++
 					nonNull[j]++
+				}
+			case AggCountDistinct:
+				if v.IsNull(rowIdx) {
+					continue // NULL values excluded from DISTINCT set (SQL standard)
+				}
+				if sv, ok := v.(*StringVector); ok {
+					s := sv.Get(rowIdx)
+					strSets := h.distinctStrs[key]
+					if strSets[j] == nil {
+						strSets[j] = make(map[string]struct{})
+						h.distinctStrs[key] = strSets
+					}
+					strSets[j][s] = struct{}{}
+				} else {
+					val := extractInt64(v, rowIdx)
+					intSets := h.distinctInts[key]
+					if intSets[j] == nil {
+						intSets[j] = make(map[int64]struct{})
+						h.distinctInts[key] = intSets
+					}
+					intSets[j][val] = struct{}{}
 				}
 			case AggSum:
 				if v.IsNull(rowIdx) {
@@ -369,6 +433,11 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 		h.groups[key] = accs
 		h.aggNonNull[key] = make([]int64, len(h.aggExprs))
 		h.keys = append(h.keys, key)
+		// Initialize distinct sets for the single implicit group.
+		if h.hasDistinct {
+			h.distinctInts[key] = make([]map[int64]struct{}, len(h.aggExprs))
+			h.distinctStrs[key] = make([]map[string]struct{}, len(h.aggExprs))
+		}
 	}
 
 	nonNull := h.aggNonNull[key]
@@ -386,6 +455,29 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 						accs[j]++
 						nonNull[j]++
 					}
+				}
+			}
+		case AggCountDistinct:
+			for _, rowIdx := range indices {
+				if v.IsNull(rowIdx) {
+					continue // NULL excluded from DISTINCT set
+				}
+				if sv, ok := v.(*StringVector); ok {
+					s := sv.Get(rowIdx)
+					strSets := h.distinctStrs[key]
+					if strSets[j] == nil {
+						strSets[j] = make(map[string]struct{})
+						h.distinctStrs[key] = strSets
+					}
+					strSets[j][s] = struct{}{}
+				} else {
+					val := extractInt64(v, rowIdx)
+					intSets := h.distinctInts[key]
+					if intSets[j] == nil {
+						intSets[j] = make(map[int64]struct{})
+						h.distinctInts[key] = intSets
+					}
+					intSets[j][val] = struct{}{}
 				}
 			}
 		case AggSum:
@@ -541,6 +633,21 @@ func (h *HashAggregate) buildOutputBatch(keys []string) *Batch {
 				}
 				vecs[outIdx] = out
 			}
+		case AggCountDistinct:
+			// COUNT(DISTINCT) resolves to the size of the distinct value set.
+			// Never returns NULL (returns 0 for empty/all-null groups).
+			out := &Int64Vector{Values: make([]int64, n), NullBitmap: storage.FullBitmap(n)}
+			for i, key := range keys {
+				var count int64
+				if intSets := h.distinctInts[key]; intSets != nil && intSets[j] != nil {
+					count = int64(len(intSets[j]))
+				}
+				if strSets := h.distinctStrs[key]; strSets != nil && strSets[j] != nil {
+					count = int64(len(strSets[j]))
+				}
+				out.Values[i] = count
+			}
+			vecs[outIdx] = out
 		case AggSum, AggMin, AggMax:
 			// SUM/MIN/MAX return NULL when all inputs were null.
 			if ae.AccumType == TypeFloat64 {
@@ -594,7 +701,7 @@ func (h *HashAggregate) buildEmptyGlobalResult() *Batch {
 	vecs := make([]Vector, len(h.aggExprs))
 	for j, ae := range h.aggExprs {
 		switch ae.Kind {
-		case AggCount:
+		case AggCount, AggCountDistinct:
 			vecs[j] = &Int64Vector{Values: []int64{0}, NullBitmap: storage.FullBitmap(1)}
 		case AggSum, AggMin, AggMax:
 			if ae.AccumType == TypeFloat64 {
