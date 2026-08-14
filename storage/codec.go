@@ -126,6 +126,9 @@ func (d *Dictionary) Get(code uint32) string {
 	return string(d.Data[start:end])
 }
 
+// Len returns the number of entries in the dictionary.
+func (d *Dictionary) Len() int { return len(d.Offsets) }
+
 // Lookup returns (code, true) if s is in the dictionary.
 func (d *Dictionary) Lookup(s string) (uint32, bool) {
 	// Linear scan — dictionaries are small per row group (v1).

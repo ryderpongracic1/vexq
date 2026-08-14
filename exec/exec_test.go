@@ -539,7 +539,7 @@ func (s *singleBatchOp) Next(ctx context.Context) (*exec.Batch, error) {
 	return s.batch, nil
 }
 func (s *singleBatchOp) Schema() exec.Schema { return s.batch.Schema }
-func (s *singleBatchOp) Close() error         { return nil }
+func (s *singleBatchOp) Close() error        { return nil }
 
 // emptyOp is an operator that yields no batches (empty input).
 type emptyOp struct {
@@ -554,7 +554,7 @@ func TestAvgWithNulls(t *testing.T) {
 	// AVG over [1.0, NULL, 3.0] should return 2.0 (not 1.33)
 	vec := makeFloat64VecWithNulls([]float64{1.0, 0.0, 3.0}, []int{1})
 	batch := &exec.Batch{
-		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeFloat64, Nullable: true}}},
+		Schema:  exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeFloat64, Nullable: true}}},
 		Vectors: []exec.Vector{vec},
 		Length:  3,
 	}
@@ -593,7 +593,7 @@ func TestSumAllNull(t *testing.T) {
 	// SUM over [NULL, NULL, NULL] should return NULL
 	vec := makeFloat64VecWithNulls([]float64{0, 0, 0}, []int{0, 1, 2})
 	batch := &exec.Batch{
-		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeFloat64, Nullable: true}}},
+		Schema:  exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeFloat64, Nullable: true}}},
 		Vectors: []exec.Vector{vec},
 		Length:  3,
 	}
@@ -624,7 +624,7 @@ func TestMinMaxAllNull(t *testing.T) {
 	// MIN/MAX over [NULL, NULL] should return NULL
 	vec := makeInt64VecWithNulls([]int64{0, 0}, []int{0, 1})
 	batch := &exec.Batch{
-		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeInt64, Nullable: true}}},
+		Schema:  exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeInt64, Nullable: true}}},
 		Vectors: []exec.Vector{vec},
 		Length:  2,
 	}
@@ -722,7 +722,7 @@ func TestCountColumnWithNulls(t *testing.T) {
 	// COUNT(col) skips nulls: [1, NULL, 3, NULL, 5] → COUNT=3
 	vec := makeInt64VecWithNulls([]int64{1, 0, 3, 0, 5}, []int{1, 3})
 	batch := &exec.Batch{
-		Schema: exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeInt64, Nullable: true}}},
+		Schema:  exec.Schema{Fields: []exec.Field{{Name: "val", Type: exec.TypeInt64, Nullable: true}}},
 		Vectors: []exec.Vector{vec},
 		Length:  5,
 	}
@@ -754,5 +754,143 @@ func TestCountColumnWithNulls(t *testing.T) {
 	cntStar := result.Vectors[1].(*exec.Int64Vector)
 	if cntStar.Values[0] != 5 {
 		t.Errorf("COUNT(*) = %d, want 5", cntStar.Values[0])
+	}
+}
+
+// ---- CASE WHEN string literals ----------------------------------------------
+
+func TestCaseWhenStringBranches(t *testing.T) {
+	// CASE WHEN val > 500 THEN 'high' WHEN val > 200 THEN 'medium' ELSE 'low' END
+	// Over a batch where val = [100, 300, 600, 50]
+	n := 4
+	vals := &exec.Float64Vector{
+		Values:     []float64{100, 300, 600, 50},
+		NullBitmap: storage.FullBitmap(n),
+	}
+	batch := &exec.Batch{
+		Schema:  storage.Schema{Fields: []storage.Field{{Name: "val", Type: storage.TypeFloat64}}},
+		Vectors: []exec.Vector{vals},
+		Length:  n,
+	}
+
+	caseExpr := &exec.CaseExpr{
+		Whens: []exec.When{
+			{
+				Cond:   &exec.BinOp{Op: exec.BinGT, Left: &exec.ColumnRef{Name: "val", Idx: 0, T: exec.TypeFloat64}, Right: &exec.Literal{Val: float64(500), T: exec.TypeFloat64}, T: exec.TypeBool},
+				Result: &exec.Literal{Val: "high", T: exec.TypeString},
+			},
+			{
+				Cond:   &exec.BinOp{Op: exec.BinGT, Left: &exec.ColumnRef{Name: "val", Idx: 0, T: exec.TypeFloat64}, Right: &exec.Literal{Val: float64(200), T: exec.TypeFloat64}, T: exec.TypeBool},
+				Result: &exec.Literal{Val: "medium", T: exec.TypeString},
+			},
+		},
+		Else: &exec.Literal{Val: "low", T: exec.TypeString},
+		T:    exec.TypeString,
+	}
+
+	result, err := caseExpr.Eval(ctx, batch)
+	if err != nil {
+		t.Fatalf("CaseExpr.Eval: %v", err)
+	}
+	sv := result.(*exec.StringVector)
+	// val=100 → low, val=300 → medium, val=600 → high, val=50 → low
+	expected := []string{"low", "medium", "high", "low"}
+	for i, want := range expected {
+		got := sv.Get(i)
+		if got != want {
+			t.Errorf("row %d: got %q, want %q", i, got, want)
+		}
+		if sv.IsNull(i) {
+			t.Errorf("row %d: unexpected null", i)
+		}
+	}
+}
+
+func TestCaseWhenStringNoElse(t *testing.T) {
+	// CASE WHEN val > 500 THEN 'high' END — no ELSE means NULL for unmatched rows
+	n := 4
+	vals := &exec.Float64Vector{
+		Values:     []float64{100, 300, 600, 800},
+		NullBitmap: storage.FullBitmap(n),
+	}
+	batch := &exec.Batch{
+		Schema:  storage.Schema{Fields: []storage.Field{{Name: "val", Type: storage.TypeFloat64}}},
+		Vectors: []exec.Vector{vals},
+		Length:  n,
+	}
+
+	caseExpr := &exec.CaseExpr{
+		Whens: []exec.When{
+			{
+				Cond:   &exec.BinOp{Op: exec.BinGT, Left: &exec.ColumnRef{Name: "val", Idx: 0, T: exec.TypeFloat64}, Right: &exec.Literal{Val: float64(500), T: exec.TypeFloat64}, T: exec.TypeBool},
+				Result: &exec.Literal{Val: "high", T: exec.TypeString},
+			},
+		},
+		Else: nil,
+		T:    exec.TypeString,
+	}
+
+	result, err := caseExpr.Eval(ctx, batch)
+	if err != nil {
+		t.Fatalf("CaseExpr.Eval: %v", err)
+	}
+	sv := result.(*exec.StringVector)
+	// val=100 → NULL, val=300 → NULL, val=600 → high, val=800 → high
+	for i := 0; i < n; i++ {
+		if i < 2 {
+			if !sv.IsNull(i) {
+				t.Errorf("row %d: expected null, got %q", i, sv.Get(i))
+			}
+		} else {
+			if sv.IsNull(i) {
+				t.Errorf("row %d: unexpected null", i)
+			}
+			if got := sv.Get(i); got != "high" {
+				t.Errorf("row %d: got %q, want %q", i, got, "high")
+			}
+		}
+	}
+}
+
+func TestCaseWhenStringWithSelVec(t *testing.T) {
+	// Simulate a filtered batch where batch.Length is physical length (Project contract).
+	// CASE WHEN val > 200 THEN 'yes' ELSE 'no' END
+	n := 4 // physical length
+	vals := &exec.Float64Vector{
+		Values:     []float64{100, 300, 50, 600},
+		NullBitmap: storage.FullBitmap(n),
+	}
+	batch := &exec.Batch{
+		Schema:  storage.Schema{Fields: []storage.Field{{Name: "val", Type: storage.TypeFloat64}}},
+		Vectors: []exec.Vector{vals},
+		Length:  n, // Project sets this to physical length before Eval
+	}
+
+	caseExpr := &exec.CaseExpr{
+		Whens: []exec.When{
+			{
+				Cond:   &exec.BinOp{Op: exec.BinGT, Left: &exec.ColumnRef{Name: "val", Idx: 0, T: exec.TypeFloat64}, Right: &exec.Literal{Val: float64(200), T: exec.TypeFloat64}, T: exec.TypeBool},
+				Result: &exec.Literal{Val: "yes", T: exec.TypeString},
+			},
+		},
+		Else: &exec.Literal{Val: "no", T: exec.TypeString},
+		T:    exec.TypeString,
+	}
+
+	result, err := caseExpr.Eval(ctx, batch)
+	if err != nil {
+		t.Fatalf("CaseExpr.Eval: %v", err)
+	}
+	sv := result.(*exec.StringVector)
+	// Verify full physical vector: val[0]=100→no, val[1]=300→yes, val[2]=50→no, val[3]=600→yes
+	expected := []string{"no", "yes", "no", "yes"}
+	if sv.Len() != n {
+		t.Fatalf("result length = %d, want %d", sv.Len(), n)
+	}
+	for i, want := range expected {
+		got := sv.Get(i)
+		if got != want {
+			t.Errorf("row %d: got %q, want %q", i, got, want)
+		}
 	}
 }

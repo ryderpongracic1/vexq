@@ -460,9 +460,23 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 				return nil, err
 			}
 		}
+		// Determine result type from the first WHEN branch.
 		t := exec.TypeFloat64
 		if len(whens) > 0 {
 			t = whens[0].Result.Type()
+		}
+		// Validate all branches produce the same (or coercible) type.
+		for i, w := range whens {
+			if w.Result.Type() != t {
+				return nil, fmt.Errorf(
+					"planner: CASE branch %d has type %v, expected %v (all branches must have a common type)",
+					i+1, w.Result.Type(), t)
+			}
+		}
+		if elseExpr != nil && elseExpr.Type() != t {
+			return nil, fmt.Errorf(
+				"planner: CASE ELSE has type %v, expected %v (all branches must have a common type)",
+				elseExpr.Type(), t)
 		}
 		return &exec.CaseExpr{Whens: whens, Else: elseExpr, T: t}, nil
 	}

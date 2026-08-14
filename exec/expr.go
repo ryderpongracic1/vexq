@@ -80,9 +80,14 @@ func (l *Literal) Eval(_ context.Context, b *Batch) (Vector, error) {
 		}
 		return &DateVector{Values: vals, NullBitmap: storage.FullBitmap(n)}, nil
 	case TypeString:
-		// String literals are not materialized into a StringVector;
-		// they are only used via BinOp/InExpr comparisons at the operator level.
-		return nil, fmt.Errorf("expr: string literal Eval not supported (compare via BinOp)")
+		s := l.Val.(string)
+		db := storage.NewDictBuilder()
+		code := db.Add(s)
+		codes := make([]uint32, n)
+		for i := range codes {
+			codes[i] = code
+		}
+		return newStringVector(db, codes, storage.FullBitmap(n)), nil
 	default:
 		return nil, fmt.Errorf("expr: unknown literal type %v", l.T)
 	}
@@ -1304,6 +1309,46 @@ func mergeVectors(cond *BoolVector, valV, base Vector, n int) Vector {
 			}
 		}
 		return out
+	case *StringVector:
+		vv := valV.(*StringVector)
+		// Build a unified dictionary from both base and value vectors.
+		db := storage.NewDictBuilder()
+		// Remap base dict entries.
+		var baseRemap []uint32
+		if bv.Dict != nil {
+			baseRemap = make([]uint32, bv.Dict.Len())
+			for i := 0; i < bv.Dict.Len(); i++ {
+				baseRemap[i] = db.Add(bv.Dict.Get(uint32(i)))
+			}
+		}
+		// Remap val dict entries.
+		var valRemap []uint32
+		if vv.Dict != nil {
+			valRemap = make([]uint32, vv.Dict.Len())
+			for i := 0; i < vv.Dict.Len(); i++ {
+				valRemap[i] = db.Add(vv.Dict.Get(uint32(i)))
+			}
+		}
+		codes := make([]uint32, n)
+		nullBmp := make([]byte, (n+7)/8)
+		for i := 0; i < n; i++ {
+			if !cond.IsNull(i) && cond.Get(i) {
+				if vv.IsNull(i) {
+					// null from val: leave code 0, bit stays 0 (null)
+				} else {
+					codes[i] = valRemap[vv.Codes[i]]
+					storage.SetValidBit(nullBmp, i)
+				}
+			} else {
+				if bv.IsNull(i) {
+					// null from base: leave code 0, bit stays 0 (null)
+				} else {
+					codes[i] = baseRemap[bv.Codes[i]]
+					storage.SetValidBit(nullBmp, i)
+				}
+			}
+		}
+		return newStringVector(db, codes, nullBmp)
 	default:
 		return base
 	}
@@ -1316,6 +1361,8 @@ func nullVector(t DataType, n int) Vector {
 		return &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 	case TypeFloat64:
 		return &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}
+	case TypeString:
+		return &StringVector{Codes: make([]uint32, n), Dict: nil, NullBitmap: make([]byte, (n+7)/8)}
 	default:
 		return &BoolVector{Bits: make([]byte, (n+7)/8), NullBitmap: make([]byte, (n+7)/8), Length: n}
 	}
