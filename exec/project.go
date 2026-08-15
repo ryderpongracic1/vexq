@@ -16,10 +16,29 @@ type ProjectExpr struct {
 // Project evaluates a list of expressions against each input Batch and
 // produces a new Batch with the results.  It respects SelVec from upstream
 // Filter operators by materialising only the selected rows.
+//
+// Buffer ownership contract: Project is the boundary between reused expression
+// scratch (see scratch.go) and the batches it hands downstream.
+//   - With a selection vector, materialize() copies the selected rows into fresh
+//     vectors, as it always has.
+//   - Without one, a bare column reference still passes the input vector through
+//     untouched — so Project's output aliases TableScan's decode buffers exactly
+//     as it did before this change — while any computed expression is copied,
+//     because its vector is scratch owned by an Expr node that will overwrite it
+//     on the next batch. That copy replaces the fresh vector the evaluator used
+//     to allocate, so it costs no extra allocation.
+//
+// The upshot is that Project's output never aliases operator scratch, which is
+// what lets a consumer hold a Project batch across Next() as long as it did
+// before.
 type Project struct {
 	child  Operator
 	exprs  []ProjectExpr
 	schema Schema
+
+	// passthrough[i] is true when exprs[i] is a bare column reference, whose
+	// Eval returns the input vector itself rather than a scratch buffer.
+	passthrough []bool
 }
 
 func NewProject(child Operator, exprs []ProjectExpr) (*Project, error) {
@@ -27,13 +46,16 @@ func NewProject(child Operator, exprs []ProjectExpr) (*Project, error) {
 		return nil, fmt.Errorf("exec: project: no expressions")
 	}
 	fields := make([]Field, len(exprs))
+	passthrough := make([]bool, len(exprs))
 	for i, pe := range exprs {
 		fields[i] = Field{Name: pe.Name, Type: pe.Expr.Type(), Nullable: true}
+		_, passthrough[i] = pe.Expr.(*ColumnRef)
 	}
 	return &Project{
-		child:  child,
-		exprs:  exprs,
-		schema: Schema{Fields: fields},
+		child:       child,
+		exprs:       exprs,
+		schema:      Schema{Fields: fields},
+		passthrough: passthrough,
 	}, nil
 }
 
@@ -75,9 +97,13 @@ func (p *Project) Next(ctx context.Context) (*Batch, error) {
 		}
 		// If there's a selection vector, materialise only selected rows into
 		// freshly allocated vectors (important: output must not alias reused
-		// scan buffers from TableScan).
+		// scan buffers from TableScan).  Without one, a computed expression's
+		// vector is scratch owned by the Expr node, so copy it; a bare column
+		// reference is passed through as before.
 		if origSel != nil {
 			raw = materialize(raw, origSel)
+		} else if !p.passthrough[i] {
+			raw = copyVector(raw, raw.Len())
 		}
 		outVecs[i] = raw
 	}

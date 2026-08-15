@@ -8,9 +8,26 @@ import (
 // Filter applies a predicate to each Batch from its child, producing a
 // SelectionVector of surviving row indices.  It does NOT materialise a new
 // batch — downstream operators must honor Batch.SelVec.
+//
+// Buffer ownership contract: the selection vector is a per-Filter buffer reused
+// across Next() calls, so it is valid only until the next Next() on this Filter.
+// That is exactly the lifetime of the batch it is attached to: Filter returns
+// its child's batch unchanged, and TableScan already overwrites that batch's
+// vectors on the next call (see scan.go). Every consumer therefore already had
+// to read or copy the batch before pulling again — HashAggregate accumulates
+// into its maps, sort copies into sortRow, the join build copies into buildRow,
+// Distinct replaces the vector with its own — so attaching a reused index buffer
+// to that same batch weakens nothing.
+//
+// Stacked filters are safe because each Filter owns its own buffer: the upper
+// Filter reads the lower one's selection vector and writes its own, never both
+// at once.
 type Filter struct {
 	child     Operator
 	predicate Expr
+
+	// sel is the reused selection-vector buffer; see the contract above.
+	sel SelectionVector
 }
 
 func NewFilter(child Operator, predicate Expr) (*Filter, error) {
@@ -41,7 +58,8 @@ func (f *Filter) Next(ctx context.Context) (*Batch, error) {
 			return nil, fmt.Errorf("exec: filter: predicate returned %T, expected *BoolVector", bv)
 		}
 
-		sel := BoolToSelVec(batch, boolVec)
+		sel := BoolToSelVecInto(batch, boolVec, f.sel)
+		f.sel = sel
 		if len(sel) == 0 {
 			// No rows survive; try the next batch.
 			continue
