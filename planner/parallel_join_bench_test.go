@@ -28,12 +28,28 @@ const q12Shaped = `SELECT l_shipmode,
   GROUP BY l_shipmode
   ORDER BY l_shipmode`
 
-// benchCatalog opens orders.vxq and lineitem.vxq from $VEXQ_BENCH_DIR, skipping
-// when that data is absent — the files are too large to keep in the repository.
-// Generate them with cmd/vexqgen from TPC-H (or TPC-H-shaped) .tbl input:
+// q3Shaped is TPC-H Q3: a three-table left-deep chain. The whole
+// customer ⋈ orders subtree is the build side, lineitem the probe side, so it
+// exercises needed-column propagation through a nested join.
+const q3Shaped = `SELECT l_orderkey, SUM(l_extendedprice) AS revenue, o_orderdate, o_shippriority
+  FROM customer, orders, lineitem
+  WHERE c_mktsegment = 'BUILDING'
+    AND c_custkey = o_custkey
+    AND l_orderkey = o_orderkey
+    AND o_orderdate < '1995-03-15'
+    AND l_shipdate > '1995-03-15'
+  GROUP BY l_orderkey, o_orderdate, o_shippriority
+  ORDER BY revenue DESC
+  LIMIT 10`
+
+// benchCatalog opens orders.vxq, lineitem.vxq and customer.vxq from
+// $VEXQ_BENCH_DIR, skipping when that data is absent — the files are too large
+// to keep in the repository. Generate them with cmd/vexqgen from TPC-H (or
+// TPC-H-shaped) .tbl input:
 //
 //	vexqgen orders   orders.tbl   orders.vxq
 //	vexqgen lineitem lineitem.tbl lineitem.vxq
+//	vexqgen customer customer.tbl customer.vxq
 //	VEXQ_BENCH_DIR=<dir> go test ./planner/ -run '^$' \
 //	    -bench 'BenchmarkJoinQ12' -benchtime=5x
 func benchCatalog(b *testing.B) *catalog.Catalog {
@@ -45,6 +61,7 @@ func benchCatalog(b *testing.B) *catalog.Catalog {
 	tables := map[string]string{
 		"orders":   filepath.Join(dir, "orders.vxq"),
 		"lineitem": filepath.Join(dir, "lineitem.vxq"),
+		"customer": filepath.Join(dir, "customer.vxq"),
 	}
 	for _, p := range tables {
 		if _, err := os.Stat(p); err != nil {
@@ -129,6 +146,16 @@ func BenchmarkJoinQ12Parallel4(b *testing.B) {
 func BenchmarkJoinQ12Parallel8(b *testing.B) {
 	cat := benchCatalog(b)
 	runBenchQuery(b, cat, q12Shaped, 8)
+}
+
+func BenchmarkJoinQ3Serial(b *testing.B) {
+	cat := benchCatalog(b)
+	runBenchQuery(b, cat, q3Shaped, 0)
+}
+
+func BenchmarkJoinQ3Parallel4(b *testing.B) {
+	cat := benchCatalog(b)
+	runBenchQuery(b, cat, q3Shaped, 4)
 }
 
 // buildOnlyJoin isolates the serial build phase: the l_receiptdate bound is
