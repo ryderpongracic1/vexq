@@ -10,8 +10,32 @@ import (
 )
 
 // Expr is the column-at-a-time expression interface.
+//
+// SIZING CONVENTION. An Expr evaluates over the batch's PHYSICAL rows, not its
+// logical ones. Once a Filter has installed a selection vector, Batch.Length
+// drops to the number of selected rows while the column vectors keep their full
+// physical length; every vector an Expr produces must still hold one element per
+// physical row, addressed by physical row index.
+//
+// The convention is forced by both ends of the tree. ColumnRef hands back the
+// batch's own vector, so every node that combines a column with anything else —
+// each comparison, each arithmetic op — is already sized physically and reads
+// its operands at physical indices. At the top, BoolToSelVecInto indexes a
+// predicate's result by the physical indices held in the incoming selection
+// vector. A leaf sized from Batch.Length is therefore short, and a short operand
+// either null-masks the batch's trailing physical rows (wrong results) or is
+// read past its end by the 8-rows-at-a-time comparison kernels (panic). Leaves
+// with no child to inherit a length from — Literal, an empty AndExpr or OrExpr,
+// CaseExpr's implicit NULL else — MUST call evalLen(b) instead of b.Length.
+//
+// Evaluating unselected rows does work that is then discarded. That is the
+// deliberate trade: the alternative is teaching every comparison and arithmetic
+// kernel to walk a selection vector, giving up the branch-free 8-rows-per-byte
+// inner loops. Compaction to the selected rows happens once, at the Project
+// boundary (project.go).
 type Expr interface {
-	// Eval evaluates the expression against b, returning a new Vector.
+	// Eval evaluates the expression against b, returning a Vector of
+	// evalLen(b) rows.
 	Eval(ctx context.Context, b *Batch) (Vector, error)
 	Type() DataType
 }
@@ -62,7 +86,7 @@ type Literal struct {
 func (l *Literal) Type() DataType { return l.T }
 
 func (l *Literal) Eval(_ context.Context, b *Batch) (Vector, error) {
-	n := b.Length
+	n := evalLen(b)
 	switch l.T {
 	case TypeInt64:
 		v := l.Val.(int64)
@@ -1013,9 +1037,10 @@ func (a *AndExpr) Type() DataType { return TypeBool }
 
 func (a *AndExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if len(a.Children) == 0 {
-		out := acquireBoolVector(&a.out, b.Length)
-		setAllValid(out.Bits, b.Length)
-		setAllValid(out.NullBitmap, b.Length)
+		n := evalLen(b)
+		out := acquireBoolVector(&a.out, n)
+		setAllValid(out.Bits, n)
+		setAllValid(out.NullBitmap, n)
 		return out, nil
 	}
 	first, err := a.Children[0].Eval(ctx, b)
@@ -1055,8 +1080,9 @@ func (o *OrExpr) Type() DataType { return TypeBool }
 
 func (o *OrExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if len(o.Children) == 0 {
-		out := acquireBoolVector(&o.out, b.Length)
-		setAllValid(out.NullBitmap, b.Length)
+		n := evalLen(b)
+		out := acquireBoolVector(&o.out, n)
+		setAllValid(out.NullBitmap, n)
 		return out, nil
 	}
 	first, err := o.Children[0].Eval(ctx, b)
@@ -1376,6 +1402,7 @@ type CaseExpr struct {
 func (e *CaseExpr) Type() DataType { return e.T }
 
 func (e *CaseExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
+	n := evalLen(b)
 	// Start with the ELSE result and then overwrite with WHEN results in
 	// reverse priority order (last WHEN overwrites earlier ones).
 	// This is simpler than tracking which rows have been matched.
@@ -1387,7 +1414,7 @@ func (e *CaseExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 			return nil, err
 		}
 	} else {
-		result = nullVector(e.T, b.Length)
+		result = nullVector(e.T, n)
 	}
 
 	// Apply WHENs in reverse so the first matching WHEN wins.
@@ -1402,7 +1429,7 @@ func (e *CaseExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		if err != nil {
 			return nil, err
 		}
-		result = mergeVectors(cond, valV, result, b.Length)
+		result = mergeVectors(cond, valV, result, n)
 	}
 	return result, nil
 }
