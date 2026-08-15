@@ -35,8 +35,9 @@ type ColumnReader struct {
 	totalRows int
 
 	// win buffers the file range [winStart, winStart+len(win)), always a
-	// sub-range of [colMeta.SectionOffset, end). Borrowed from r.bufPool and
-	// returned by Close.
+	// sub-range of [colMeta.SectionOffset, end). Borrowed from the owning
+	// Reader's free list (which is itself backed by the package's shared
+	// size-classed pool) and returned by Close.
 	win      []byte
 	winStart int64
 
