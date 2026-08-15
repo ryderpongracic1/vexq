@@ -8,7 +8,7 @@ Built a vectorized analytical SQL execution engine in Go using columnar storage,
 
 vexq is a complete analytical query engine — from a custom on-disk columnar file format through a SQL parser, rule-based optimizer, and vectorized execution engine. The design shares structural principles with [distrikv](https://github.com/ryderpongracic1/distrikv) (append-only manifest, block CRCs, atomic writes via temp+rename) while adding a columnar-vectorized execution model suited for OLAP workloads.
 
-On TPC-H Q1 (GROUP BY aggregate over 6M rows), vexq is within 1.5× of DuckDB single-threaded — closing the per-core gap through dictionary-code integer-keyed aggregation and buffer-reuse elimination of GC pressure.
+On TPC-H Q1 (GROUP BY aggregate over 6M rows), vexq is within 1.3× of DuckDB single-threaded and 1.4× of DuckDB all-cores — closing the gap through dictionary-code integer-keyed aggregation, coarse-grained I/O, join column pruning, and a radix-partitioned parallel join. vexq is faster than SQLite on all four benchmarked TPC-H queries.
 
 The engine processes data in batches of 1024 rows, designed to saturate L1 cache and amortize operator dispatch overhead. A pushed-down predicate + zone-map pruning layer skips entire row groups before any I/O, and dictionary encoding reduces string comparisons to integer equality in the filter hot loop.
 
@@ -152,7 +152,7 @@ Requires Go 1.22+. No external runtime dependencies (SQLite and DuckDB are bench
 
 ## Benchmarks
 
-TPC-H scale factor 1 (6M lineitem rows) on Apple M4 Pro (14-core, 192 KB L1D per performance core, 36 MB SLC). Page cache warm. Each benchmark run 10×; numbers are median wall time. The headline result is per-core parity with DuckDB on Q1 (1.5×); see the DuckDB decomposition below.
+TPC-H scale factor 1 (6M lineitem rows) on Apple M4 Pro (14-core, 192 KB L1D per performance core, 36 MB SLC). Page cache warm. Each benchmark run 10×; numbers are median wall time. The headline results: within 1.3× of DuckDB single-threaded and 1.4× of DuckDB all-cores on Q1, and faster than SQLite on all four queries; see the DuckDB decomposition below.
 
 **Query provenance:** The harness runs the canonical TPC-H Q6 (`SUM(l_extendedprice * l_discount)`, inclusive `BETWEEN`). Earlier revisions used a simplified variant (`SUM(l_extendedprice)`) because aggregates over expressions crashed the planner; that bug is fixed (plan-time type coercion + a column-pruning fix), and both engines in every table below now run identical query text. vexq's canonical Q6 result (123,141,078.23) matches SQLite (asserted in-harness to 1e-9 relative tolerance) and DuckDB's canonical result (123141078.2283) exactly. Where a table below reports the *simplified* variant for like-for-like comparison across revisions, it is labeled as such.
 
@@ -164,26 +164,26 @@ All four TPC-H query results verified identical to SQLite output (via the in-har
 
 DuckDB is a state-of-the-art embedded analytical engine: SIMD intrinsics, a cost-based optimizer, radix-partitioned hash aggregation, adaptive parallel morsel scheduling, LLVM JIT compilation, and a columnar execution engine written in C++.
 
-The table below decomposes the gap into **per-core execution efficiency** (single-threaded DuckDB vs vexq serial) and **total throughput** (DuckDB all-cores vs vexq serial). This decomposition separates SIMD/JIT advantages from parallelism, which is the more informative comparison for a from-scratch engine.
+The table below decomposes the gap into **per-core execution efficiency** (single-threaded DuckDB vs vexq serial) and **end-to-end throughput** (DuckDB all-cores vs vexq parallel — both engines using all 14 cores). This decomposition separates SIMD/JIT advantages from parallelism, which is the more informative comparison for a from-scratch engine.
 
-Note: this comparison runs DuckDB on ARM64, where its strongest x86 SIMD paths (AVX-512) are unavailable; an x86 comparison would likely widen DuckDB's per-core advantage. The comparison is same-machine and therefore fair, but the 1.5× Q1 figure should be read with that context.
+Note: this comparison runs DuckDB on ARM64, where its strongest x86 SIMD paths (AVX-512) are unavailable; an x86 comparison would likely widen DuckDB's per-core advantage. The comparison is same-machine and therefore fair, but the Q1 figures should be read with that context.
 
-| Query | vexq serial | DuckDB (1 thread) | DuckDB (14 threads) | Per-core gap | Total gap |
-|-------|-------------|-------------------|---------------------|:------------:|:---------:|
-| Q1 | 239 ms | 159 ms | 25 ms | **1.5×** | **10×** |
-| Q6 | 132 ms | 37 ms | 8 ms | **3.6×** | **17×** |
-| Q3 | 684 ms | 62 ms | 17 ms | **11×** | **40×** |
-| Q12 | 1,050 ms | 81 ms | 16 ms | **13×** | **66×** |
+| Query | vexq serial | vexq parallel | DuckDB (1 thread) | DuckDB (14 threads) | Per-core gap | End-to-end gap |
+|-------|------------:|--------------:|------------------:|--------------------:|:------------:|:--------------:|
+| Q1 | 205 ms | 35 ms | 159 ms | 25 ms | **1.3×** | **1.4×** |
+| Q6 | 93 ms | 34 ms | 37 ms | 8 ms | **2.5×** | **4.3×** |
+| Q3 | 188 ms | 62 ms | 62 ms | 17 ms | **3.0×** | **3.6×** |
+| Q12 | 585 ms | 113 ms | 81 ms | 16 ms | **7.2×** | **7.1×** |
 
 **What the decomposition reveals:**
 
-- **Q1 (1.5× per-core):** The smallest gap. vexq's dictionary-code integer-keyed aggregation (packed `uint64` group keys, never a string in the hot loop) puts it within striking distance of DuckDB single-threaded. The remaining 1.5× is DuckDB's radix-partitioned hash aggregate + SIMD horizontal SUM.
+- **Q1 (1.3× per-core, 1.4× end-to-end):** The smallest gap, in both dimensions. vexq's dictionary-code integer-keyed aggregation (packed `uint64` group keys, never a string in the hot loop) plus coarse-grained I/O put it within striking distance of DuckDB single-threaded, and Q1's 5.9× parallel scaling nearly matches DuckDB's 6.4×. The remaining per-core gap is DuckDB's radix-partitioned hash aggregate + SIMD horizontal SUM. vexq parallel Q1 (35 ms) also beats DuckDB *single-threaded* (159 ms) outright.
 
-- **Q6 (3.6× per-core):** pprof profiling (serial, tests excluded, simplified-variant workload) reveals ~59% of CPU samples in `pread` syscalls under `storage.Reader.readAt → internal/poll.FD.Pread` — block-granular I/O issues ~35K preads per 6M-row scan, one syscall per block even on a warm page cache. Filter/decode compute is a minor fraction of the profile. The per-core gap is dominated by syscall overhead and DuckDB's mmap-based I/O, not vectorized predicate evaluation as previously hypothesized.
+- **Q6 (2.5× per-core):** An earlier pprof profile showed ~59% of serial Q6 CPU in `pread` syscalls (~35K block-granular preads per 6M-row scan). Row-group-buffered reads have since cut that to ~373 preads per scan (62.9×), taking serial Q6 from 132 ms to 93 ms. The remaining per-core gap is now genuinely compute: vectorized predicate evaluation (the measured AVX2 kernel ceiling is 3.3× on the filter kernel alone) and decode.
 
-- **Q3/Q12 (11–13× per-core):** Dominated by the hash join. DuckDB's radix-partitioned, SIMD-probed join keeps each partition L2-resident; vexq's serial `HashJoin` builds a Go `map[int64][]Batch` and probes with random access (likely L3 misses). A radix-partitioned **build** has since landed on the parallel path (see "What's left on the table"), and it did not close this gap: partitioning only the build side leaves the probe touching the whole table, measured flat from 1 to 256 partitions. Closing it needs the **probe** stream partitioned as well, which is a structural change to the streaming operator model, not a tuning pass.
+- **Q3 (3.0× per-core) / Q12 (7.2× per-core):** These gaps were 11× and 13× before join column pruning (each join side now decodes only the columns the query references — serial Q3 went 684 → 188 ms) and the radix-partitioned parallel build. vexq parallel Q3 (62 ms) now exactly matches DuckDB single-threaded (62 ms). The remaining gap is DuckDB's SIMD-probed, cache-resident join: partitioning only the build side does not make probes cache-resident (measured flat from 1 to 256 partitions) — closing it needs the **probe** stream partitioned as well, a structural change to the streaming operator model. Q12's larger gap adds the CASE WHEN aggregate that DuckDB JIT-compiles.
 
-- **Parallelism gap:** DuckDB achieves 4.5–6.4× scaling from threads=1 to threads=14. vexq achieves 1.85× on Q1; canonical Q6 currently gets no parallel speedup because aggregates over expressions fall back to the serial planner (see parallel section below). For parallelizable shapes, GC pressure from per-batch allocations in filter/project operators is the primary limiter.
+- **Parallelism gap (mostly closed):** DuckDB achieves 4.5–6.4× scaling from threads=1 to threads=14. vexq now achieves 5.9× (Q1), 5.2× (Q12), 3.0× (Q3), and 2.7× (Q6) — all four queries take the parallel path (expression aggregates parallelize; joins parallelize both build and probe). The remaining limiter is GC pressure from per-batch allocations in filter/project operators (see the GOGC ablation below).
 
 ### Hardware migration and normalization
 
@@ -200,51 +200,66 @@ The Q6 rows in this normalization use the simplified variant on both machines (t
 
 The Q1 improvement is almost entirely software (the dictionary-code integer-key aggregate rework targeted precisely this query). Q3/Q12 improvements are almost entirely hardware — no join optimizations were made.
 
+### Second optimization round (same hardware — no normalization needed)
+
+A later round landed coarse-grained I/O (row-group-buffered reads, 62.9× fewer preads), join column pruning, a radix-partitioned parallel join build, and parallel expression aggregates. Both measurements below are from the same M4 Pro, so the deltas are pure software:
+
+| Query | Serial before | Serial after | Software improvement | Dominant cause |
+|-------|--------------:|-------------:|:--------------------:|----------------|
+| Q1 | 239 ms | 205 ms | **1.17×** | coarse-grained I/O |
+| Q6 | 132 ms | 93 ms | **1.42×** | coarse-grained I/O (pread was ~59% of the profile) |
+| Q3 | 684 ms | 188 ms | **3.6×** | join column pruning (customer 8→2, orders 9→4, lineitem 16→4 columns) + coarse I/O |
+| Q12 | 1,050 ms | 585 ms | **1.8×** | join column pruning + coarse I/O |
+
 ### Floor — vs SQLite (row-store OLTP)
 
 SQLite is a B-tree row-store engine designed for OLTP: it reads full rows, applies predicates row-at-a-time, and has no columnar I/O or vectorized aggregation. Beating a row-store on full-table OLAP scans is the **expected** outcome of any columnar engine — this baseline confirms the columnar layout and vectorized operators are paying off, not that the engine is production-grade.
 
-| Query | Description | vexq | SQLite | Speedup |
-|-------|-------------|------|--------|---------|
-| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 239 ms | 2,197 ms | **9.2×** |
-| Q6 | Revenue forecast — scan with 5 range predicates, SUM(expr) | 132 ms | 381 ms | **2.9×** |
-| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 684 ms | 2,525 ms | **3.7×** |
-| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 1,050 ms | 724 ms | 0.69× |
+| Query | Description | vexq serial | SQLite | Speedup |
+|-------|-------------|------------:|-------:|:-------:|
+| Q1 | Pricing summary — full scan, GROUP BY 2 string cols | 205 ms | 2,197 ms | **10.7×** |
+| Q6 | Revenue forecast — scan with 5 range predicates, SUM(expr) | 93 ms | 381 ms | **4.1×** |
+| Q3 | Shipping priority — 3-table join, complex SUM, LIMIT 10 | 188 ms | 2,525 ms | **13.4×** |
+| Q12 | Shipping modes — 2-table join, CASE WHEN agg, date comparisons | 585 ms | 724 ms | **1.24×** |
 
-Q12 remains close to parity with SQLite: the `HashJoin` build phase materializes the full orders table and SQLite benefits from its B-tree index on `o_orderkey`. Future work: index-nested-loop join and late materialization would close this gap.
+vexq is now faster than SQLite on all four queries, serially. Q12 was the last holdout (0.69× before join column pruning): the `HashJoin` build phase materialized all nine orders columns while SQLite walked its B-tree index on `o_orderkey`; pruning the build side to the referenced columns flipped it.
 
 ### What's left on the table
 
-- **Coarser-grained I/O**: The single largest serial Q6 opportunity. pprof shows ~59% of CPU samples in `pread` syscalls (~35K preads per 6M-row scan, one per block even on warm page cache). Issuing one `pread` per row group (or mmap-ing the file) would eliminate the vast majority of these syscalls, collapsing the dominant serial cost center.
-- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops. However, pprof profiling of serial Q6 reveals filter compute is a small fraction of total execution time (~59% of samples are in `pread` syscalls); with filter being a minor contributor, AVX2 kernels alone yield only a modest end-to-end Q6 improvement despite the 3.3× kernel speedup. SIMD remains valuable for Q1-style queries where aggregation compute dominates. See [`bench/simd_filter/`](bench/simd_filter/) for the kernel measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row (3.3× speedup)**, measured on Intel Xeon 6975P-C (x86-64).
+- **Coarser-grained I/O (landed)**: `ColumnReader` now buffers a window of its column section (up to 4 MiB, admitting a whole row group) and serves blocks from memory: 23,449 → 373 preads per canonical-Q6 scan (62.9×). Measured on the M4 Pro: serial Q6 132 → 93 ms, and it contributes to every other query's second-round improvement. mmap was considered and rejected — it needs `golang.org/x/sys`, breaking the zero-runtime-dependency claim.
+- **Explicit SIMD**: Use `avo` or Go assembly to generate AVX2/AVX-512 kernels for the hot decode and comparison loops. With the pread bottleneck now removed by coarse-grained I/O, filter/decode compute is a much larger fraction of serial Q6 — SIMD kernels are worth more than they were, though still bounded by Amdahl over the filter fraction. SIMD remains valuable for Q1-style queries where aggregation compute dominates. See [`bench/simd_filter/`](bench/simd_filter/) for the kernel measurement: **AVX2 int64 intrinsics achieve 2.44 ns/row vs 8.17 ns/row (3.3× speedup)**, measured on Intel Xeon 6975P-C (x86-64).
 - **Parallel hash join — radix-partitioned parallel build (landed)**: Three increments, all measured on a synthetic 300K-order ⋈ 1.2M-lineitem dataset (Intel Xeon 6975P-C, 4 cores available, warm page cache, medians of 5 runs). Phase 1: `planner.Parallel()` detects `Aggregate → HashJoin → (Filter →)? Scan` and parallelizes the **probe** side (`exec.ParallelHashJoinAggregate`), bringing Q3's and Q12's shapes into the parallel path for the first time. Phase 2: the optimizer pushes needed-column sets through `LogicalJoin`, so each side decodes only its join key plus the columns the query references — that halved the isolated build phase and cut the build's share of serial Q12-shaped runtime from ~60% to ~47%. Phase 3: the build side is now **radix-partitioned and built in parallel** over its own row-group morsels — workers bucket rows by mixed-hash radix bits into per-(morsel, partition) buckets, then one goroutine per partition assembles that partition's map, so the build needs no lock. Walking morsels in index order during assembly keeps per-key row order identical to a serial drain, so integer aggregates stay exactly equal to serial results, not merely equivalent. Q12-shaped parallel(4) went 191 ms → 113 ms and its speedup over serial 1.15× → **2.01×**; Q3-shaped parallel(4) 63 ms → 52 ms (1.22× → 1.51×); a probe-heavy unfiltered join 203 ms → 149 ms (1.45× → 2.03×); the isolated build phase 114 ms → 54 ms, which had actually been a **regression** against its own 99 ms serial build before this change and is now 1.96× faster than it. Under `GOGC=off`, Q12-shaped parallel scaling is 1.32× → **2.74×** on 4 cores, so GC still absorbs a large share of the win. Two honest costs: allocated bytes rise ~34% for the two-pass shuffle's buckets, and build morsels are row groups, so a build side of only a few row groups leaves a straggler (the 300K-row fixture is 5 row groups, and its in-query build scales 1.59× on 4 workers rather than near-linearly).
 - **Radix partitioning did not make the probe cache-resident**: this was the stated motivation and the measurement did not support it. `exec.BenchmarkPartitionedProbe` holds the build rows and probe keys fixed and varies only the partition count: 1 → 256 partitions is flat within noise (4.1–4.7 ms). Only the build side is partitioned, so a probe batch's keys still spread across every partition and the probe touches the whole table per unit time either way. What partitioning does buy is the lock-free parallel build, plus 1.58× on a single-threaded build purely from growing 64 small maps instead of one big one (`exec.BenchmarkRadixBuild`). Getting the cache win needs the **probe** stream partitioned too — buffering probe rows per partition at morsel granularity and then probing partition-at-a-time — which conflicts with a streaming operator whose `TableScan` reuses its decode buffers between batches. That is the remaining structural piece of DuckDB's join advantage, and it is not claimed here.
 - **Column pruning through joins is name-based, not cost-based**: a column name present in both joined tables is kept on both sides, since needed-column sets carry unqualified names. That over-approximates rather than under-prunes, so it is correct but leaves a little on the table for schemas that reuse column names across tables. A scan also cannot express "read zero columns" — `SELECT COUNT(*) FROM t` over a single table still decodes every column, because an empty projection means "all" in `exec.NewTableScan`. Under a join the join key saves it, but the single-table case would need a row-count-only scan path.
-- **Parallel aggregates over expressions**: Canonical Q6 (`SUM(a*b)`) currently falls back to serial; extending the parallel planner to evaluate expression aggregates per-morsel would restore Q6's parallel speedup on the canonical query.
 - **Late materialization**: Avoid decoding non-predicate columns until after the filter selection vector is built — saves decode work proportional to filter selectivity.
 - **Further GC reduction**: Extend buffer reuse from TableScan (already done) to Filter and Project operators — would improve parallel scaling toward the hardware ceiling.
 - **Adaptive compression**: Delta encoding for sorted integer columns (timestamps, order keys) could improve decode throughput and reduce I/O.
 
 ### Parallel execution (morsel-driven, 14 goroutines)
 
-`planner.Parallel()` detects aggregate plan shapes — including `Sort → Aggregate` and `Limit → Sort → Aggregate` — and partitions the scan across `runtime.NumCPU()` goroutines using a dynamic atomic-counter morsel queue. Each goroutine runs an independent pipeline on dynamically claimed morsels; a merge step combines partial aggregates in the calling goroutine.
+`planner.Parallel()` detects aggregate plan shapes — including `Sort → Aggregate`, `Limit → Sort → Aggregate`, and aggregates over an inner hash join — and partitions the scan across `runtime.NumCPU()` goroutines using a dynamic atomic-counter morsel queue. Each goroutine runs an independent pipeline on dynamically claimed morsels; a merge step combines partial aggregates in the calling goroutine. For join shapes, the build side is radix-partitioned and built in parallel first, then probe-side morsels are distributed across workers. All four TPC-H queries now take the parallel path.
 
 | Query | vexq serial | vexq parallel | Speedup | Notes |
-|-------|-------------|---------------|---------|-------|
-| Q1 | 239 ms | **129 ms** | **1.85×** | Sort-peeling: parallel aggregate, serial 4-row sort |
-| Q6 (canonical) | 132 ms | pending re-measurement | pending re-measurement | Now parallelized — the aggregate expression is materialized per morsel |
-| Q6 (simple-agg variant) | 111 ms | **96 ms** | **1.16×** | GC-limited — remaining per-batch allocations in filter/project |
+|-------|------------:|--------------:|:-------:|-------|
+| Q1 | 205 ms | **35 ms** | **5.9×** | Sort-peeling: parallel aggregate, serial 4-row sort |
+| Q6 | 93 ms | **34 ms** | **2.7×** | Expression aggregate materialized per morsel |
+| Q3 | 188 ms | **62 ms** | **3.0×** | Radix-partitioned parallel build + parallel probe (3-table chain) |
+| Q12 | 585 ms | **113 ms** | **5.2×** | Parallel join + CASE WHEN expression aggregate |
 
-Q3/Q12 fall back to `planner.Physical()` because they contain `HashJoin`, which is not yet parallelized. Canonical Q6 no longer falls back: each worker pipeline ends with the same pre-projection the serial planner applies, materializing the aggregate's expression (`SUM(a*b)`) into a synthetic column per morsel — the expression is row-local, so evaluating it per morsel is equivalent to evaluating it over the whole scan. Its M4 Pro parallel timing is pending re-measurement; the GC-scaling analysis below still uses the simplified Q6 variant, because that is the workload the existing ablation and worker-sweep numbers were measured on. Float64 `SUM`/`AVG` results agree with serial execution to within IEEE-754 rounding rather than bit-for-bit — partitioning reorders float additions, which is a property of any partitioned float reduction, including the simple-column path; integer aggregates and `COUNT` are exact. Parallel scaling is currently limited by Go GC pressure: decode-buffer reuse in `TableScan` reduced GC cycles by 30%, but small per-batch allocations in downstream operators remain. With GC on, parallel efficiency (speedup ÷ N) is 8% (Q6) and 13% (Q1). The ablation below shows this is not a fixed serial-fraction limit: GC overhead grows with worker count (more goroutines allocating → more GC cycles and STW time), which is why an Amdahl model cannot fit these numbers — the ablation exceeds the ceiling any fitted serial fraction would imply.
+Q1's 5.9× on 14 cores (10P+4E) is ~59% efficiency against the realistic 10-P-core ceiling — a long way from the 1.16–1.85× this table showed before buffer reuse, sort-peeling, parallel expression aggregates, and the parallel join landed.
 
-Ablation with `GOGC=off` proves this is GC pressure, not contention: Q6 parallel drops from 96 ms to 29 ms (3.2× like-for-like scaling), Q1 from 129 ms to 43 ms (5.8× like-for-like scaling). The morsel scheduler scales correctly once GC is removed — the remaining gap to linear is P/E-core asymmetry: the M4 Pro's 14 cores are 10 performance + 4 efficiency cores, and runtime.NumCPU() spawns 14 workers, four of which land on E-cores with a fraction of P-core throughput. Against a realistic 10-P-core ceiling, Q1's scaling is ~58% efficiency. The worker sweep below demonstrates this empirically. It is explicitly not memory bandwidth: Q6 decodes ~288 MB in 29 ms (~10 GB/s), under 5% of the platform's available bandwidth.
+Expression aggregates parallelize by ending each worker pipeline with the same pre-projection the serial planner applies, materializing the expression (`SUM(a*b)`) into a synthetic column per morsel — the expression is row-local, so evaluating it per morsel is equivalent to evaluating it over the whole scan. Float64 `SUM`/`AVG` results agree with serial execution to within IEEE-754 rounding rather than bit-for-bit — partitioning reorders float additions, which is a property of any partitioned float reduction; integer aggregates and `COUNT` are exact (the parallel join's morsel-ordered build assembly keeps per-key row order identical to a serial drain). `COUNT(DISTINCT)` still falls back to serial. Remaining parallel scaling is limited by Go GC pressure — per-batch allocations in filter/project operators — plus P/E-core asymmetry: GC overhead grows with worker count, which is why a fixed-serial-fraction (Amdahl) model cannot fit these numbers.
 
-| Query | Serial (GC on) | Serial (GOGC=off) | Parallel (GOGC=off) | True scaling |
-|-------|---------------:|-------------------:|--------------------:|:------------:|
-| Q1 | 239 ms | 250 ms | 43 ms | **5.8×** |
-| Q6 (simple-agg variant) | 111 ms | 94 ms | 29 ms | **3.3×** |
+Ablation with `GOGC=off` quantifies the remaining GC share (parallel, all four queries): Q1 35 → 26 ms, Q6 34 → 19 ms, Q3 62 → 43 ms, Q12 113 → 56 ms. GC still costs 26–50% of parallel wall time, so extending buffer reuse to filter/project/join operators remains the top parallel-scaling item. The rest of the gap to linear is P/E-core asymmetry: the M4 Pro's 14 cores are 10 performance + 4 efficiency cores, and runtime.NumCPU() spawns 14 workers, four of which land on E-cores with a fraction of P-core throughput — the worker sweep below demonstrates the bend at 10 workers empirically. It is explicitly not memory bandwidth (Q6 decodes ~288 MB in tens of milliseconds, a small fraction of the platform's ~273 GB/s).
 
-An interesting detail: GOGC=off slightly *slows* serial Q1 (heap growth overhead without concurrent GC amortization) while speeding serial Q6 ~15% — the like-for-like scaling figures (dividing parallel GOGC=off by serial GOGC=off) are the honest ones. GOGC=off is a diagnostic, not a production configuration — unbounded heap growth is not viable. The realistic mitigations are the buffer-reuse work already applied to TableScan (extending to Filter/Project), and GOMEMLIMIT as a bounded middle ground.
+| Query | Parallel (GC on) | Parallel (GOGC=off) | GC share of parallel time |
+|-------|-----------------:|--------------------:|:-------------------------:|
+| Q1 | 35 ms | 26 ms | ~26% |
+| Q6 | 34 ms | 19 ms | ~44% |
+| Q3 | 62 ms | 43 ms | ~31% |
+| Q12 | 113 ms | 56 ms | ~50% |
+
+GOGC=off is a diagnostic, not a production configuration — unbounded heap growth is not viable. The realistic mitigations are the buffer-reuse work already applied to TableScan (extending to Filter/Project/join operators), and GOMEMLIMIT as a bounded middle ground.
 
 #### Worker sweep (GOGC=off, Q6-shaped simple-aggregate query)
 
@@ -324,6 +339,10 @@ perf stat -e cache-misses,cache-references,branch-misses \
 | 13 | Aggregate optimization — packed dictionary-code integer keys | ✅ Complete |
 | 14 | Correctness oracle — 48-query golden test suite ([`internal/goldentest/`](internal/goldentest/)) | ✅ Complete |
 | 15 | Expression eval hardening — NOT precedence, date coercion, CASE WHEN strings, COUNT(DISTINCT) | ✅ Complete |
+| 16 | Coarse-grained I/O — row-group-buffered reads, 62.9× pread reduction | ✅ Complete |
+| 17 | Parallel expression aggregates + parallel hash join (probe side) | ✅ Complete |
+| 18 | Join column pruning — needed-column sets pushed through `LogicalJoin` | ✅ Complete |
+| 19 | Radix-partitioned parallel join build — lock-free two-pass, 64-partition measured optimum | ✅ Complete |
 
 ## Design Notes
 
