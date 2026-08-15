@@ -38,7 +38,7 @@ exec/          — Vectorized operator pipeline
 catalog/       — Table registry with lazy schema loading from .vxq footer
 storage/       — .vxq file format: writer, reader, block codec, zone maps
 internal/encoding — Little-endian primitives, CRC32-IEEE helpers
-internal/goldentest — End-to-end correctness oracle (48-query suite)
+internal/goldentest — End-to-end correctness oracle (59-query suite, 4 execution paths)
 bench/tpch     — TPC-H Q1/Q3/Q6/Q12 benchmarks vs SQLite and DuckDB
 bench/simd_filter — Isolated AVX2 filter kernel benchmark (ceiling measurement, x86-64)
 ```
@@ -158,7 +158,7 @@ TPC-H scale factor 1 (6M lineitem rows) on Apple M4 Pro (14-core, 192 KB L1D per
 
 ### Correctness
 
-All four TPC-H query results verified identical to SQLite output (via the in-harness `TestQ*Correctness` assertions; Q6's SUM is asserted to 1e-9 relative tolerance). vexq's canonical Q6 additionally matches DuckDB's result exactly. Additionally, an independent 48-query golden test suite ([`internal/goldentest/`](internal/goldentest/)) verifies the full SQL subset against a naive row-at-a-time reference evaluator — and every query runs through **both** `planner.Physical()` and `planner.Parallel(…, 4)`, so the radix-partitioned parallel build, parallel probe, and per-morsel expression materialization are all verified against the same oracle (under `-race` in CI). 48/48 passing on both paths, zero known correctness issues.
+All four TPC-H query results verified identical to SQLite output (via the in-harness `TestQ*Correctness` assertions; Q6's SUM is asserted to 1e-9 relative tolerance). vexq's canonical Q6 additionally matches DuckDB's result exactly. Additionally, an independent 59-query golden test suite ([`internal/goldentest/`](internal/goldentest/)) verifies the full SQL subset against a naive row-at-a-time reference evaluator — and every query runs through **both** `planner.Physical()` and `planner.Parallel(…, 4)`, so the radix-partitioned parallel build, parallel probe, and per-morsel expression materialization are all verified against the same oracle (under `-race` in CI). 59/59 passing on all four oracle paths (serial, parallel, optimizer-off, and a stacked-filter path that duplicates pushed-down predicates to cover plan shapes SQL alone cannot reach), zero known correctness issues.
 
 ### Ceiling — vs DuckDB (SOTA embedded OLAP)
 
@@ -338,7 +338,7 @@ perf stat -e cache-misses,cache-references,branch-misses \
 | 11 | SIMD filter kernel benchmark — AVX2 ceiling measurement ([`bench/simd_filter/`](bench/simd_filter/)) | ✅ Complete |
 | 12 | Parallel scaling — decode-buffer reuse, sort-peeling, GC diagnosis | ✅ Complete |
 | 13 | Aggregate optimization — packed dictionary-code integer keys | ✅ Complete |
-| 14 | Correctness oracle — 48-query golden test suite ([`internal/goldentest/`](internal/goldentest/)) | ✅ Complete |
+| 14 | Correctness oracle — golden test suite (now 59 queries, 4 oracle paths) ([`internal/goldentest/`](internal/goldentest/)) | ✅ Complete |
 | 15 | Expression eval hardening — NOT precedence, date coercion, CASE WHEN strings, COUNT(DISTINCT) | ✅ Complete |
 | 16 | Coarse-grained I/O — row-group-buffered reads, 62.9× pread reduction | ✅ Complete |
 | 17 | Parallel expression aggregates + parallel hash join (probe side) | ✅ Complete |
@@ -352,7 +352,7 @@ perf stat -e cache-misses,cache-references,branch-misses \
 **How morsel-driven parallelism works.** Two distinct layers handle plan-shape detection and dynamic scheduling:
 
 - `planner.Parallel()` ([`planner/parallel.go`](planner/parallel.go)) detects aggregate plan shapes (including `Sort → Aggregate` and `Limit → Sort → Aggregate`), resolves group-by/aggregate column indices, and builds a `PipelineFactory` closure (one independent `TableScan → Filter → Project` pipeline per call). Sort/limit nodes above the aggregate are peeled off and applied serially to the small merged result.
-- `ParallelHashAggregate.setup()` ([`exec/parallel.go`](exec/parallel.go)) handles *dynamic scheduling*: a `morselQueue` wraps an `atomic.Int64` cursor padded to its own 64-byte cache line (preventing false-sharing). Each of the `numWorkers` goroutines loops calling `q.claim(morselSize)` to atomically reserve the next chunk of row groups, runs the pipeline on that morsel, accumulates into a goroutine-local `HashAggregate`, and claims the next morsel — no coordinator, no barriers between morsels. Fast workers (low-selectivity morsels) complete early and immediately claim more work, eliminating stragglers. After all workers drain the queue, the calling goroutine merges all partial aggregates single-threadedly (correct IEEE float64 via bit-reencoding). `TableScan.Reset(rgStart, rgEnd)` allows a single open `storage.Reader` to be repositioned without reopening the file, enabling pipeline reuse across morsels within a single worker.
+- `ParallelHashAggregate.setup()` ([`exec/parallel.go`](exec/parallel.go)) handles *dynamic scheduling*: a `morselQueue` wraps an `atomic.Int64` cursor padded to its own 64-byte cache line (preventing false-sharing). Each of the `numWorkers` goroutines loops calling `q.claim(morselSize)` to atomically reserve the next chunk of row groups, runs the pipeline on that morsel, accumulates into a goroutine-local `HashAggregate`, and claims the next morsel — no coordinator, no barriers between morsels. Fast workers (low-selectivity morsels) complete early and immediately claim more work, eliminating stragglers. After all workers drain the queue, the calling goroutine merges all partial aggregates single-threadedly (correct IEEE float64 via bit-reencoding). `TableScan.Reset(rgStart, rgEnd)` allows a single open `storage.Reader` to be repositioned without reopening the file, allowing a reader to be repositioned without reopening the file (used by the serial path; the parallel worker loop currently builds a fresh pipeline per morsel).
 
 **Why 1024-row batches?** An `Int64Vector` of 1024 rows is 8 KB values + 128 B nulls ≈ 8.2 KB, fitting comfortably in L1 (32–48 KB on x86, 192 KB on Apple M4 Pro performance cores). Per-batch overhead (one `Next()` call, type assertions) amortizes over 1024 rows. Same constant used by Velox, DuckDB, and Photon.
 
