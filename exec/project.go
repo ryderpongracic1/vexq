@@ -109,6 +109,19 @@ func (p *Project) Next(ctx context.Context) (*Batch, error) {
 	}, nil
 }
 
+// Reset repositions this projection's subtree onto row groups [rgStart, rgEnd)
+// (see MorselPipeline). Project itself holds no per-morsel state — it builds
+// every output vector from the batch in front of it — so there is nothing to
+// clear here beyond what its child clears. Its expressions' scratch buffers are
+// rewritten per Eval, which is the same guarantee that already makes them safe
+// batch to batch.
+//
+// See Filter.Reset for why an unresettable child panics rather than being
+// skipped.
+func (p *Project) Reset(rgStart, rgEnd int) {
+	p.child.(MorselPipeline).Reset(rgStart, rgEnd)
+}
+
 func (p *Project) Close() error { return p.child.Close() }
 
 // materialize compacts a vector down to the rows indicated by sel.

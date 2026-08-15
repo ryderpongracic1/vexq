@@ -363,6 +363,28 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 	}
 }
 
+// Reset repositions the probe side onto row groups [rgStart, rgEnd) and
+// discards this join's probe-phase state, so one worker pipeline can probe every
+// morsel it claims (see MorselPipeline).
+//
+// The build table is deliberately kept: reusableMorselPipeline only accepts a
+// join probing a SharedHashTable, which is materialised once by the operator
+// above and read-only for the whole probe phase. Every field cleared here holds
+// rows or offsets from the previous morsel's probe batch — probeBatch above all,
+// which probeColumnFromRows reads through — so keeping any of them would emit
+// the previous morsel's rows again. matchBuf keeps its capacity, since
+// Next truncates and refills it before reading it.
+//
+// See Filter.Reset for why an unresettable probe child panics rather than being
+// skipped.
+func (j *HashJoin) Reset(rgStart, rgEnd int) {
+	j.probeBatch = nil
+	j.probePos = 0
+	j.matchBuf = j.matchBuf[:0]
+	j.matchPos = 0
+	j.probe.(MorselPipeline).Reset(rgStart, rgEnd)
+}
+
 func (j *HashJoin) Close() error {
 	// build is nil when probing a SharedHashTable — the table is owned by the
 	// ParallelHashJoinAggregate that built it, not by this join.

@@ -28,9 +28,12 @@ package exec
 //  4. GOROUTINE LOCALITY. Scratch is not synchronised, so an Expr tree must not
 //     be shared across goroutines. Every parallel worker builds its own
 //     pipeline and its own Expr tree — planner.Parallel's factory calls
-//     buildExecExpr per morsel (planner/parallel.go), as do the join factories
-//     in planner/parallel_join.go and buildPreProjection in planner/physical.go
-//     — so worker pipelines share no expression state.
+//     buildExecExpr for the worker that invoked it (planner/parallel.go), as do
+//     the join factories in planner/parallel_join.go and buildPreProjection in
+//     planner/physical.go — so worker pipelines share no expression state. A
+//     worker that reuses one pipeline across its morsels (exec/morsel.go) keeps
+//     that tree on the one goroutine for the whole run, which narrows the
+//     exposure rather than widening it.
 //
 //  5. NO SCRATCH ESCAPES Project. Project is the boundary between reused
 //     expression scratch and the batches it hands downstream: it materialises

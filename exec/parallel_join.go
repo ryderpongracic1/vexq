@@ -379,12 +379,17 @@ func BuildSharedHashTableParallel(
 
 	for range pass1Workers {
 		go func() {
+			// One pipeline per worker where the factory produces a resettable
+			// one — see morselRunner. Each morsel still gets its own bucket and
+			// its own store, so the rows this pass publishes are unaffected.
+			runner := morselRunner{factory: factory}
+			defer runner.close()
 			for {
 				start, stop, ok := q.claim(msize)
 				if !ok {
 					break // queue exhausted; this worker is done
 				}
-				pipeline, err := factory(wCtx, int(start), int(stop))
+				pipeline, err := runner.open(wCtx, int(start), int(stop))
 				if err != nil {
 					errCh <- fmt.Errorf("radix build worker [%d,%d): pipeline: %w", start, stop, err)
 					return
@@ -403,7 +408,7 @@ func BuildSharedHashTableParallel(
 						local.rows[p] = append(local.rows[p], keyedRow{key: key, row: row})
 						return nil
 					})
-				pipeline.Close()
+				runner.release(pipeline)
 				if err != nil {
 					errCh <- fmt.Errorf("radix build worker [%d,%d): %w", start, stop, err)
 					return
@@ -850,9 +855,10 @@ func (p *ParallelHashJoinAggregate) finishMerged(merged *HashAggregate) {
 }
 
 // runMorselAggWorkers runs numWorkers goroutines that dynamically claim
-// row-group morsels from a shared atomic cursor, build a pipeline per morsel via
-// mkPipeline, and accumulate into a goroutine-local partial HashAggregate. It
-// returns the partial aggregates for the caller to merge.
+// row-group morsels from a shared atomic cursor, get the pipeline for each morsel
+// from a morselRunner over mkPipeline, and accumulate into a goroutine-local
+// partial HashAggregate. It returns the partial aggregates for the caller to
+// merge.
 //
 // This is the same dynamic scheduling ParallelHashAggregate.setup performs
 // inline; factored out here so the join operator does not duplicate it.
@@ -877,12 +883,17 @@ func runMorselAggWorkers(
 	for range numWorkers {
 		go func() {
 			ha := newPartialAggregate(groupBy, aggExprs, schema)
+			// One pipeline per worker where mkPipeline produces a resettable one
+			// — for the probe side that is Scan → Filter? → HashJoinShared →
+			// PreProjection?, whose shared build table Reset leaves untouched.
+			runner := morselRunner{factory: mkPipeline}
+			defer runner.close()
 			for {
 				start, stop, ok := q.claim(msize)
 				if !ok {
 					break // queue exhausted; this worker is done
 				}
-				pipeline, err := mkPipeline(ctx, int(start), int(stop))
+				pipeline, err := runner.open(ctx, int(start), int(stop))
 				if err != nil {
 					ch <- workerResult{err: fmt.Errorf("parallel join worker [%d,%d): pipeline: %w", start, stop, err)}
 					return
@@ -890,7 +901,7 @@ func runMorselAggWorkers(
 				for {
 					batch, err := pipeline.Next(ctx)
 					if err != nil {
-						pipeline.Close()
+						runner.release(pipeline)
 						ch <- workerResult{err: fmt.Errorf("parallel join worker [%d,%d): %w", start, stop, err)}
 						return
 					}
@@ -898,12 +909,12 @@ func runMorselAggWorkers(
 						break
 					}
 					if err := ha.accumulate(batch); err != nil {
-						pipeline.Close()
+						runner.release(pipeline)
 						ch <- workerResult{err: fmt.Errorf("parallel join worker [%d,%d): accumulate: %w", start, stop, err)}
 						return
 					}
 				}
-				pipeline.Close()
+				runner.release(pipeline)
 			}
 			// Materialize integer-key state to string maps before merge.
 			if ha.intKey.enabled && len(ha.intKey.intKeys) > 0 {
