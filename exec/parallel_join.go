@@ -113,20 +113,24 @@ func radixPart(key int64, mask uint64) int {
 // SharedHashTable is a build-side hash table that many probe goroutines read
 // concurrently. It is immutable once its constructor returns.
 //
-// The table is radix-partitioned: parts holds a power-of-two number of maps and
-// a key lives in parts[radixHash(key) & partMask]. A single partition (partMask
-// 0) is the unpartitioned case and behaves exactly like the one big map that
-// preceded partitioning.
+// The table is radix-partitioned: parts holds a power-of-two number of flat
+// open-addressed tables (see join_table.go) and a key lives in
+// parts[radixHash(key) & partMask]. A single partition (partMask 0) is the
+// unpartitioned case and behaves exactly like the one table that preceded
+// partitioning. Every partition indexes into one shared rowStore, so a row index
+// identifies a build row table-wide and the probe never needs to know which
+// partition a row came from.
 //
 // What partitioning buys, and what it does not:
 //
 //   - A lock-free parallel build. Each partition is owned by exactly one
-//     goroutine during assembly, so workers never write the same map. This is the
-//     main reason partitioning is here.
-//   - Cheaper map growth, even single-threaded. Growing one map to N entries
-//     rehashes progressively larger bucket arrays; growing 2^k maps to N/2^k
-//     entries each does the same number of insertions over far smaller arrays.
-//     Measured at 1.58x on a one-worker build (see radixTargetRows).
+//     goroutine during assembly, so workers never write the same table. This is
+//     the main reason partitioning is here.
+//   - Cheaper table growth, even single-threaded. Building 2^k tables of N/2^k
+//     keys each rehashes over far smaller slot arrays than growing one table to
+//     N keys — and the parallel builder presizes from exact pass-1 counts, so it
+//     rehashes not at all. Measured at 1.58x on a one-worker build back when the
+//     partitions were Go maps (see radixTargetRows).
 //   - It does NOT make the probe cache-resident. That was the original
 //     hypothesis, and BenchmarkPartitionedProbe — which holds the build rows and
 //     probe keys fixed and varies only the partition count — measures no
@@ -147,14 +151,14 @@ func radixPart(key int64, mask uint64) int {
 //	`go` statement is observed by the goroutine it starts, so every write
 //	performed during the build phase happens-before every read performed by a
 //	probe worker. Nothing mutates the table afterwards — workers only index into
-//	it — and concurrent reads of a Go map with no concurrent writer are
-//	race-free. This invariant is what makes probe-side parallelism safe without a
-//	lock or a per-worker copy.
+//	it — so the concurrent reads are race-free. This invariant is what makes
+//	probe-side parallelism safe without a lock or a per-worker copy.
 //
 // Ownership: the SharedHashTable outlives every probe join built on top of it.
 // HashJoin.Close therefore must not free it (see HashJoin.Close).
 type SharedHashTable struct {
-	parts    []map[int64][]buildRow
+	parts    []*joinHashTable
+	store    *rowStore
 	partMask uint64
 	schema   Schema
 	keyIdx   int
@@ -170,8 +174,8 @@ func (s *SharedHashTable) NumRows() int { return s.numRows }
 // NumKeys returns the number of distinct join keys in the table.
 func (s *SharedHashTable) NumKeys() int {
 	n := 0
-	for _, m := range s.parts {
-		n += len(m)
+	for _, t := range s.parts {
+		n += t.keys
 	}
 	return n
 }
@@ -184,23 +188,26 @@ func (s *SharedHashTable) NumPartitions() int { return len(s.parts) }
 // set still produces correct results.
 func (s *SharedHashTable) PartitionRows() []int {
 	out := make([]int, len(s.parts))
-	for p, m := range s.parts {
-		for _, rows := range m {
-			out[p] += len(rows)
-		}
+	for p, t := range s.parts {
+		out[p] = t.numRow
 	}
 	return out
 }
 
-// newSharedHashTable allocates numParts empty partitions.
-func newSharedHashTable(schema Schema, keyIdx, radixBits int) *SharedHashTable {
+// newSharedHashTable allocates numParts empty partitions over one row store.
+// capRows sizes the store up front where the caller knows the row count, and
+// expectedKeysPerPart presizes each partition's slot array; 0 for either means
+// "grow on demand".
+func newSharedHashTable(schema Schema, keyIdx, radixBits, capRows, expectedKeysPerPart int) *SharedHashTable {
 	numParts := 1 << radixBits
-	parts := make([]map[int64][]buildRow, numParts)
+	store := newRowStore(schema, capRows)
+	parts := make([]*joinHashTable, numParts)
 	for i := range parts {
-		parts[i] = make(map[int64][]buildRow)
+		parts[i] = newJoinHashTable(store, expectedKeysPerPart)
 	}
 	return &SharedHashTable{
 		parts:    parts,
+		store:    store,
 		partMask: uint64(numParts - 1),
 		schema:   schema,
 		keyIdx:   keyIdx,
@@ -220,20 +227,27 @@ func BuildSharedHashTable(ctx context.Context, build Operator, buildKeyIdx int) 
 //
 // This is the build path for a build side that cannot be split into row-group
 // morsels — a nested join subtree the planner could not decompose. It still
-// benefits from cheaper map growth, and it produces a table with the same probe
+// benefits from cheaper table growth, and it produces a table with the same probe
 // layout as the parallel builder, so the probe path has one shape only.
 //
-// Row order within a key is drain order, identical to the serial HashJoin.
+// Rows land in the shared store in drain order and are inserted as they arrive,
+// so row order within a key is drain order, identical to the serial HashJoin.
 func BuildSharedHashTableRadix(ctx context.Context, build Operator, buildKeyIdx, radixBits int) (*SharedHashTable, error) {
 	schema := build.Schema()
 	if buildKeyIdx < 0 || buildKeyIdx >= len(schema.Fields) {
 		return nil, fmt.Errorf("exec: shared hash table: build key %d out of range", buildKeyIdx)
 	}
-	sht := newSharedHashTable(schema, buildKeyIdx, clampRadixBits(radixBits))
-	err := forEachBuildRow(ctx, build, buildKeyIdx, len(schema.Fields), func(key int64, row buildRow) {
-		m := sht.parts[radixPart(key, sht.partMask)]
-		m[key] = append(m[key], row)
+	// Row count unknown before the drain, so both the store and the partition
+	// tables grow on demand.
+	sht := newSharedHashTable(schema, buildKeyIdx, clampRadixBits(radixBits), 0, 0)
+	err := forEachBuildRow(ctx, build, buildKeyIdx, func(key int64, batch *Batch, rowIdx int) error {
+		row, err := sht.store.appendFrom(batch, rowIdx)
+		if err != nil {
+			return err
+		}
+		sht.parts[radixPart(key, sht.partMask)].insert(key, row)
 		sht.numRows++
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -255,13 +269,22 @@ func clampRadixBits(bits int) int {
 	return bits
 }
 
-// keyedBuildRow is a materialised build row plus its join key, the unit the
-// parallel build shuffles between its two passes. The key is carried explicitly
-// rather than re-derived from the row because a string-typed key column stores
-// its value in strVals, leaving values[keyIdx] zero.
-type keyedBuildRow struct {
+// keyedRow is a build row's join key paired with its index in the morsel store
+// that materialised it — the unit the parallel build shuffles between its two
+// passes. The key is carried explicitly rather than re-derived from the row
+// because a string-typed key column stores its value in the store's string
+// window, leaving the numeric slot zero.
+type keyedRow struct {
 	key int64
-	row buildRow
+	row int32
+}
+
+// morselBucket is one build morsel's pass-1 output: a store holding every row
+// that morsel materialised, plus per-partition lists of the rows that belong to
+// each partition, in morsel order.
+type morselBucket struct {
+	store *rowStore
+	rows  [][]keyedRow // indexed by partition
 }
 
 // BuildSharedHashTableParallel materialises the build side with numWorkers
@@ -273,28 +296,37 @@ type keyedBuildRow struct {
 // Two passes, neither of which takes a lock:
 //
 //  1. Partition, parallel over build row groups. Each worker claims morsels from
-//     a shared atomic cursor, runs factory over the morsel, and appends every
-//     materialised row into a per-(morsel, partition) bucket. A morsel is
-//     claimed by exactly one worker, so no two goroutines write the same bucket
-//     slot.
-//  2. Assemble, parallel over partitions. Each partition is claimed by exactly
-//     one goroutine, which builds that partition's map by walking morsels in
-//     ascending index order. Distinct goroutines write distinct parts[p], so
-//     again no two write the same location.
+//     a shared atomic cursor, runs factory over the morsel, and materialises
+//     every row into that morsel's own store, recording (key, row) in the
+//     per-partition list it belongs to. A morsel is claimed by exactly one
+//     worker, so no two goroutines write the same bucket.
+//  2. Assemble, parallel over partitions. Pass 1's exact row counts size the
+//     final store, and each partition owns a contiguous range of it. Each
+//     partition is claimed by exactly one goroutine, which walks morsels in
+//     ascending index order, copies each of its rows into its own range of the
+//     final store, and inserts it into its own table. Distinct goroutines write
+//     distinct store rows and distinct parts[p], so again no two write the same
+//     location — and because the row counts are exact, no table rehashes.
 //
 // Happens-before: pass 1's bucket writes are published to the calling goroutine
 // by each worker's send on its result channel; pass 2's goroutines are started
 // only after every pass-1 worker has been received, so they observe all bucket
-// writes; pass 2's writes to parts are published to the caller the same way. The
-// function returns before any probe worker exists, so SharedHashTable's
-// read-only contract holds unchanged.
+// writes; pass 2's writes to the store and to parts are published to the caller
+// the same way. The function returns before any probe worker exists, so
+// SharedHashTable's read-only contract holds unchanged.
 //
 // Determinism: pass 1 preserves within-morsel order, pass 2 walks morsels in
-// index order, and morsel index order is row-group order — so the row slice
+// index order, and morsel index order is row-group order — so the chain of rows
 // stored for each key is identical to what a serial drain of the same build side
 // produces, whatever order workers happened to claim morsels in. Join output is
 // therefore per-key order-identical to the serial join, and aggregate results
 // are exact for integers rather than merely equivalent.
+//
+// Cost worth naming: the row payload exists twice between the end of pass 1 and
+// the end of pass 2 — once in the morsel stores, once in the final store — since
+// the final store cannot be sized before pass 1 has counted. The old
+// representation avoided the copy by keeping per-row allocations and moving only
+// slice headers, which is what it paid for with 3 allocations per build row.
 func BuildSharedHashTableParallel(
 	ctx context.Context,
 	factory PipelineFactory,
@@ -308,10 +340,11 @@ func BuildSharedHashTableParallel(
 	if morselSize < 1 {
 		morselSize = defaultMorselSize
 	}
-	sht := newSharedHashTable(schema, buildKeyIdx, clampRadixBits(radixBits))
-	numParts := len(sht.parts)
+	bits := clampRadixBits(radixBits)
+	numParts := 1 << bits
+	partMask := uint64(numParts - 1)
 	if totalRGs < 1 {
-		return sht, nil
+		return newSharedHashTable(schema, buildKeyIdx, bits, 0, 0), nil
 	}
 
 	numMorsels := (totalRGs + morselSize - 1) / morselSize
@@ -328,9 +361,9 @@ func BuildSharedHashTableParallel(
 	}
 
 	// ---- Pass 1: partition ---------------------------------------------------
-	// buckets[morselIdx][partition]. Pre-allocated so workers only ever write
-	// the slot for a morsel they claimed.
-	buckets := make([][][]keyedBuildRow, numMorsels)
+	// buckets[morselIdx]. Pre-allocated so workers only ever write the slot for
+	// a morsel they claimed.
+	buckets := make([]*morselBucket, numMorsels)
 	q := &morselQueue{end: int64(totalRGs)}
 	msize := int64(morselSize)
 	errCh := make(chan error, pass1Workers)
@@ -356,11 +389,19 @@ func BuildSharedHashTableParallel(
 					errCh <- fmt.Errorf("radix build worker [%d,%d): pipeline: %w", start, stop, err)
 					return
 				}
-				local := make([][]keyedBuildRow, numParts)
-				err = forEachBuildRow(wCtx, pipeline, buildKeyIdx, len(schema.Fields),
-					func(key int64, row buildRow) {
-						p := radixPart(key, sht.partMask)
-						local[p] = append(local[p], keyedBuildRow{key: key, row: row})
+				local := &morselBucket{
+					store: newRowStore(schema, 0),
+					rows:  make([][]keyedRow, numParts),
+				}
+				err = forEachBuildRow(wCtx, pipeline, buildKeyIdx,
+					func(key int64, batch *Batch, rowIdx int) error {
+						row, err := local.store.appendFrom(batch, rowIdx)
+						if err != nil {
+							return err
+						}
+						p := radixPart(key, partMask)
+						local.rows[p] = append(local.rows[p], keyedRow{key: key, row: row})
+						return nil
 					})
 				pipeline.Close()
 				if err != nil {
@@ -384,10 +425,41 @@ func BuildSharedHashTableParallel(
 	}
 
 	// ---- Pass 2: assemble ----------------------------------------------------
+	// Exact per-partition row counts, and the contiguous range of the final store
+	// each partition owns.
+	counts := make([]int, numParts)
+	total := 0
+	for _, b := range buckets {
+		if b == nil {
+			continue
+		}
+		for p := range b.rows {
+			counts[p] += len(b.rows[p])
+			total += len(b.rows[p])
+		}
+	}
+	if int64(total) > maxBuildRows {
+		return nil, fmt.Errorf("exec: hash join: build side exceeds %d rows", maxBuildRows)
+	}
+	offsets := make([]int32, numParts)
+	next := int32(0)
+	for p, n := range counts {
+		offsets[p] = next
+		next += int32(n)
+	}
+
+	sht := &SharedHashTable{
+		parts:    make([]*joinHashTable, numParts),
+		store:    newSizedRowStore(schema, total),
+		partMask: partMask,
+		schema:   schema,
+		keyIdx:   buildKeyIdx,
+		numRows:  total,
+	}
+
 	// done carries no value because pass 2 cannot fail: it only reads buckets and
-	// writes maps.
+	// writes rows and slots it exclusively owns.
 	pq := &morselQueue{end: int64(numParts)}
-	partRows := make([]int, numParts)
 	done := make(chan struct{}, pass2Workers)
 	for range pass2Workers {
 		go func() {
@@ -397,39 +469,33 @@ func BuildSharedHashTableParallel(
 					break
 				}
 				p := int(p64)
-				// Size the map from the exact row count so assembly does not
-				// rehash. Duplicate keys make this an over-estimate of the key
-				// count, which costs memory but never a rehash.
-				n := 0
+				// Presized from the exact row count. Duplicate keys make that an
+				// over-estimate of the key count, which costs slot memory but
+				// never a rehash.
+				tbl := newJoinHashTable(sht.store, counts[p])
+				dst := offsets[p]
 				for mi := range buckets {
-					if buckets[mi] != nil {
-						n += len(buckets[mi][p])
-					}
-				}
-				m := make(map[int64][]buildRow, n)
-				for mi := range buckets {
-					if buckets[mi] == nil {
+					b := buckets[mi]
+					if b == nil {
 						continue
 					}
-					for _, kr := range buckets[mi][p] {
-						m[kr.key] = append(m[kr.key], kr.row)
+					for _, kr := range b.rows[p] {
+						sht.store.setFrom(dst, b.store, kr.row)
+						tbl.insert(kr.key, dst)
+						dst++
 					}
-					// Release the bucket so its backing array can be collected
-					// while later partitions are still assembling. Only this
-					// goroutine reads or writes slot [mi][p].
-					buckets[mi][p] = nil
+					// Release the partition's list so its backing array can be
+					// collected while later partitions are still assembling. Only
+					// this goroutine reads or writes rows[p].
+					b.rows[p] = nil
 				}
-				sht.parts[p] = m
-				partRows[p] = n
+				sht.parts[p] = tbl
 			}
 			done <- struct{}{}
 		}()
 	}
 	for range pass2Workers {
 		<-done
-	}
-	for _, n := range partRows {
-		sht.numRows += n
 	}
 	return sht, nil
 }
@@ -458,6 +524,7 @@ func NewHashJoinShared(sht *SharedHashTable, probe Operator, probeKeyIdx int) (*
 		schema:      Schema{Fields: outFields},
 		parts:       sht.parts,
 		partMask:    sht.partMask,
+		store:       sht.store,
 		buildDone:   true,
 	}, nil
 }
