@@ -194,10 +194,14 @@ func TestOversizedWindowIsServedButNotPooled(t *testing.T) {
 // ---- Reuse across Reader lifetimes (the morsel pattern) --------------------
 
 // TestWindowsReusedAcrossReaders is the regression test for the bug this pool
-// exists to fix. The morsel scheduler creates a Reader per morsel, so before the
-// shared pool every morsel started with a cold free list and allocated a fresh
-// window per projected column — 100% miss rate, invisible to the pointer-identity
-// test that only covers row groups within one Reader.
+// exists to fix. The morsel scheduler created a Reader per morsel at the time,
+// so before the shared pool every morsel started with a cold free list and
+// allocated a fresh window per projected column — 100% miss rate, invisible to
+// the pointer-identity test that only covers row groups within one Reader.
+// Per-worker pipeline reuse (exec.MorselPipeline) has since made a Reader last a
+// worker's whole run, but windows still have to survive Reader boundaries — this
+// test drives them directly, one short-lived Reader per morsel, so it keeps
+// pinning that property regardless of how long the executor's Readers live.
 //
 // The assertion is a ratio rather than zero because sync.Pool is cleared by the
 // garbage collector: a GC landing mid-test legitimately costs a few allocations.

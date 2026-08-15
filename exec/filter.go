@@ -77,4 +77,18 @@ func (f *Filter) Next(ctx context.Context) (*Batch, error) {
 	}
 }
 
+// Reset repositions this filter's subtree onto row groups [rgStart, rgEnd) so
+// one worker pipeline can serve every morsel it claims (see MorselPipeline).
+// Only the selection-vector buffer's capacity survives: its contents are
+// rewritten from the next batch before anything reads them, which is already
+// true batch to batch within a morsel.
+//
+// The child assertion cannot fail for a pipeline reusableMorselPipeline
+// accepted, and panicking rather than quietly not repositioning is deliberate: a
+// scan left on the previous range would re-emit the previous morsel's rows.
+func (f *Filter) Reset(rgStart, rgEnd int) {
+	f.sel = f.sel[:0]
+	f.child.(MorselPipeline).Reset(rgStart, rgEnd)
+}
+
 func (f *Filter) Close() error { return f.child.Close() }

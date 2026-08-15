@@ -131,7 +131,9 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 	// ---- Factory closure ----------------------------------------------------
 	// Each call to factory(ctx, rgStart, rgEnd) builds an independent pipeline:
 	//   TableScanRange → ScanPredFilter? → Filter? → PreProjection?
-	// This is called once per morsel inside ParallelHashAggregate.setup, and once
+	// This is called once per worker inside ParallelHashAggregate.setup — a worker
+	// repositions the pipeline it gets for each further morsel instead of asking
+	// for a new one (exec.MorselPipeline) — and once
 	// here to probe the pipeline's output schema.
 	//
 	// PreProjection is what makes aggregates over expressions parallel-safe: it

@@ -36,10 +36,14 @@ func (q *morselQueue) claim(size int64) (start, stop int64, ok bool) {
 }
 
 // ParallelHashAggregate runs one goroutine per worker. Each goroutine
-// dynamically claims row-group morsels from a shared atomic counter, runs an
-// independent pipeline on each morsel, and accumulates partial results locally.
+// dynamically claims row-group morsels from a shared atomic counter, runs its own
+// pipeline over each morsel it claims, and accumulates partial results locally.
 // After all workers drain the queue the calling goroutine merges the partial
 // aggregates — no shared mutable state during execution.
+//
+// A worker's pipeline is built once and repositioned per morsel where the factory
+// produces a resettable one, and rebuilt per morsel where it does not; either
+// way no pipeline is shared between workers. See morselRunner (morsel.go).
 //
 // Unlike the previous static-partition design, workers self-schedule: a
 // goroutine whose morsels have high filter selectivity finishes fast and claims
@@ -139,12 +143,16 @@ func (p *ParallelHashAggregate) setup(ctx context.Context) error {
 	for range p.numWorkers {
 		go func() {
 			ha := newPartialAggregate(p.groupBy, p.aggExprs, p.schema)
+			// One pipeline per worker where the factory produces a resettable
+			// one, rebuilt per morsel where it does not — see morselRunner.
+			runner := morselRunner{factory: p.factory}
+			defer runner.close()
 			for {
 				start, stop, ok := q.claim(msize)
 				if !ok {
 					break // queue exhausted; this worker is done
 				}
-				pipeline, err := p.factory(ctx, int(start), int(stop))
+				pipeline, err := runner.open(ctx, int(start), int(stop))
 				if err != nil {
 					ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): factory: %w", start, stop, err)}
 					return
@@ -152,7 +160,7 @@ func (p *ParallelHashAggregate) setup(ctx context.Context) error {
 				for {
 					batch, err := pipeline.Next(ctx)
 					if err != nil {
-						pipeline.Close()
+						runner.release(pipeline)
 						ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): %w", start, stop, err)}
 						return
 					}
@@ -160,12 +168,12 @@ func (p *ParallelHashAggregate) setup(ctx context.Context) error {
 						break
 					}
 					if err := ha.accumulate(batch); err != nil {
-						pipeline.Close()
+						runner.release(pipeline)
 						ch <- workerResult{err: fmt.Errorf("parallel agg worker [%d,%d): accumulate: %w", start, stop, err)}
 						return
 					}
 				}
-				pipeline.Close()
+				runner.release(pipeline)
 			}
 			// Materialize integer-key state to string maps before merge.
 			if ha.intKey.enabled && len(ha.intKey.intKeys) > 0 {

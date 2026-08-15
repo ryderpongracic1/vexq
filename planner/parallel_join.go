@@ -244,7 +244,9 @@ func openScanPipeline(ctx context.Context, node LogicalNode) (*scanPipeline, err
 // builds, restricted to a row-group range.
 //
 // Each call opens its own reader, so pipelines from different goroutines share no
-// mutable state.
+// mutable state. A worker calls this once and then repositions what it gets for
+// each further morsel it claims (exec.MorselPipeline), so the open is per worker
+// rather than per morsel.
 func (sp *scanPipeline) factory() exec.PipelineFactory {
 	scan, filter, zonePred := sp.scan, sp.filter, sp.zonePred
 	return func(ctx context.Context, rgStart, rgEnd int) (exec.Operator, error) {

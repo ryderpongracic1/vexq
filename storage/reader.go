@@ -46,14 +46,16 @@ const numBufClasses = maxPrefetchBytes / bufClassBytes // 64
 // sharedBufPool holds free section windows by size class so a window outlives
 // the Reader that allocated it.
 //
-// Why process-global rather than per-Reader: the morsel scheduler creates one
-// Reader per morsel — exec.PipelineFactory opens the file for each claimed
-// row-group range and closes it when that morsel finishes — so a per-Reader
-// free list is only ever warm within one morsel. In the parallel path a morsel
-// is a single row group, so every column's first (and only) window acquire
-// missed a cold list and allocated: ~180 MB per Q6-shaped parallel op and
-// ~200 MB per Q1-shaped op. Pooling at process scope instead of Reader scope is
-// what lets those windows survive Reader churn.
+// Why process-global rather than per-Reader: a Reader's lifetime is shorter than
+// a query's. When this pool was added the morsel scheduler opened one Reader per
+// morsel — a single row group in the parallel path — so every column's first and
+// only window acquire missed a cold per-Reader list and allocated: ~180 MB per
+// Q6-shaped parallel op and ~200 MB per Q1-shaped op. Per-worker pipeline reuse
+// (exec.MorselPipeline) has since cut that to one Reader per worker, which warms
+// the per-Reader list across a worker's morsels, but the process-scope pool is
+// still what carries windows across queries, across workers whose lifetimes do
+// not overlap, and across the pipelines that are still rebuilt per morsel
+// because their shape is not resettable.
 //
 // sync.Pool rather than a mutex-guarded slice: Readers on different workers
 // acquire concurrently, and sync.Pool's per-P fast path keeps that off a shared
@@ -71,6 +73,22 @@ var (
 	sectionBufAllocs atomic.Int64
 	sectionBufReuses atomic.Int64
 )
+
+// footerParses counts footers read and parsed, process-wide — one per Open.
+var footerParses atomic.Int64
+
+// FooterParses reports how many footers have been read and parsed since process
+// start. There is exactly one per successful or failed Open, so it is also the
+// number of Readers a workload opened.
+//
+// It exists for the same reason SectionBufferStats does. The per-morsel Reader
+// churn that kept the section-buffer pool cold also re-read and re-parsed the
+// footer once per morsel — ~112 times for a 92-row-group parallel scan — and
+// only an allocation profile revealed it. Counting makes the invariant directly
+// assertable instead: with per-worker pipeline reuse (exec.MorselPipeline) a
+// parallel query's footer parses scale with worker count, not with row-group
+// count, and a test can fail if that regresses.
+func FooterParses() int64 { return footerParses.Load() }
 
 // SectionBufferStats reports how many coarse-grained section windows have been
 // allocated versus served from a pool since process start.
@@ -208,8 +226,9 @@ func (r *Reader) OpenColumn(_ context.Context, rg, col int) (*ColumnReader, erro
 // to the shared pool.
 //
 // The handback is what makes pooling effective under morsel-driven parallelism:
-// a Reader's lifetime there is one morsel, so windows that stopped at Reader
-// scope were garbage on every morsel boundary.
+// a Reader's lifetime there is one worker's run — and was one morsel before
+// per-worker pipeline reuse — so windows that stopped at Reader scope were
+// garbage on every Reader boundary.
 func (r *Reader) Close() error {
 	for i, b := range r.bufPool {
 		putSharedBuf(b)
@@ -274,6 +293,7 @@ func (r *Reader) readAt(off int64, buf []byte) error {
 
 // readFooter reads and parses the footer from the end of the file.
 func (r *Reader) readFooter() error {
+	footerParses.Add(1)
 	fi, err := r.f.Stat()
 	if err != nil {
 		return wrap("open: footer: stat", err)
