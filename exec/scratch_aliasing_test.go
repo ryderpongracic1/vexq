@@ -216,13 +216,13 @@ func TestSharedChildExprEvaluatedTwice(t *testing.T) {
 // own reused selection-vector buffer, compose correctly: the upper Filter reads
 // the lower one's vector while writing its own.
 //
-// The upper predicate compares two columns rather than a column against a
-// literal, deliberately. A literal is sized from Batch.Length while a comparison
-// is sized from the physical vector length, so a literal above a selection vector
-// is short and null-masks the batch's trailing rows. That mismatch predates this
-// change and behaves identically before and after it (verified by running the
-// same stacked-filter shape on df58edb), but it would obscure what this test is
-// here to check.
+// The upper predicate compares a column against a literal, which this test used
+// to avoid: a literal was sized from Batch.Length while a comparison was sized
+// from the physical vector length, so a literal above a selection vector came out
+// short and null-masked the batch's trailing rows. That mismatch predated buffer
+// reuse and is now fixed — expression leaves size themselves from evalLen, per the
+// sizing convention on the Expr interface — so the natural predicate form is
+// usable here. exec/stacked_filter_test.go covers the sizing convention itself.
 func TestFilterSelVecStackedFilters(t *testing.T) {
 	ctx := context.Background()
 	src := newReusingSourceOp([][]int64{
@@ -237,10 +237,9 @@ func TestFilterSelVecStackedFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lower filter: %v", err)
 	}
-	// b < t, i.e. a×10 < 250 → a < 25.
 	upper, err := NewFilter(lower, &BinOp{
-		Op: BinLT, Left: colRef("b", 1, TypeInt64),
-		Right: colRef("t", 2, TypeInt64), T: TypeBool,
+		Op: BinLT, Left: colRef("a", 0, TypeInt64),
+		Right: &Literal{Val: int64(25), T: TypeInt64}, T: TypeBool,
 	})
 	if err != nil {
 		t.Fatalf("upper filter: %v", err)

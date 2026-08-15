@@ -29,6 +29,31 @@ func NewBatch(schema Schema) *Batch {
 	return &Batch{Schema: schema, Vectors: vecs}
 }
 
+// physicalLen returns the number of rows in b's underlying vectors, independent
+// of any selection vector. This is the true allocation size.
+func physicalLen(b *Batch) int {
+	if len(b.Vectors) > 0 {
+		return b.Vectors[0].Len()
+	}
+	return b.Length
+}
+
+// evalLen returns the number of rows an expression must produce for b, per the
+// sizing convention documented on the Expr interface (expr.go): the physical row
+// count whenever a selection vector is active, Batch.Length otherwise.
+//
+// The two answers differ only when a selection vector is installed — Batch's own
+// invariant above says Length equals the vectors' length when SelVec is nil — so
+// this widens the length in exactly the case that needs it and changes nothing
+// elsewhere. Expression leaves that have no child to take their length from must
+// call this rather than reading b.Length.
+func evalLen(b *Batch) int {
+	if b.SelVec == nil {
+		return b.Length
+	}
+	return physicalLen(b)
+}
+
 func makeVector(t DataType) Vector {
 	switch t {
 	case TypeInt64:
@@ -63,20 +88,20 @@ type Int64Vector struct {
 	NullBitmap []byte
 }
 
-func (v *Int64Vector) Len() int        { return len(v.Values) }
-func (v *Int64Vector) Type() DataType  { return TypeInt64 }
+func (v *Int64Vector) Len() int          { return len(v.Values) }
+func (v *Int64Vector) Type() DataType    { return TypeInt64 }
 func (v *Int64Vector) IsNull(i int) bool { return storage.IsNullBit(v.NullBitmap, i) }
-func (v *Int64Vector) Nulls() []byte   { return v.NullBitmap }
+func (v *Int64Vector) Nulls() []byte     { return v.NullBitmap }
 
 type Float64Vector struct {
 	Values     []float64
 	NullBitmap []byte
 }
 
-func (v *Float64Vector) Len() int        { return len(v.Values) }
-func (v *Float64Vector) Type() DataType  { return TypeFloat64 }
+func (v *Float64Vector) Len() int          { return len(v.Values) }
+func (v *Float64Vector) Type() DataType    { return TypeFloat64 }
 func (v *Float64Vector) IsNull(i int) bool { return storage.IsNullBit(v.NullBitmap, i) }
-func (v *Float64Vector) Nulls() []byte   { return v.NullBitmap }
+func (v *Float64Vector) Nulls() []byte     { return v.NullBitmap }
 
 type BoolVector struct {
 	// Bits holds the actual bool values: 1 = true.
@@ -85,11 +110,11 @@ type BoolVector struct {
 	Length     int
 }
 
-func (v *BoolVector) Len() int        { return v.Length }
-func (v *BoolVector) Type() DataType  { return TypeBool }
+func (v *BoolVector) Len() int          { return v.Length }
+func (v *BoolVector) Type() DataType    { return TypeBool }
 func (v *BoolVector) IsNull(i int) bool { return storage.IsNullBit(v.NullBitmap, i) }
-func (v *BoolVector) Nulls() []byte   { return v.NullBitmap }
-func (v *BoolVector) Get(i int) bool  { return v.Bits[i/8]>>(uint(i%8))&1 == 1 }
+func (v *BoolVector) Nulls() []byte     { return v.NullBitmap }
+func (v *BoolVector) Get(i int) bool    { return v.Bits[i/8]>>(uint(i%8))&1 == 1 }
 func (v *BoolVector) Set(i int, val bool) {
 	if val {
 		v.Bits[i/8] |= 1 << uint(i%8)
@@ -104,10 +129,10 @@ type StringVector struct {
 	NullBitmap []byte
 }
 
-func (v *StringVector) Len() int        { return len(v.Codes) }
-func (v *StringVector) Type() DataType  { return TypeString }
+func (v *StringVector) Len() int          { return len(v.Codes) }
+func (v *StringVector) Type() DataType    { return TypeString }
 func (v *StringVector) IsNull(i int) bool { return storage.IsNullBit(v.NullBitmap, i) }
-func (v *StringVector) Nulls() []byte   { return v.NullBitmap }
+func (v *StringVector) Nulls() []byte     { return v.NullBitmap }
 func (v *StringVector) Get(i int) string {
 	if v.Dict == nil {
 		return ""
@@ -120,10 +145,10 @@ type DateVector struct {
 	NullBitmap []byte
 }
 
-func (v *DateVector) Len() int        { return len(v.Values) }
-func (v *DateVector) Type() DataType  { return TypeDate }
+func (v *DateVector) Len() int          { return len(v.Values) }
+func (v *DateVector) Type() DataType    { return TypeDate }
 func (v *DateVector) IsNull(i int) bool { return storage.IsNullBit(v.NullBitmap, i) }
-func (v *DateVector) Nulls() []byte   { return v.NullBitmap }
+func (v *DateVector) Nulls() []byte     { return v.NullBitmap }
 
 // newStringVector builds a StringVector from a DictBuilder, pre-filled codes,
 // and a null bitmap.  Shared by aggregate and sort output paths.

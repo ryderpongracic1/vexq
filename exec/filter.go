@@ -22,6 +22,13 @@ import (
 // Stacked filters are safe because each Filter owns its own buffer: the upper
 // Filter reads the lower one's selection vector and writes its own, never both
 // at once.
+//
+// A stacked Filter also hands its child's batch to Eval untouched — selection
+// vector installed, Length already down to the selected count. That is the batch
+// the expression sizing convention is written for (see the Expr interface in
+// expr.go): the predicate is evaluated over every physical row, and
+// BoolToSelVecInto then reads the result only at the physical indices the
+// incoming selection vector names.
 type Filter struct {
 	child     Operator
 	predicate Expr

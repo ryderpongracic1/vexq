@@ -104,6 +104,47 @@ func runGoldenCase(t *testing.T, ctx context.Context, tc queryCase, cat *catalog
 	// Compare results.
 	compareResults(t, tc, refResult, engineResult)
 
+	// Also run the plan with the optimizer switched off. Predicate pushdown
+	// folds a LogicalFilter over a LogicalScan into the scan's own predicate,
+	// so the optimized plan reaches exec.Filter through physicalScan and never
+	// through physicalFilter — meaning the standalone LogicalFilter operator
+	// path, and any plan shape where a Filter sits above an operator that has
+	// already installed a selection vector, would otherwise go unoracled.
+	// Optimize is an optional public step (planner.Physical accepts an
+	// unoptimized plan), so both plans must produce the same answer.
+	unoptResult, unoptErr := executeEngineUnoptimized(ctx, stmt, cat)
+	if unoptErr != nil {
+		t.Fatalf("engine error (unoptimized plan): %v", unoptErr)
+	}
+	compareResults(t, queryCase{
+		name:    tc.name + "/unoptimized",
+		ordered: tc.ordered,
+	}, refResult, unoptResult)
+
+	// Also run a plan in which every pushed-down scan predicate is ALSO applied
+	// as a standalone filter above the scan. Selection is idempotent — σp(σp(R))
+	// = σp(R) — so the answer must not change, while the operator tree becomes
+	// Filter over Filter over TableScan: the second filter evaluates its
+	// predicate against a batch that already carries a selection vector.
+	//
+	// No query the builder emits today produces that shape, because predicate
+	// pushdown folds a LogicalFilter into the scan below it rather than leaving
+	// both. Three places in the planner nonetheless construct it — physicalScan
+	// plus physicalFilter, planner.Parallel's factory, and the parallel join's
+	// morsel factory, each of which applies the scan predicate and then an
+	// optional filter above it — so the shape is one pushdown change away from
+	// being live, and the oracle should cover it before then.
+	stackedResult, stackedErr := executeEngineStackedFilters(ctx, stmt, cat)
+	if stackedErr != nil {
+		t.Fatalf("engine error (duplicated predicate): %v", stackedErr)
+	}
+	if stackedResult != nil {
+		compareResults(t, queryCase{
+			name:    tc.name + "/stacked-filters",
+			ordered: tc.ordered,
+		}, refResult, stackedResult)
+	}
+
 	// Also try the parallel path if the plan shape allows it.
 	parallelResult, parallelErr := executeEngineParallel(ctx, stmt, cat)
 	if parallelErr == nil && parallelResult != nil {
@@ -112,6 +153,84 @@ func runGoldenCase(t *testing.T, ctx context.Context, tc queryCase, cat *catalog
 			ordered: tc.ordered,
 		}, refResult, parallelResult)
 	}
+}
+
+// executeEngineStackedFilters runs the optimized plan with every scan predicate
+// duplicated into a LogicalFilter directly above its scan. Returns nil,nil when
+// the plan has no pushed-down predicate to duplicate.
+func executeEngineStackedFilters(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (*RefResult, error) {
+	logical, err := planner.Build(ctx, stmt, cat)
+	if err != nil {
+		return nil, err
+	}
+	logical = planner.Optimize(logical)
+	stacked, changed := duplicateScanPredicates(logical)
+	if !changed {
+		return nil, nil
+	}
+	op, err := planner.Physical(ctx, stacked)
+	if err != nil {
+		return nil, err
+	}
+	defer op.Close()
+
+	return drainOperator(ctx, op)
+}
+
+// duplicateScanPredicates rewrites every LogicalScan that carries a pushed-down
+// predicate into LogicalFilter{Predicate: scan.Predicate} over that same scan,
+// reporting whether anything was rewritten. The scan keeps its predicate, so the
+// filter is a redundant second application of it — semantically a no-op that
+// changes only the operator shape.
+func duplicateScanPredicates(node planner.LogicalNode) (planner.LogicalNode, bool) {
+	switch n := node.(type) {
+	case *planner.LogicalScan:
+		if n.Predicate == nil {
+			return n, false
+		}
+		return &planner.LogicalFilter{Child: n, Predicate: n.Predicate}, true
+	case *planner.LogicalFilter:
+		child, changed := duplicateScanPredicates(n.Child)
+		return &planner.LogicalFilter{Child: child, Predicate: n.Predicate}, changed
+	case *planner.LogicalProject:
+		child, changed := duplicateScanPredicates(n.Child)
+		return &planner.LogicalProject{Child: child, Exprs: n.Exprs}, changed
+	case *planner.LogicalAggregate:
+		child, changed := duplicateScanPredicates(n.Child)
+		return &planner.LogicalAggregate{Child: child, GroupBy: n.GroupBy, Aggs: n.Aggs}, changed
+	case *planner.LogicalSort:
+		child, changed := duplicateScanPredicates(n.Child)
+		return &planner.LogicalSort{Child: child, OrderBy: n.OrderBy}, changed
+	case *planner.LogicalLimit:
+		child, changed := duplicateScanPredicates(n.Child)
+		return &planner.LogicalLimit{Child: child, Count: n.Count}, changed
+	case *planner.LogicalDistinct:
+		child, changed := duplicateScanPredicates(n.Child)
+		return &planner.LogicalDistinct{Child: child}, changed
+	case *planner.LogicalJoin:
+		left, lc := duplicateScanPredicates(n.Left)
+		right, rc := duplicateScanPredicates(n.Right)
+		return &planner.LogicalJoin{Left: left, Right: right, Condition: n.Condition}, lc || rc
+	}
+	return node, false
+}
+
+// executeEngineUnoptimized runs a query through the serial engine with the
+// rule-based optimizer skipped, so the logical plan keeps the shape the builder
+// produced: predicates stay in LogicalFilter nodes and no column pruning is
+// applied.
+func executeEngineUnoptimized(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (*RefResult, error) {
+	logical, err := planner.Build(ctx, stmt, cat)
+	if err != nil {
+		return nil, err
+	}
+	op, err := planner.Physical(ctx, logical)
+	if err != nil {
+		return nil, err
+	}
+	defer op.Close()
+
+	return drainOperator(ctx, op)
 }
 
 // executeEngine runs a query through the full serial engine pipeline.
@@ -596,6 +715,81 @@ func buildCorpus() []queryCase {
 		{
 			name:  "alias_table",
 			query: "SELECT o.order_id, o.amount FROM orders o WHERE o.amount > 5000.0 LIMIT 10",
+		},
+
+		// --- Expressions evaluated above a selection vector -----------------
+		//
+		// Everything in this group puts a literal-bearing expression above a
+		// filter, which is the shape that exposed the sizing mismatch between
+		// expression leaves (which used to size from the post-filter logical
+		// length) and comparison kernels (which size from the physical vector
+		// length). See the sizing convention on exec.Expr.
+		//
+		// Selectivity matters here: the predicates deliberately leave a
+		// partially-filled batch, so the physical length exceeds the logical
+		// one and a short vector would null-mask real rows rather than land on
+		// a batch boundary where the two lengths coincide.
+		{
+			name:  "literal_column_over_filter",
+			query: "SELECT order_id, 1 AS one, 'tag' AS label FROM orders WHERE amount > 5000.0",
+		},
+		{
+			name:  "arith_literal_over_filter",
+			query: "SELECT order_id, amount * 2.0 + 1.0 AS scaled FROM orders WHERE amount > 5000.0",
+		},
+		{
+			name:  "mixed_type_arith_over_filter",
+			query: "SELECT orders.order_id, amount * quantity AS total FROM orders, items WHERE orders.order_id = items.order_id AND amount > 5000.0",
+		},
+		{
+			name:  "case_over_filter",
+			query: `SELECT order_id, CASE WHEN amount > 8000.0 THEN 'high' ELSE 'low' END AS tier FROM orders WHERE amount > 5000.0`,
+		},
+		{
+			name:  "case_no_else_over_filter",
+			query: `SELECT order_id, CASE WHEN amount > 8000.0 THEN 'high' END AS tier FROM orders WHERE amount > 5000.0`,
+		},
+		{
+			name:  "between_and_literal_over_filter",
+			query: "SELECT order_id, amount, 0 AS pad FROM orders WHERE amount BETWEEN 1000.0 AND 8000.0 AND status = 'alpha'",
+		},
+
+		// --- Conjunctions that a partial pushdown would split across filters -
+		//
+		// Each of these is one WHERE with several terms over one table. Today
+		// the optimizer folds them all into a single scan predicate, so they
+		// execute as one Filter with an AndExpr; with the optimizer off they
+		// execute as one Filter over a raw scan. Either way the answer must
+		// match the reference, and if pushdown ever becomes partial — pushing
+		// the zone-mappable terms and leaving the rest above — these become
+		// genuine stacked filters without needing new cases.
+		{
+			name:  "multi_term_conjunction",
+			query: "SELECT order_id, amount FROM orders WHERE amount > 1000.0 AND amount < 8000.0 AND status = 'alpha' AND customer_id > 5",
+		},
+		{
+			name:  "multi_term_conjunction_with_expr",
+			query: "SELECT order_id, amount * 1.5 AS scaled, 7 AS seven FROM orders WHERE amount > 1000.0 AND amount < 8000.0 AND order_date > 16500",
+		},
+		{
+			name:  "disjunction_over_filter",
+			query: "SELECT order_id, amount FROM orders WHERE (amount > 8000.0 OR amount < 200.0) AND amount IS NOT NULL",
+		},
+
+		// --- Expressions above a HAVING filter -------------------------------
+		//
+		// HAVING is the one shape where the builder leaves a standalone
+		// LogicalFilter that pushdown cannot fold into a scan, and a hidden
+		// aggregate puts a Project directly above that filter's selection
+		// vector.
+		{
+			name:  "having_hidden_agg_projection",
+			query: "SELECT status FROM orders GROUP BY status HAVING COUNT(*) > 30",
+		},
+		{
+			name:    "having_with_literal_projection",
+			query:   "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status HAVING COUNT(*) > 30 ORDER BY status",
+			ordered: true,
 		},
 	}
 }
