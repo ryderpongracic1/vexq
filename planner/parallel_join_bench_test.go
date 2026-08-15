@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ryderpongracic1/vexq/catalog"
 	"github.com/ryderpongracic1/vexq/exec"
@@ -172,9 +173,109 @@ func BenchmarkJoinBuildOnlySerial(b *testing.B) {
 	runBenchQuery(b, cat, buildOnlyJoin, 0)
 }
 
+func BenchmarkJoinBuildOnlyParallel1(b *testing.B) {
+	cat := benchCatalog(b)
+	runBenchQuery(b, cat, buildOnlyJoin, 1)
+}
+
+func BenchmarkJoinBuildOnlyParallel2(b *testing.B) {
+	cat := benchCatalog(b)
+	runBenchQuery(b, cat, buildOnlyJoin, 2)
+}
+
 func BenchmarkJoinBuildOnlyParallel4(b *testing.B) {
 	cat := benchCatalog(b)
 	runBenchQuery(b, cat, buildOnlyJoin, 4)
+}
+
+// ---- Build-phase attribution -------------------------------------------------
+
+// q12NoOrder is q12Shaped without ORDER BY, so the plan root is the parallel join
+// operator itself rather than the serial sort peeled above it. That is what lets
+// benchBuildPhase read exec.JoinBuildStats off the operator.
+const q12NoOrder = `SELECT l_shipmode,
+    SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count,
+    SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count
+  FROM orders, lineitem
+  WHERE o_orderkey = l_orderkey
+    AND l_shipmode IN ('MAIL', 'SHIP')
+    AND l_commitdate < l_receiptdate
+    AND l_shipdate < l_commitdate
+    AND l_receiptdate >= '1994-01-01'
+    AND l_receiptdate < '1995-01-01'
+  GROUP BY l_shipmode`
+
+// benchBuildPhase splits a parallel join's wall time into its build and probe
+// phases using the build stats the operator records, and reports the partition
+// count it chose. Unlike BenchmarkJoinBuildOnly*, which isolates the build with a
+// query whose probe side prunes to nothing, this measures the build inside the
+// real query — so build-ns/op and ns/op come from the same run and probe-ns/op is
+// their exact difference.
+func benchBuildPhase(b *testing.B, cat *catalog.Catalog, query string, workers int) {
+	b.Helper()
+	ctx := context.Background()
+
+	p := sql.NewParser(query)
+	node, err := p.ParseStatement()
+	if err != nil {
+		b.Fatalf("parse: %v", err)
+	}
+	stmt := node.(*sql.SelectStmt)
+
+	var buildTotal time.Duration
+	var stats exec.JoinBuildStats
+	for range b.N {
+		logical, err := planner.Build(ctx, stmt, cat)
+		if err != nil {
+			b.Fatalf("Build: %v", err)
+		}
+		logical = planner.Optimize(logical)
+		op, err := planner.Parallel(ctx, logical, workers)
+		if err != nil {
+			b.Fatalf("Parallel: %v", err)
+		}
+		pj, ok := op.(*exec.ParallelHashJoinAggregate)
+		if !ok {
+			_ = op.Close()
+			b.Fatalf("root operator = %T, want *exec.ParallelHashJoinAggregate — the query must not have ORDER BY or LIMIT", op)
+		}
+		rows := 0
+		for {
+			batch, err := pj.Next(ctx)
+			if err != nil {
+				b.Fatalf("Next: %v", err)
+			}
+			if batch == nil {
+				break
+			}
+			rows += batch.Length
+		}
+		stats = pj.BuildStats()
+		buildTotal += stats.Elapsed
+		_ = pj.Close()
+		if rows == 0 {
+			b.Fatal("query returned no rows — benchmark data does not match the query")
+		}
+	}
+	b.ReportMetric(float64(buildTotal.Nanoseconds())/float64(b.N), "build-ns/op")
+	b.ReportMetric(float64(stats.Partitions), "partitions")
+	b.ReportMetric(float64(stats.Rows), "build-rows")
+}
+
+func BenchmarkJoinBuildPhaseQ12Parallel1(b *testing.B) {
+	benchBuildPhase(b, benchCatalog(b), q12NoOrder, 1)
+}
+
+func BenchmarkJoinBuildPhaseQ12Parallel2(b *testing.B) {
+	benchBuildPhase(b, benchCatalog(b), q12NoOrder, 2)
+}
+
+func BenchmarkJoinBuildPhaseQ12Parallel4(b *testing.B) {
+	benchBuildPhase(b, benchCatalog(b), q12NoOrder, 4)
+}
+
+func BenchmarkJoinBuildPhaseProbeHeavyParallel4(b *testing.B) {
+	benchBuildPhase(b, benchCatalog(b), probeHeavyJoin, 4)
 }
 
 // probeHeavyJoin removes the probe-side predicates so the probe phase dominates,

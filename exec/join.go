@@ -24,9 +24,19 @@ type HashJoin struct {
 	// (see NewHashJoinShared in parallel_join.go).
 	buildSchema Schema
 
-	// build-phase hash table: serialised key → list of build row indices
+	// build-phase hash table: serialised key → list of build row indices.
+	// Used when this join materialises its own build side.
 	hashTable map[int64][]buildRow
 	buildDone bool
+
+	// parts and partMask are the radix-partitioned alternative to hashTable,
+	// set only by NewHashJoinShared: a join probing a prebuilt SharedHashTable
+	// looks up parts[radixPart(key, partMask)] instead of hashTable. parts is
+	// nil for a self-building join, which keeps the serial path exactly as it
+	// was. Exactly one of the two representations is populated; see the probe
+	// loop in Next.
+	parts    []map[int64][]buildRow
+	partMask uint64
 
 	// probe-phase state
 	probeBatch *Batch
@@ -130,7 +140,13 @@ func (j *HashJoin) Next(ctx context.Context) (*Batch, error) {
 				continue
 			}
 			key := extractInt64(pv, rowIdx)
-			rows, ok := j.hashTable[key]
+			var rows []buildRow
+			var ok bool
+			if j.parts != nil {
+				rows, ok = j.parts[radixPart(key, j.partMask)][key]
+			} else {
+				rows, ok = j.hashTable[key]
+			}
 			if !ok {
 				continue
 			}
@@ -153,6 +169,23 @@ func (j *HashJoin) buildHashTable(ctx context.Context) error {
 // Shared by HashJoin's own build phase and by BuildSharedHashTable, so serial
 // and parallel execution materialise byte-identical build rows.
 func buildHashTableFrom(ctx context.Context, src Operator, keyIdx, numCols int, table map[int64][]buildRow) error {
+	return forEachBuildRow(ctx, src, keyIdx, numCols, func(key int64, row buildRow) {
+		table[key] = append(table[key], row)
+	})
+}
+
+// forEachBuildRow drains src and calls visit once per row that has a non-NULL
+// join key, in the order src produces them, passing the row's int64 key and its
+// materialised buildRow.
+//
+// This is the single place build rows are materialised. Every build-side
+// strategy — the serial join's own table, the phase-1 shared table, and the
+// radix-partitioned tables in parallel_join.go — goes through it, which is what
+// guarantees they all produce byte-identical build rows from the same input.
+//
+// visit must not retain the batch the row came from: values are copied out, so
+// the row stays valid after TableScan reuses its decode buffers.
+func forEachBuildRow(ctx context.Context, src Operator, keyIdx, numCols int, visit func(key int64, row buildRow)) error {
 	for {
 		batch, err := src.Next(ctx)
 		if err != nil {
@@ -200,7 +233,7 @@ func buildHashTableFrom(ctx context.Context, src Operator, keyIdx, numCols int, 
 					}
 				}
 			}
-			table[key] = append(table[key], row)
+			visit(key, row)
 		}
 	}
 }
