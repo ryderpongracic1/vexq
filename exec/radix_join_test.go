@@ -73,17 +73,17 @@ func (f radixBuildFixture) serialOp() Operator {
 func tableContents(t *testing.T, sht *SharedHashTable) map[int64][]int64 {
 	t.Helper()
 	out := make(map[int64][]int64)
-	for _, m := range sht.parts {
-		for key, rows := range m {
+	for _, tbl := range sht.parts {
+		tbl.forEachKey(func(key int64, head int32) {
 			if _, dup := out[key]; dup {
 				t.Fatalf("key %d appears in more than one partition", key)
 			}
-			vals := make([]int64, len(rows))
-			for i, r := range rows {
-				vals[i] = r.values[1]
+			var vals []int64
+			for r := head; r != noRow; r = sht.store.next[r] {
+				vals = append(vals, sht.store.value(r, 1))
 			}
 			out[key] = vals
-		}
+		})
 	}
 	return out
 }

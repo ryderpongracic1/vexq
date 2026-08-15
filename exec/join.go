@@ -24,19 +24,18 @@ type HashJoin struct {
 	// (see NewHashJoinShared in parallel_join.go).
 	buildSchema Schema
 
-	// build-phase hash table: serialised key → list of build row indices.
-	// Used when this join materialises its own build side.
-	hashTable map[int64][]buildRow
-	buildDone bool
-
-	// parts and partMask are the radix-partitioned alternative to hashTable,
-	// set only by NewHashJoinShared: a join probing a prebuilt SharedHashTable
-	// looks up parts[radixPart(key, partMask)] instead of hashTable. parts is
-	// nil for a self-building join, which keeps the serial path exactly as it
-	// was. Exactly one of the two representations is populated; see the probe
-	// loop in Next.
-	parts    []map[int64][]buildRow
+	// Build-phase hash table: parts holds one flat open-addressed table per
+	// radix partition, and a key lives in parts[radixPart(key, partMask)]. A
+	// self-building join has exactly one partition and a zero partMask, which
+	// radixPart short-circuits — so the serial and shared paths run the same
+	// probe code, and the serial path pays nothing for partitioning it does not
+	// use. store holds the build rows the tables index into; it is shared across
+	// partitions, so a row index identifies a row table-wide.
+	parts    []*joinHashTable
 	partMask uint64
+	store    *rowStore
+
+	buildDone bool
 
 	// probe-phase state
 	probeBatch *Batch
@@ -45,15 +44,13 @@ type HashJoin struct {
 	matchPos   int
 }
 
-type buildRow struct {
-	values  []int64  // raw bits per column (non-string types)
-	strVals []string // materialized string values (populated for TypeString columns)
-	nulls   []bool
-}
-
+// joinRow is one output row: a build row index into HashJoin.store paired with a
+// row index into the current probe batch. Eight bytes, so a match buffer of a
+// full output batch stays small and emitMatches walks it sequentially — the
+// previous representation embedded three slice headers per match.
 type joinRow struct {
-	build buildRow
-	probe int // row index in probe batch
+	build int32
+	probe int32
 }
 
 func NewHashJoin(build, probe Operator, buildKeyIdx, probeKeyIdx int) (*HashJoin, error) {
@@ -79,7 +76,6 @@ func NewHashJoin(build, probe Operator, buildKeyIdx, probeKeyIdx int) (*HashJoin
 		probeKey:    probeKeyIdx,
 		buildSchema: bSchema,
 		schema:      Schema{Fields: outFields},
-		hashTable:   make(map[int64][]buildRow),
 	}, nil
 }
 
@@ -140,18 +136,14 @@ func (j *HashJoin) Next(ctx context.Context) (*Batch, error) {
 				continue
 			}
 			key := extractInt64(pv, rowIdx)
-			var rows []buildRow
-			var ok bool
-			if j.parts != nil {
-				rows, ok = j.parts[radixPart(key, j.partMask)][key]
-			} else {
-				rows, ok = j.hashTable[key]
-			}
-			if !ok {
-				continue
-			}
-			for _, br := range rows {
-				j.matchBuf = append(j.matchBuf, joinRow{build: br, probe: rowIdx})
+			// One mix serves both indexes: the low bits pick the partition (a
+			// zero partMask selects the only one), the high bits pick the slot.
+			h := radixHash(key)
+			tbl := j.parts[h&j.partMask]
+			// One lookup lands on the key's first build row; the rest of that
+			// key's rows follow the chain, in build order.
+			for ri := tbl.lookupHashed(key, h); ri != noRow; ri = j.store.next[ri] {
+				j.matchBuf = append(j.matchBuf, joinRow{build: ri, probe: int32(rowIdx)})
 			}
 		}
 		j.probePos = n
@@ -159,33 +151,35 @@ func (j *HashJoin) Next(ctx context.Context) (*Batch, error) {
 }
 
 func (j *HashJoin) buildHashTable(ctx context.Context) error {
-	return buildHashTableFrom(ctx, j.build, j.buildKey, len(j.buildSchema.Fields), j.hashTable)
-}
-
-// buildHashTableFrom drains src and inserts every row into table, keyed by the
-// int64 representation of column keyIdx. Rows whose key is NULL are dropped —
-// an inner equi-join can never match them.
-//
-// Shared by HashJoin's own build phase and by BuildSharedHashTable, so serial
-// and parallel execution materialise byte-identical build rows.
-func buildHashTableFrom(ctx context.Context, src Operator, keyIdx, numCols int, table map[int64][]buildRow) error {
-	return forEachBuildRow(ctx, src, keyIdx, numCols, func(key int64, row buildRow) {
-		table[key] = append(table[key], row)
+	j.store = newRowStore(j.buildSchema, 0)
+	// One unpartitioned table: a self-building serial join has no morsels to
+	// split, so radix partitioning would buy it nothing.
+	tbl := newJoinHashTable(j.store, 0)
+	j.parts = []*joinHashTable{tbl}
+	j.partMask = 0
+	return forEachBuildRow(ctx, j.build, j.buildKey, func(key int64, batch *Batch, rowIdx int) error {
+		row, err := j.store.appendFrom(batch, rowIdx)
+		if err != nil {
+			return err
+		}
+		tbl.insert(key, row)
+		return nil
 	})
 }
 
 // forEachBuildRow drains src and calls visit once per row that has a non-NULL
-// join key, in the order src produces them, passing the row's int64 key and its
-// materialised buildRow.
+// join key, in the order src produces them, passing the row's int64 key and the
+// batch coordinates of the row. Rows whose key is NULL are dropped — an inner
+// equi-join can never match them.
 //
-// This is the single place build rows are materialised. Every build-side
-// strategy — the serial join's own table, the phase-1 shared table, and the
-// radix-partitioned tables in parallel_join.go — goes through it, which is what
-// guarantees they all produce byte-identical build rows from the same input.
+// visit must not retain batch: TableScan reuses its decode buffers between
+// batches, so a row that outlives the call has to be copied out, which is what
+// rowStore.appendFrom does.
 //
-// visit must not retain the batch the row came from: values are copied out, so
-// the row stays valid after TableScan reuses its decode buffers.
-func forEachBuildRow(ctx context.Context, src Operator, keyIdx, numCols int, visit func(key int64, row buildRow)) error {
+// Every build-side strategy drains through here — the serial join's own table,
+// the serial radix build, and the morsel-parallel build in parallel_join.go —
+// which is what guarantees they see the same rows in the same order.
+func forEachBuildRow(ctx context.Context, src Operator, keyIdx int, visit func(key int64, batch *Batch, rowIdx int) error) error {
 	for {
 		batch, err := src.Next(ctx)
 		if err != nil {
@@ -209,31 +203,14 @@ func forEachBuildRow(ctx context.Context, src Operator, keyIdx, numCols int, vis
 			}
 		}
 
+		kv := batch.Vectors[keyIdx]
 		for _, rowIdx := range indices {
-			kv := batch.Vectors[keyIdx]
 			if kv.IsNull(rowIdx) {
 				continue
 			}
-			key := extractInt64(kv, rowIdx)
-			row := buildRow{
-				values:  make([]int64, numCols),
-				strVals: make([]string, numCols),
-				nulls:   make([]bool, numCols),
+			if err := visit(extractInt64(kv, rowIdx), batch, rowIdx); err != nil {
+				return err
 			}
-			for c := 0; c < numCols; c++ {
-				v := batch.Vectors[c]
-				row.nulls[c] = v.IsNull(rowIdx)
-				if !row.nulls[c] {
-					if sv, ok := v.(*StringVector); ok {
-						if sv.Dict != nil {
-							row.strVals[c] = sv.Dict.Get(sv.Codes[rowIdx])
-						}
-					} else {
-						row.values[c] = extractInt64(v, rowIdx)
-					}
-				}
-			}
-			visit(key, row)
 		}
 	}
 }
@@ -267,12 +244,13 @@ func (j *HashJoin) emitMatches() *Batch {
 }
 
 func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n int) Vector {
+	s := j.store
 	switch t {
 	case TypeInt64:
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
-			if !r.build.nulls[colIdx] {
-				out.Values[i] = r.build.values[colIdx]
+			if !s.isNull(r.build, colIdx) {
+				out.Values[i] = s.value(r.build, colIdx)
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
@@ -280,8 +258,8 @@ func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 	case TypeFloat64:
 		out := &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
-			if !r.build.nulls[colIdx] {
-				out.Values[i] = math.Float64frombits(uint64(r.build.values[colIdx]))
+			if !s.isNull(r.build, colIdx) {
+				out.Values[i] = math.Float64frombits(uint64(s.value(r.build, colIdx)))
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
@@ -289,8 +267,8 @@ func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 	case TypeDate:
 		out := &DateVector{Values: make([]int32, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
-			if !r.build.nulls[colIdx] {
-				out.Values[i] = int32(r.build.values[colIdx])
+			if !s.isNull(r.build, colIdx) {
+				out.Values[i] = int32(s.value(r.build, colIdx))
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
@@ -300,8 +278,8 @@ func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 		codes := make([]uint32, n)
 		nullBmp := make([]byte, (n+7)/8)
 		for i, r := range rows {
-			if !r.build.nulls[colIdx] {
-				codes[i] = db.Add(r.build.strVals[colIdx])
+			if !s.isNull(r.build, colIdx) {
+				codes[i] = db.Add(s.str(r.build, colIdx))
 				storage.SetValidBit(nullBmp, i)
 			}
 		}
@@ -309,8 +287,8 @@ func (j *HashJoin) buildColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 	default: // TypeBool
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
-			if !r.build.nulls[colIdx] {
-				out.Values[i] = r.build.values[colIdx]
+			if !s.isNull(r.build, colIdx) {
+				out.Values[i] = s.value(r.build, colIdx)
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
@@ -326,8 +304,9 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		sv := src.(*Int64Vector)
 		for i, r := range rows {
-			if !sv.IsNull(r.probe) {
-				out.Values[i] = sv.Values[r.probe]
+			pRow := int(r.probe)
+			if !sv.IsNull(pRow) {
+				out.Values[i] = sv.Values[pRow]
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
@@ -336,8 +315,9 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 		out := &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}
 		sv := src.(*Float64Vector)
 		for i, r := range rows {
-			if !sv.IsNull(r.probe) {
-				out.Values[i] = sv.Values[r.probe]
+			pRow := int(r.probe)
+			if !sv.IsNull(pRow) {
+				out.Values[i] = sv.Values[pRow]
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
@@ -346,8 +326,9 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 		out := &DateVector{Values: make([]int32, n), NullBitmap: make([]byte, (n+7)/8)}
 		sv := src.(*DateVector)
 		for i, r := range rows {
-			if !sv.IsNull(r.probe) {
-				out.Values[i] = sv.Values[r.probe]
+			pRow := int(r.probe)
+			if !sv.IsNull(pRow) {
+				out.Values[i] = sv.Values[pRow]
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
@@ -358,10 +339,11 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 		codes := make([]uint32, n)
 		nullBmp := make([]byte, (n+7)/8)
 		for i, r := range rows {
-			if !sv.IsNull(r.probe) {
+			pRow := int(r.probe)
+			if !sv.IsNull(pRow) {
 				var s string
 				if sv.Dict != nil {
-					s = sv.Dict.Get(sv.Codes[r.probe])
+					s = sv.Dict.Get(sv.Codes[pRow])
 				}
 				codes[i] = db.Add(s)
 				storage.SetValidBit(nullBmp, i)
@@ -371,8 +353,9 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 	default: // TypeBool
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
-			if !src.IsNull(r.probe) {
-				out.Values[i] = extractInt64(src, r.probe)
+			pRow := int(r.probe)
+			if !src.IsNull(pRow) {
+				out.Values[i] = extractInt64(src, pRow)
 				storage.SetValidBit(out.NullBitmap, i)
 			}
 		}
