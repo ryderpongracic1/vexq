@@ -31,6 +31,9 @@ import (
 // expression is row-local, so evaluating it per morsel is equivalent to
 // evaluating it over the whole scan.
 //
+// Aggregates over an inner hash join are handled by tryParallelJoin
+// ([planner/parallel_join.go]), which parallelizes the probe side.
+//
 // Float64 SUM/AVG results agree with serial execution to within IEEE-754
 // rounding rather than bit-for-bit: partitioning changes the order of float
 // additions, and float addition is not associative. This is a property of any
@@ -41,8 +44,8 @@ import (
 //
 // Falls back to Physical(ctx, root) when:
 //   - root is not a LogicalAggregate (or Sort/Limit above an aggregate)
-//   - the aggregate child (after peeling an optional LogicalFilter) is not a LogicalScan
-//     (e.g., the plan involves a HashJoin)
+//   - the aggregate child (after peeling an optional LogicalFilter) is neither a
+//     LogicalScan nor a join shape tryParallelJoin recognizes
 //   - any aggregate uses DISTINCT (partial distinct counts cannot be summed)
 //   - the pipeline schema or aggregate configuration cannot be resolved, in
 //     which case Physical is the authoritative implementation
@@ -51,6 +54,15 @@ import (
 func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Operator, error) {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
+	}
+
+	// Probe-side-parallel hash join (planner/parallel_join.go). Additive: it
+	// returns matched=false for every shape it does not handle, so the
+	// aggregate-over-scan detection below is unchanged.
+	if op, matched, err := tryParallelJoin(ctx, root, numWorkers); err != nil {
+		return nil, err
+	} else if matched {
+		return op, nil
 	}
 
 	// ---- Plan shape detection ------------------------------------------------
