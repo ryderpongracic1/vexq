@@ -801,6 +801,49 @@ func runVexqParallel(t testing.TB, table, query string, numWorkers int) [][]stri
 	return rows
 }
 
+// runVexqMultiParallel runs a multi-table query through planner.Parallel.
+func runVexqMultiParallel(t testing.TB, tables map[string]string, query string, numWorkers int) [][]string {
+	t.Helper()
+	ctx := context.Background()
+
+	cat, err := catalog.OpenMulti(ctx, tables)
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+
+	p := vsql.NewParser(query)
+	stmt, err := p.ParseStatement()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	sel := stmt.(*vsql.SelectStmt)
+
+	logical, err := planner.Build(ctx, sel, cat)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	logical = planner.Optimize(logical)
+
+	op, err := planner.Parallel(ctx, logical, numWorkers)
+	if err != nil {
+		t.Fatalf("parallel: %v", err)
+	}
+	defer op.Close()
+
+	var rows [][]string
+	for {
+		batch, err := op.Next(ctx)
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if batch == nil {
+			break
+		}
+		appendBatchRows(&rows, batch)
+	}
+	return rows
+}
+
 // ---- parallel correctness tests --------------------------------------------
 
 func TestQ1ParallelCorrectness(t *testing.T) {
@@ -845,6 +888,43 @@ func TestQ6ParallelCorrectness(t *testing.T) {
 	t.Logf("Q6 parallel correctness OK: serial=%s parallel=%s", serial[0][0], parallel[0][0])
 }
 
+func TestQ3ParallelCorrectness(t *testing.T) {
+	tables := vxqPaths(t, "customer", "orders", "lineitem")
+	serial := runVexqMulti(t, tables, q3)
+	parallel := runVexqMultiParallel(t, tables, q3, runtime.NumCPU())
+
+	if len(serial) != len(parallel) {
+		t.Fatalf("Q3 parallel: serial %d rows, parallel %d rows", len(serial), len(parallel))
+	}
+	// Q3 is ORDER BY revenue DESC, o_orderdate LIMIT 10 — rows arrive ordered.
+	// Compare l_orderkey (exact) per position.
+	for i := range serial {
+		if serial[i][0] != parallel[i][0] {
+			t.Errorf("Q3 parallel row %d l_orderkey: serial=%s parallel=%s", i, serial[i][0], parallel[i][0])
+		}
+	}
+	t.Logf("Q3 parallel correctness OK: %d rows, %d workers", len(serial), runtime.NumCPU())
+}
+
+func TestQ12ParallelCorrectness(t *testing.T) {
+	tables := vxqPaths(t, "orders", "lineitem")
+	serial := runVexqMulti(t, tables, q12)
+	parallel := runVexqMultiParallel(t, tables, q12, runtime.NumCPU())
+
+	if len(serial) != len(parallel) {
+		t.Fatalf("Q12 parallel: serial %d rows, parallel %d rows", len(serial), len(parallel))
+	}
+	// Q12 counts are integer sums — must be exactly equal.
+	for i := range serial {
+		for j := range serial[i] {
+			if serial[i][j] != parallel[i][j] {
+				t.Errorf("Q12 parallel row %d col %d: serial=%s parallel=%s", i, j, serial[i][j], parallel[i][j])
+			}
+		}
+	}
+	t.Logf("Q12 parallel correctness OK: %d rows, %d workers", len(serial), runtime.NumCPU())
+}
+
 // ---- parallel benchmarks ---------------------------------------------------
 
 func BenchmarkVexqQ1Parallel(b *testing.B) {
@@ -875,6 +955,44 @@ func BenchmarkVexqQ6Parallel(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		cat, _ := catalog.OpenSingle(ctx, "lineitem", path)
 		p := vsql.NewParser(q6)
+		stmt, _ := p.ParseStatement()
+		sel := stmt.(*vsql.SelectStmt)
+		logical, _ := planner.Build(ctx, sel, cat)
+		logical = planner.Optimize(logical)
+		op, _ := planner.Parallel(ctx, logical, workers)
+		drainOp(b, ctx, op)
+		op.Close()
+	}
+}
+
+func BenchmarkVexqQ3Parallel(b *testing.B) {
+	tables := vxqPaths(b, "customer", "orders", "lineitem")
+	ctx := context.Background()
+	workers := runtime.NumCPU()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cat, _ := catalog.OpenMulti(ctx, tables)
+		p := vsql.NewParser(q3)
+		stmt, _ := p.ParseStatement()
+		sel := stmt.(*vsql.SelectStmt)
+		logical, _ := planner.Build(ctx, sel, cat)
+		logical = planner.Optimize(logical)
+		op, _ := planner.Parallel(ctx, logical, workers)
+		drainOp(b, ctx, op)
+		op.Close()
+	}
+}
+
+func BenchmarkVexqQ12Parallel(b *testing.B) {
+	tables := vxqPaths(b, "orders", "lineitem")
+	ctx := context.Background()
+	workers := runtime.NumCPU()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cat, _ := catalog.OpenMulti(ctx, tables)
+		p := vsql.NewParser(q12)
 		stmt, _ := p.ParseStatement()
 		sel := stmt.(*vsql.SelectStmt)
 		logical, _ := planner.Build(ctx, sel, cat)
