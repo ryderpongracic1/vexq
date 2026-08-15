@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 
 	enc "github.com/ryderpongracic1/vexq/internal/encoding"
@@ -19,17 +20,132 @@ import (
 // to allocate. Sections larger than this are read in successive windows.
 const maxPrefetchBytes = 4 << 20 // 4 MiB
 
-// maxPooledBufs bounds the section-buffer free list. A scan holds one buffer per
-// concurrently open column, so this admits the widest table the format
-// supports being projected in full while keeping retained memory bounded.
+// maxPooledBufs bounds the per-Reader section-buffer free list. A scan holds one
+// buffer per concurrently open column, so this admits the widest table the
+// format supports being projected in full while keeping retained memory
+// bounded. Windows beyond the bound go to the shared pool rather than being
+// dropped.
 const maxPooledBufs = 32
+
+// bufClassBytes is the size-class granularity of the shared section-buffer pool
+// (see sharedBufPool). Window capacities are always an exact multiple of it, so
+// the class a buffer is filed under is the same class a later request of that
+// size looks in — without this, a 520 KiB buffer and a 520 KiB request would
+// round to different classes and the pool would miss every time.
+//
+// 64 KiB keeps the round-up overhead small: the largest section the current
+// format produces is a full row group of 8-byte values, 64 × (128 B bitmap +
+// 8 KiB values + 4 B CRC) = 520.25 KiB, which rounds to 576 KiB (+10.7%). A
+// 4-byte-value section is 264.25 KiB and rounds to 320 KiB, so the two land in
+// different classes and neither is served from an oversized buffer.
+const bufClassBytes = 64 << 10
+
+// numBufClasses covers window sizes in (0, maxPrefetchBytes].
+const numBufClasses = maxPrefetchBytes / bufClassBytes // 64
+
+// sharedBufPool holds free section windows by size class so a window outlives
+// the Reader that allocated it.
+//
+// Why process-global rather than per-Reader: the morsel scheduler creates one
+// Reader per morsel — exec.PipelineFactory opens the file for each claimed
+// row-group range and closes it when that morsel finishes — so a per-Reader
+// free list is only ever warm within one morsel. In the parallel path a morsel
+// is a single row group, so every column's first (and only) window acquire
+// missed a cold list and allocated: ~180 MB per Q6-shaped parallel op and
+// ~200 MB per Q1-shaped op. Pooling at process scope instead of Reader scope is
+// what lets those windows survive Reader churn.
+//
+// sync.Pool rather than a mutex-guarded slice: Readers on different workers
+// acquire concurrently, and sync.Pool's per-P fast path keeps that off a shared
+// lock. It also bounds retention for free — entries are dropped by the GC, so an
+// idle process does not pin megabytes of read buffers. Entries are *[]byte so a
+// Put does not box a slice header into an interface.
+var sharedBufPool [numBufClasses + 1]sync.Pool
+
+// sectionBufAllocs and sectionBufReuses count section windows freshly allocated
+// versus served from a pool, process-wide. They exist so tests can pin the
+// pooling invariant directly — the per-Reader pool silently stopped delivering
+// reuse under the parallel path once pipelines became per-morsel, and only an
+// allocation profile revealed it. See SectionBufferStats.
+var (
+	sectionBufAllocs atomic.Int64
+	sectionBufReuses atomic.Int64
+)
+
+// SectionBufferStats reports how many coarse-grained section windows have been
+// allocated versus served from a pool since process start.
+//
+// It plays the same diagnostic role for buffer reuse that (*Reader).ReadOps
+// plays for read syscalls: a steady-state scan should reuse windows and allocate
+// only while the pool warms up. Counters are process-wide because the pool is.
+func SectionBufferStats() (allocs, reuses int64) {
+	return sectionBufAllocs.Load(), sectionBufReuses.Load()
+}
+
+// bufClassOf returns the size class that can serve a request of n bytes, or 0
+// when n does not fit any class (n <= 0, or a block larger than
+// maxPrefetchBytes, which the current format cannot produce).
+func bufClassOf(n int) int {
+	if n <= 0 || n > maxPrefetchBytes {
+		return 0
+	}
+	return (n + bufClassBytes - 1) / bufClassBytes
+}
+
+// poolClassOf returns the class a buffer of the given capacity may be filed
+// under, or 0 when it must not be pooled.
+//
+// Only exact class multiples are poolable. That is what makes bufClassOf's
+// round-up safe: every buffer in class c has capacity exactly c*bufClassBytes,
+// so a Get for class c never has to reject an entry as too small, and no entry
+// is larger than the class it is filed under. Buffers from the unpoolable path
+// in getSharedBuf are sized to their request, so they fail this test and are
+// correctly dropped rather than pinning more than maxPrefetchBytes.
+func poolClassOf(capacity int) int {
+	if capacity <= 0 || capacity > maxPrefetchBytes || capacity%bufClassBytes != 0 {
+		return 0
+	}
+	return capacity / bufClassBytes
+}
+
+// getSharedBuf returns a buffer of length n from the shared pool, allocating one
+// sized to its whole size class on a miss.
+func getSharedBuf(n int) []byte {
+	c := bufClassOf(n)
+	if c == 0 {
+		// Unpoolable size: allocate exactly and never file it, so an outlier
+		// cannot pin a buffer larger than the largest class.
+		sectionBufAllocs.Add(1)
+		return make([]byte, n)
+	}
+	if v := sharedBufPool[c].Get(); v != nil {
+		if b := *(v.(*[]byte)); cap(b) >= n {
+			sectionBufReuses.Add(1)
+			return b[:n]
+		}
+	}
+	sectionBufAllocs.Add(1)
+	return make([]byte, n, c*bufClassBytes)
+}
+
+// putSharedBuf files a buffer for reuse, dropping it if it is not exactly one
+// size class wide.
+func putSharedBuf(b []byte) {
+	c := poolClassOf(cap(b))
+	if c == 0 {
+		return
+	}
+	b = b[:cap(b)]
+	sharedBufPool[c].Put(&b)
+}
 
 // Reader opens and reads a .vxq file.
 //
 // A Reader and the ColumnReaders derived from it are single-goroutine objects:
-// they share an unsynchronised buffer pool (see acquireBuf). Parallel execution
-// gives each worker its own Reader over the same path, so workers never share
-// a pool.
+// their free list of section windows (see acquireBuf) is unsynchronised.
+// Parallel execution gives each worker its own Reader over the same path, so
+// workers never share that list. The shared pool those windows are drawn from
+// and returned to is synchronised — see sharedBufPool.
 type Reader struct {
 	path      string
 	f         *os.File
@@ -37,11 +153,14 @@ type Reader struct {
 	bytesRead atomic.Int64
 	readOps   atomic.Int64
 
-	// bufPool is a free list of coarse-grained section read buffers. Buffers are
-	// borrowed by ColumnReaders and returned on Close, so a full scan allocates
-	// on the order of one buffer per concurrently open column rather than one
-	// per block — and those buffers survive across row groups and across
-	// TableScan.Reset repositioning.
+	// bufPool is this Reader's free list of coarse-grained section read buffers.
+	// Buffers are borrowed by ColumnReaders and returned on Close, so a scan
+	// allocates on the order of one buffer per concurrently open column rather
+	// than one per block — and those buffers survive across row groups and
+	// across TableScan.Reset repositioning.
+	//
+	// A miss here falls through to sharedBufPool, and Reader.Close hands whatever
+	// is left back to it, so the buffers also survive this Reader's lifetime.
 	bufPool [][]byte
 }
 
@@ -85,8 +204,18 @@ func (r *Reader) OpenColumn(_ context.Context, rg, col int) (*ColumnReader, erro
 	}, nil
 }
 
-// Close closes the underlying file.
+// Close closes the underlying file and hands this Reader's free section windows
+// to the shared pool.
+//
+// The handback is what makes pooling effective under morsel-driven parallelism:
+// a Reader's lifetime there is one morsel, so windows that stopped at Reader
+// scope were garbage on every morsel boundary.
 func (r *Reader) Close() error {
+	for i, b := range r.bufPool {
+		putSharedBuf(b)
+		r.bufPool[i] = nil
+	}
+	r.bufPool = nil
 	return r.f.Close()
 }
 
@@ -98,29 +227,32 @@ func (r *Reader) BytesRead() int64 { return r.bytesRead.Load() }
 // (row group, column) sections touched rather than the number of blocks.
 func (r *Reader) ReadOps() int64 { return r.readOps.Load() }
 
-// acquireBuf returns a buffer of exactly n bytes, preferring one from the pool.
-//
-// A pooled buffer that is too small is discarded rather than grown: the freshly
-// allocated replacement is larger and is pooled on release, so the pool
-// converges upward to the largest section size the scan actually needs.
+// acquireBuf returns a buffer of exactly n bytes, preferring this Reader's free
+// list and falling back to the shared size-classed pool.
 func (r *Reader) acquireBuf(n int) []byte {
 	if k := len(r.bufPool); k > 0 {
 		b := r.bufPool[k-1]
 		r.bufPool[k-1] = nil
 		r.bufPool = r.bufPool[:k-1]
 		if cap(b) >= n {
+			sectionBufReuses.Add(1)
 			return b[:n]
 		}
+		// Too small for this section but the right size for another: file it in
+		// the shared pool rather than dropping it.
+		putSharedBuf(b)
 	}
-	return make([]byte, n)
+	return getSharedBuf(n)
 }
 
-// releaseBuf returns a buffer to the pool for reuse by a later section read.
-//
-// The pool is bounded so a wide projection cannot pin one large buffer per
-// column forever; beyond the bound, buffers are simply dropped for the GC.
+// releaseBuf returns a buffer for reuse by a later section read: to this
+// Reader's free list while it has room, otherwise straight to the shared pool.
 func (r *Reader) releaseBuf(b []byte) {
-	if b == nil || len(r.bufPool) >= maxPooledBufs {
+	if b == nil {
+		return
+	}
+	if len(r.bufPool) >= maxPooledBufs {
+		putSharedBuf(b)
 		return
 	}
 	r.bufPool = append(r.bufPool, b[:cap(b)])
