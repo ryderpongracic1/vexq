@@ -37,9 +37,26 @@ func (c *ColumnRef) Eval(_ context.Context, b *Batch) (Vector, error) {
 // ---- Literal ----------------------------------------------------------------
 
 // Literal is a constant value broadcast to all rows.
+//
+// The broadcast vector is built once per Literal instance and reused across
+// batches: every element already holds Val, so a later batch of the same or
+// smaller length needs no refill. See scratch.go for the aliasing contract —
+// consumers treat the returned vector as read-only, and Project copies it
+// rather than passing it downstream.
 type Literal struct {
 	Val any
 	T   DataType
+
+	// Cached broadcast vector, grown on demand. filled records how many
+	// leading elements already hold Val, so growing only fills the new tail.
+	cacheInt64   *Int64Vector
+	cacheFloat64 *Float64Vector
+	cacheDate    *DateVector
+	cacheBool    *BoolVector
+	cacheString  *StringVector
+	litCode      uint32
+	filled       int
+	validBmp     []byte
 }
 
 func (l *Literal) Type() DataType { return l.T }
@@ -49,45 +66,93 @@ func (l *Literal) Eval(_ context.Context, b *Batch) (Vector, error) {
 	switch l.T {
 	case TypeInt64:
 		v := l.Val.(int64)
-		vals := make([]int64, n)
-		for i := range vals {
+		if l.cacheInt64 == nil || cap(l.cacheInt64.Values) < n {
+			l.cacheInt64 = &Int64Vector{Values: make([]int64, n)}
+			l.filled = 0
+		}
+		vals := l.cacheInt64.Values[:n]
+		for i := l.filled; i < n; i++ {
 			vals[i] = v
 		}
-		return &Int64Vector{Values: vals, NullBitmap: storage.FullBitmap(n)}, nil
+		l.cacheInt64.Values = vals
+		l.cacheInt64.NullBitmap = acquireValidBitmap(&l.validBmp, n)
+		if n > l.filled {
+			l.filled = n
+		}
+		return l.cacheInt64, nil
 	case TypeFloat64:
 		v := l.Val.(float64)
-		vals := make([]float64, n)
-		for i := range vals {
+		if l.cacheFloat64 == nil || cap(l.cacheFloat64.Values) < n {
+			l.cacheFloat64 = &Float64Vector{Values: make([]float64, n)}
+			l.filled = 0
+		}
+		vals := l.cacheFloat64.Values[:n]
+		for i := l.filled; i < n; i++ {
 			vals[i] = v
 		}
-		return &Float64Vector{Values: vals, NullBitmap: storage.FullBitmap(n)}, nil
+		l.cacheFloat64.Values = vals
+		l.cacheFloat64.NullBitmap = acquireValidBitmap(&l.validBmp, n)
+		if n > l.filled {
+			l.filled = n
+		}
+		return l.cacheFloat64, nil
 	case TypeBool:
 		v := l.Val.(bool)
-		bv := &BoolVector{
-			Bits:       make([]byte, (n+7)/8),
-			NullBitmap: storage.FullBitmap(n),
-			Length:     n,
+		if l.cacheBool == nil || cap(l.cacheBool.Bits) < (n+7)/8 {
+			l.cacheBool = &BoolVector{Bits: make([]byte, (n+7)/8)}
+			l.filled = 0
 		}
-		for i := 0; i < n; i++ {
-			bv.Set(i, v)
+		l.cacheBool.Bits = l.cacheBool.Bits[:(n+7)/8]
+		l.cacheBool.Length = n
+		for i := l.filled; i < n; i++ {
+			l.cacheBool.Set(i, v)
 		}
-		return bv, nil
+		// When n shrinks, the final byte still carries bits set for rows that no
+		// longer exist. Mask them so the vector is byte-identical to a freshly
+		// built one — no consumer reads past Length, but parity keeps the
+		// contract in scratch.go literally true. Masking discards bits the fill
+		// loop had already written, so record filled as exactly n: a later,
+		// larger batch refills from here rather than trusting the masked tail.
+		if n%8 != 0 {
+			l.cacheBool.Bits[(n+7)/8-1] &= 1<<uint(n%8) - 1
+		}
+		l.cacheBool.NullBitmap = acquireValidBitmap(&l.validBmp, n)
+		l.filled = n
+		return l.cacheBool, nil
 	case TypeDate:
 		v := l.Val.(int32)
-		vals := make([]int32, n)
-		for i := range vals {
+		if l.cacheDate == nil || cap(l.cacheDate.Values) < n {
+			l.cacheDate = &DateVector{Values: make([]int32, n)}
+			l.filled = 0
+		}
+		vals := l.cacheDate.Values[:n]
+		for i := l.filled; i < n; i++ {
 			vals[i] = v
 		}
-		return &DateVector{Values: vals, NullBitmap: storage.FullBitmap(n)}, nil
+		l.cacheDate.Values = vals
+		l.cacheDate.NullBitmap = acquireValidBitmap(&l.validBmp, n)
+		if n > l.filled {
+			l.filled = n
+		}
+		return l.cacheDate, nil
 	case TypeString:
 		s := l.Val.(string)
-		db := storage.NewDictBuilder()
-		code := db.Add(s)
-		codes := make([]uint32, n)
-		for i := range codes {
-			codes[i] = code
+		if l.cacheString == nil || cap(l.cacheString.Codes) < n {
+			db := storage.NewDictBuilder()
+			l.litCode = db.Add(s)
+			l.cacheString = newStringVector(db, make([]uint32, n), nil)
+			l.filled = 0
 		}
-		return newStringVector(db, codes, storage.FullBitmap(n)), nil
+		codes := l.cacheString.Codes[:n]
+		for i := l.filled; i < n; i++ {
+			codes[i] = l.litCode
+		}
+		l.cacheString.Codes = codes
+		l.cacheString.NullBitmap = acquireValidBitmap(&l.validBmp, n)
+		if n > l.filled {
+			l.filled = n
+		}
+		return l.cacheString, nil
 	default:
 		return nil, fmt.Errorf("expr: unknown literal type %v", l.T)
 	}
@@ -98,8 +163,14 @@ func (l *Literal) Eval(_ context.Context, b *Batch) (Vector, error) {
 // CastIntToFloatExpr wraps an int64-returning expression and converts its
 // output to a Float64Vector.  Used by the planner to promote int64 operands
 // in mixed-type arithmetic so evalArith always receives matching types.
+//
+// The output vector is per-instance scratch (see scratch.go). Its null bitmap
+// aliases the input's, as it always has: the cast never changes validity, and
+// the input bitmap is read-only to this node.
 type CastIntToFloatExpr struct {
 	Inner Expr
+
+	out *Float64Vector
 }
 
 func (c *CastIntToFloatExpr) Type() DataType { return TypeFloat64 }
@@ -114,10 +185,12 @@ func (c *CastIntToFloatExpr) Eval(ctx context.Context, b *Batch) (Vector, error)
 		return nil, fmt.Errorf("expr: CastIntToFloat: expected *Int64Vector, got %T", v)
 	}
 	n := iv.Len()
-	out := &Float64Vector{
-		Values:     make([]float64, n),
-		NullBitmap: iv.NullBitmap,
+	if c.out == nil || cap(c.out.Values) < n {
+		c.out = &Float64Vector{Values: make([]float64, n)}
 	}
+	out := c.out
+	out.Values = out.Values[:n]
+	out.NullBitmap = iv.NullBitmap
 	for i := 0; i < n; i++ {
 		out.Values[i] = float64(iv.Values[i])
 	}
@@ -146,11 +219,18 @@ const (
 // BinOp evaluates a binary operation over two column expressions.
 // For comparison operators (EQ..GE), the result is a BoolVector.
 // For arithmetic, the result has the same type as the inputs.
+//
+// Both output vectors are per-instance scratch reused across batches (see
+// scratch.go): one BoolVector for comparisons, one typed vector for arithmetic.
 type BinOp struct {
 	Op    BinOpKind
 	Left  Expr
 	Right Expr
 	T     DataType // result type
+
+	cmpOut   *BoolVector
+	arithI64 *Int64Vector
+	arithF64 *Float64Vector
 }
 
 func (b *BinOp) Type() DataType { return b.T }
@@ -168,20 +248,19 @@ func (b *BinOp) Eval(ctx context.Context, batch *Batch) (Vector, error) {
 
 	switch b.Op {
 	case BinEQ, BinNE, BinLT, BinLE, BinGT, BinGE:
-		return evalCmp(b.Op, lv, rv, n)
+		return evalCmp(b.Op, lv, rv, n, &b.cmpOut)
 	case BinAdd, BinSub, BinMul, BinDiv:
-		return evalArith(b.Op, lv, rv, n)
+		return b.evalArith(b.Op, lv, rv, n)
 	default:
 		return nil, fmt.Errorf("expr: unknown BinOpKind %d", b.Op)
 	}
 }
 
-func evalCmp(op BinOpKind, lv, rv Vector, n int) (*BoolVector, error) {
-	out := &BoolVector{
-		Bits:       make([]byte, (n+7)/8),
-		NullBitmap: make([]byte, (n+7)/8),
-		Length:     n,
-	}
+// evalCmp writes the comparison of lv and rv into the caller's scratch slot,
+// which it grows on first use. out is zeroed before use, so the result is
+// identical to what a freshly allocated BoolVector would hold.
+func evalCmp(op BinOpKind, lv, rv Vector, n int, slot **BoolVector) (*BoolVector, error) {
+	out := acquireBoolVector(slot, n)
 	// Byte-level null propagation: a row is valid only when both inputs are
 	// non-null. Processing 8 rows per iteration avoids per-row bit extraction.
 	la, ra := lv.Nulls(), rv.Nulls()
@@ -846,18 +925,19 @@ func cmpInt32(op BinOpKind, a, b int32) bool {
 	return false
 }
 
-func evalArith(op BinOpKind, lv, rv Vector, n int) (Vector, error) {
+// evalArith writes the arithmetic result into this BinOp's per-instance scratch
+// vector (see scratch.go). The scratch is zeroed on acquisition, so rows left
+// unwritten because either input was null read back as zero, exactly as they did
+// when every batch allocated a fresh vector.
+func (b *BinOp) evalArith(op BinOpKind, lv, rv Vector, n int) (Vector, error) {
 	switch l := lv.(type) {
 	case *Int64Vector:
 		r, ok := rv.(*Int64Vector)
 		if !ok {
 			return nil, fmt.Errorf("expr: arithmetic type mismatch: left is *Int64Vector but right is %T (missing plan-time coercion?)", rv)
 		}
-		out := &Int64Vector{
-			Values:     make([]int64, n),
-			NullBitmap: make([]byte, (n+7)/8),
-		}
-		copy(out.NullBitmap, mergeNullBitmaps(lv.Nulls(), rv.Nulls(), n))
+		out := acquireInt64Vector(&b.arithI64, n)
+		mergeNullBitmapsInto(out.NullBitmap, lv.Nulls(), rv.Nulls(), n)
 		for i := 0; i < n; i++ {
 			if storage.IsNullBit(out.NullBitmap, i) {
 				continue
@@ -870,11 +950,8 @@ func evalArith(op BinOpKind, lv, rv Vector, n int) (Vector, error) {
 		if !ok {
 			return nil, fmt.Errorf("expr: arithmetic type mismatch: left is *Float64Vector but right is %T (missing plan-time coercion?)", rv)
 		}
-		out := &Float64Vector{
-			Values:     make([]float64, n),
-			NullBitmap: make([]byte, (n+7)/8),
-		}
-		copy(out.NullBitmap, mergeNullBitmaps(lv.Nulls(), rv.Nulls(), n))
+		out := acquireFloat64Vector(&b.arithF64, n)
+		mergeNullBitmapsInto(out.NullBitmap, lv.Nulls(), rv.Nulls(), n)
 		for i := 0; i < n; i++ {
 			if storage.IsNullBit(out.NullBitmap, i) {
 				continue
@@ -921,89 +998,100 @@ func applyArithFloat64(op BinOpKind, a, b float64) float64 {
 	return 0
 }
 
-// mergeNullBitmaps returns a bitmap where a bit is valid (1) only if both
-// input bitmaps have that bit valid.
-func mergeNullBitmaps(a, b []byte, n int) []byte {
-	size := (n + 7) / 8
-	out := make([]byte, size)
-	for i := 0; i < size; i++ {
-		ai, bi := byte(0xFF), byte(0xFF)
-		if i < len(a) {
-			ai = a[i]
-		}
-		if i < len(b) {
-			bi = b[i]
-		}
-		out[i] = ai & bi
-	}
-	return out
-}
-
 // ---- AndExpr ----------------------------------------------------------------
 
-type AndExpr struct{ Children []Expr }
+// AndExpr conjoins its children. The result goes into this node's own scratch
+// vector: an Expr's result is read-only to its consumers (see scratch.go), so a
+// parent must not fold into a child's buffer.
+type AndExpr struct {
+	Children []Expr
+
+	out *BoolVector
+}
 
 func (a *AndExpr) Type() DataType { return TypeBool }
 
 func (a *AndExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if len(a.Children) == 0 {
-		return trueVector(b.Length), nil
+		out := acquireBoolVector(&a.out, b.Length)
+		setAllValid(out.Bits, b.Length)
+		setAllValid(out.NullBitmap, b.Length)
+		return out, nil
 	}
-	result, err := a.Children[0].Eval(ctx, b)
+	first, err := a.Children[0].Eval(ctx, b)
 	if err != nil {
 		return nil, err
 	}
-	rv := result.(*BoolVector)
+	fv := first.(*BoolVector)
+	n := fv.Length
+	out := acquireBoolVector(&a.out, n)
+	copy(out.Bits, fv.Bits)
+	copy(out.NullBitmap, fv.NullBitmap)
 	for _, child := range a.Children[1:] {
 		cv, err := child.Eval(ctx, b)
 		if err != nil {
 			return nil, err
 		}
 		cv2 := cv.(*BoolVector)
-		n := rv.Length
 		for i := 0; i < (n+7)/8; i++ {
-			rv.Bits[i] &= cv2.Bits[i]
-			rv.NullBitmap[i] &= cv2.NullBitmap[i]
+			out.Bits[i] &= cv2.Bits[i]
+			out.NullBitmap[i] &= cv2.NullBitmap[i]
 		}
 	}
-	return rv, nil
+	return out, nil
 }
 
 // ---- OrExpr -----------------------------------------------------------------
 
-type OrExpr struct{ Children []Expr }
+// OrExpr disjoins its children into this node's own scratch vector, for the same
+// reason AndExpr does.
+type OrExpr struct {
+	Children []Expr
+
+	out *BoolVector
+}
 
 func (o *OrExpr) Type() DataType { return TypeBool }
 
 func (o *OrExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if len(o.Children) == 0 {
-		return falseVector(b.Length), nil
+		out := acquireBoolVector(&o.out, b.Length)
+		setAllValid(out.NullBitmap, b.Length)
+		return out, nil
 	}
-	result, err := o.Children[0].Eval(ctx, b)
+	first, err := o.Children[0].Eval(ctx, b)
 	if err != nil {
 		return nil, err
 	}
-	rv := result.(*BoolVector)
+	fv := first.(*BoolVector)
+	n := fv.Length
+	out := acquireBoolVector(&o.out, n)
+	copy(out.Bits, fv.Bits)
+	copy(out.NullBitmap, fv.NullBitmap)
 	for _, child := range o.Children[1:] {
 		cv, err := child.Eval(ctx, b)
 		if err != nil {
 			return nil, err
 		}
 		cv2 := cv.(*BoolVector)
-		n := rv.Length
 		for i := 0; i < (n+7)/8; i++ {
-			rv.Bits[i] |= cv2.Bits[i]
+			out.Bits[i] |= cv2.Bits[i]
 			// A row is non-null if either side is non-null AND true,
 			// or both sides are non-null. Simple: keep null if both are null.
-			rv.NullBitmap[i] |= cv2.NullBitmap[i]
+			out.NullBitmap[i] |= cv2.NullBitmap[i]
 		}
 	}
-	return rv, nil
+	return out, nil
 }
 
 // ---- NotExpr ----------------------------------------------------------------
 
-type NotExpr struct{ Child Expr }
+// NotExpr negates its child into this node's own scratch vector.
+type NotExpr struct {
+	Child Expr
+
+	out *BoolVector
+}
 
 func (n *NotExpr) Type() DataType { return TypeBool }
 
@@ -1012,19 +1100,25 @@ func (n *NotExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if err != nil {
 		return nil, err
 	}
-	rv, ok := cv.(*BoolVector)
+	child, ok := cv.(*BoolVector)
 	if !ok {
 		return nil, fmt.Errorf("expr: NOT requires a boolean operand, got %T", cv)
 	}
-	for i := 0; i < (rv.Length+7)/8; i++ {
-		rv.Bits[i] ^= rv.NullBitmap[i] // only flip bits that are valid (not null)
+	out := acquireBoolVector(&n.out, child.Length)
+	for i := 0; i < (child.Length+7)/8; i++ {
+		out.NullBitmap[i] = child.NullBitmap[i]
+		out.Bits[i] = child.Bits[i] ^ child.NullBitmap[i] // only flip bits that are valid (not null)
 	}
-	return rv, nil
+	return out, nil
 }
 
 // ---- IsNullExpr / IsNotNullExpr --------------------------------------------
 
-type IsNullExpr struct{ Child Expr }
+type IsNullExpr struct {
+	Child Expr
+
+	out *BoolVector
+}
 
 func (e *IsNullExpr) Type() DataType { return TypeBool }
 
@@ -1034,11 +1128,8 @@ func (e *IsNullExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		return nil, err
 	}
 	n := cv.Len()
-	out := &BoolVector{
-		Bits:       make([]byte, (n+7)/8),
-		NullBitmap: storage.FullBitmap(n),
-		Length:     n,
-	}
+	out := acquireBoolVector(&e.out, n)
+	setAllValid(out.NullBitmap, n)
 	for i := 0; i < n; i++ {
 		// IS NULL is true when the source bit is 0 (null).
 		out.Set(i, cv.IsNull(i))
@@ -1046,7 +1137,11 @@ func (e *IsNullExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	return out, nil
 }
 
-type IsNotNullExpr struct{ Child Expr }
+type IsNotNullExpr struct {
+	Child Expr
+
+	out *BoolVector
+}
 
 func (e *IsNotNullExpr) Type() DataType { return TypeBool }
 
@@ -1056,11 +1151,8 @@ func (e *IsNotNullExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		return nil, err
 	}
 	n := cv.Len()
-	out := &BoolVector{
-		Bits:       make([]byte, (n+7)/8),
-		NullBitmap: storage.FullBitmap(n),
-		Length:     n,
-	}
+	out := acquireBoolVector(&e.out, n)
+	setAllValid(out.NullBitmap, n)
 	for i := 0; i < n; i++ {
 		out.Set(i, !cv.IsNull(i))
 	}
@@ -1074,6 +1166,8 @@ type InExpr struct {
 	Child Expr
 	// Set holds typed values matching Child's type.
 	Set []any
+
+	out *BoolVector
 }
 
 func (e *InExpr) Type() DataType { return TypeBool }
@@ -1084,11 +1178,7 @@ func (e *InExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		return nil, err
 	}
 	n := cv.Len()
-	out := &BoolVector{
-		Bits:       make([]byte, (n+7)/8),
-		NullBitmap: make([]byte, (n+7)/8),
-		Length:     n,
-	}
+	out := acquireBoolVector(&e.out, n)
 	for i := 0; i < n; i++ {
 		if cv.IsNull(i) {
 			continue
@@ -1129,6 +1219,8 @@ func (e *InExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 type LikeExpr struct {
 	Child   Expr
 	Pattern string // SQL LIKE pattern
+
+	out *BoolVector
 }
 
 func (e *LikeExpr) Type() DataType { return TypeBool }
@@ -1143,11 +1235,7 @@ func (e *LikeExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		return nil, fmt.Errorf("expr: LIKE requires STRING column")
 	}
 	n := col.Len()
-	out := &BoolVector{
-		Bits:       make([]byte, (n+7)/8),
-		NullBitmap: make([]byte, (n+7)/8),
-		Length:     n,
-	}
+	out := acquireBoolVector(&e.out, n)
 	for i := 0; i < n; i++ {
 		if col.IsNull(i) {
 			continue
@@ -1197,18 +1285,28 @@ func likeMatchRec(p, s string) bool {
 // ---- BetweenExpr ------------------------------------------------------------
 
 // BetweenExpr implements BETWEEN lo AND hi (inclusive).
+//
+// It rewrites to (child >= lo) AND (child <= hi). The rewritten tree is built
+// once and cached on the instance: rebuilding it per batch allocated three
+// expression nodes each time and, worse, discarded their scratch buffers before
+// they could be reused.
 type BetweenExpr struct {
 	Child  Expr
 	Lo, Hi Expr
+
+	rewritten *AndExpr
 }
 
 func (e *BetweenExpr) Type() DataType { return TypeBool }
 
 func (e *BetweenExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
-	loExpr := &BinOp{Op: BinGE, Left: e.Child, Right: e.Lo, T: TypeBool}
-	hiExpr := &BinOp{Op: BinLE, Left: e.Child, Right: e.Hi, T: TypeBool}
-	and := &AndExpr{Children: []Expr{loExpr, hiExpr}}
-	return and.Eval(ctx, b)
+	if e.rewritten == nil {
+		e.rewritten = &AndExpr{Children: []Expr{
+			&BinOp{Op: BinGE, Left: e.Child, Right: e.Lo, T: TypeBool},
+			&BinOp{Op: BinLE, Left: e.Child, Right: e.Hi, T: TypeBool},
+		}}
+	}
+	return e.rewritten.Eval(ctx, b)
 }
 
 // ---- StringEqExpr (fast path for string equality) --------------------------
@@ -1219,6 +1317,8 @@ type StringEqExpr struct {
 	ColIdx  int
 	Literal string
 	Negate  bool // true for col != literal
+
+	out *BoolVector
 }
 
 func (e *StringEqExpr) Type() DataType { return TypeBool }
@@ -1229,11 +1329,7 @@ func (e *StringEqExpr) Eval(_ context.Context, b *Batch) (Vector, error) {
 		return nil, fmt.Errorf("expr: StringEqExpr: column %d is not STRING", e.ColIdx)
 	}
 	n := col.Len()
-	out := &BoolVector{
-		Bits:       make([]byte, (n+7)/8),
-		NullBitmap: make([]byte, (n+7)/8),
-		Length:     n,
-	}
+	out := acquireBoolVector(&e.out, n)
 	if col.Dict == nil {
 		return out, nil
 	}
@@ -1241,7 +1337,7 @@ func (e *StringEqExpr) Eval(_ context.Context, b *Batch) (Vector, error) {
 	if !found {
 		// Literal not in this row group's dict: no rows match (or all match for !=).
 		if e.Negate {
-			copy(out.NullBitmap, storage.FullBitmap(n))
+			setAllValid(out.NullBitmap, n)
 			for i := 0; i < (n+7)/8; i++ {
 				out.Bits[i] = out.NullBitmap[i]
 			}
@@ -1405,29 +1501,22 @@ func nullVector(t DataType, n int) Vector {
 	}
 }
 
-func trueVector(n int) *BoolVector {
-	bv := &BoolVector{
-		Bits:       storage.FullBitmap(n),
-		NullBitmap: storage.FullBitmap(n),
-		Length:     n,
-	}
-	return bv
-}
-
-func falseVector(n int) *BoolVector {
-	return &BoolVector{
-		Bits:       make([]byte, (n+7)/8),
-		NullBitmap: storage.FullBitmap(n),
-		Length:     n,
-	}
-}
-
 // ---- BoolToSelVec ----------------------------------------------------------
 
 // BoolToSelVec converts a BoolVector to a SelectionVector, respecting SelVec
-// if the batch already has one.
+// if the batch already has one. It allocates; hot callers should use
+// BoolToSelVecInto with a buffer they own.
 func BoolToSelVec(b *Batch, bv *BoolVector) SelectionVector {
-	var out SelectionVector
+	return BoolToSelVecInto(b, bv, nil)
+}
+
+// BoolToSelVecInto is BoolToSelVec writing into dst's array when it is large
+// enough, so a caller that owns dst pays no allocation per batch. dst must not
+// alias b.SelVec: the two are read and written in the same pass. Filter
+// guarantees this by giving every Filter instance its own buffer, so a stacked
+// Filter reads its child's vector and writes its own.
+func BoolToSelVecInto(b *Batch, bv *BoolVector, dst SelectionVector) SelectionVector {
+	out := growSelVec(dst, bv.Length)
 	if b.SelVec == nil {
 		for i := 0; i < bv.Length; i++ {
 			if !bv.IsNull(i) && bv.Get(i) {
