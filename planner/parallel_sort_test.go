@@ -321,10 +321,12 @@ func TestParallelFallback_NonAggregateSortFallback(t *testing.T) {
 	}
 }
 
-// ---- Regression tests for aggregate-over-expression fallback ----------------
-// These tests verify that planner.Parallel silently falls back to serial
-// execution (via Physical) when aggregates reference computed expressions
-// (e.g. SUM(price * discount)) rather than erroring with '_agg_0 not found'.
+// ---- Regression tests for aggregates over expressions -----------------------
+// planner.Parallel used to error with 'column "_agg_0" not found' for
+// aggregates over computed expressions (e.g. SUM(price * discount)), then
+// fell back to serial execution. It now parallelizes them by applying the
+// pre-projection inside each worker pipeline. These tests pin both properties:
+// no planner error, and results that agree with the serial path.
 
 // writeAggExprFile creates a 3-column (price float64, discount float64, qty int64)
 // .vxq file with multiple row groups for parallel eligibility.
@@ -362,10 +364,10 @@ func writeAggExprFile(t *testing.T, rowGroups int) string {
 	return path
 }
 
-// TestParallelFallback_AggOverExpr verifies that Parallel silently falls back
-// when the aggregate references a computed expression (SUM(price * discount)).
-// Previously this would error with: 'column "_agg_0" not found'.
-func TestParallelFallback_AggOverExpr(t *testing.T) {
+// TestParallelAggOverExpr_NoPlannerError verifies that Parallel plans an
+// aggregate over a computed expression without error. This previously failed
+// with: 'column "_agg_0" not found'.
+func TestParallelAggOverExpr_NoPlannerError(t *testing.T) {
 	path := writeAggExprFile(t, 3)
 	cat, err := catalog.OpenSingle(context.Background(), "lineitem", path)
 	if err != nil {
@@ -395,7 +397,10 @@ func TestParallelFallback_AggOverExpr(t *testing.T) {
 			logical := buildPlan(t, tc.query, cat)
 			op, err := planner.Parallel(context.Background(), logical, 4)
 			if err != nil {
-				t.Fatalf("Parallel should fall back, got error: %v", err)
+				t.Fatalf("Parallel: %v", err)
+			}
+			if _, ok := op.(*exec.ParallelHashAggregate); !ok {
+				t.Fatalf("expected *exec.ParallelHashAggregate, got %T (should not fall back)", op)
 			}
 			rows := drainResults(t, op)
 			if len(rows) == 0 {
@@ -405,9 +410,12 @@ func TestParallelFallback_AggOverExpr(t *testing.T) {
 	}
 }
 
-// TestParallelFallback_AggOverExpr_MatchesSerial verifies that the fallback
-// produces results identical to explicitly calling Physical.
-func TestParallelFallback_AggOverExpr_MatchesSerial(t *testing.T) {
+// TestParallelAggOverExpr_MatchesSerial verifies the parallel path agrees with
+// the serial path for aggregates over expressions. Float aggregates are compared
+// with a relative tolerance: partitioning reorders float additions, which are
+// not associative, so bit-identity is not achievable for any partitioned float
+// reduction (see assertRowsEqual).
+func TestParallelAggOverExpr_MatchesSerial(t *testing.T) {
 	path := writeAggExprFile(t, 3)
 	cat, err := catalog.OpenSingle(context.Background(), "lineitem", path)
 	if err != nil {
@@ -427,8 +435,8 @@ func TestParallelFallback_AggOverExpr_MatchesSerial(t *testing.T) {
 			query: `SELECT SUM(price * discount) AS revenue FROM lineitem WHERE discount > 0.03`,
 		},
 		{
-			name:  "SUM expr with ORDER BY (via physical fallback)",
-			query: `SELECT SUM(price * discount) AS revenue FROM lineitem`,
+			name:  "SUM expr with COUNT(*)",
+			query: `SELECT SUM(price * discount) AS revenue, COUNT(*) AS cnt FROM lineitem`,
 		},
 	}
 
@@ -442,27 +450,18 @@ func TestParallelFallback_AggOverExpr_MatchesSerial(t *testing.T) {
 			}
 			serialRows := drainResults(t, serialOp)
 
-			// Parallel path (should fall back to serial).
+			// Parallel path.
 			logical = buildPlan(t, tc.query, cat)
 			parallelOp, err := planner.Parallel(context.Background(), logical, 4)
 			if err != nil {
 				t.Fatalf("Parallel: %v", err)
 			}
+			if _, ok := parallelOp.(*exec.ParallelHashAggregate); !ok {
+				t.Fatalf("expected *exec.ParallelHashAggregate, got %T (should not fall back)", parallelOp)
+			}
 			parallelRows := drainResults(t, parallelOp)
 
-			// Compare results.
-			if len(serialRows) != len(parallelRows) {
-				t.Fatalf("row count mismatch: serial=%d parallel=%d", len(serialRows), len(parallelRows))
-			}
-			for i := range serialRows {
-				for c := range serialRows[i] {
-					s := fmt.Sprintf("%v", serialRows[i][c])
-					p := fmt.Sprintf("%v", parallelRows[i][c])
-					if s != p {
-						t.Errorf("row %d col %d: serial=%v parallel=%v", i, c, serialRows[i][c], parallelRows[i][c])
-					}
-				}
-			}
+			assertRowsEqual(t, serialRows, parallelRows)
 		})
 	}
 }
