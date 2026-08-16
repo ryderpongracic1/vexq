@@ -117,21 +117,25 @@ func (j *HashJoin) Next(ctx context.Context) (*Batch, error) {
 		pBatch := j.probeBatch
 		n := pBatch.Length
 
-		var probeIndices []int
-		if pBatch.SelVec != nil {
-			probeIndices = make([]int, len(pBatch.SelVec))
-			for i, v := range pBatch.SelVec {
-				probeIndices[i] = int(v)
-			}
-		} else {
-			probeIndices = make([]int, n)
-			for i := range probeIndices {
-				probeIndices[i] = i
-			}
+		// Walk the probe rows without materialising their indices. The batch's
+		// selection vector is []uint16 and the unfiltered case is 0..n-1, so the
+		// only reason to build a []int was the `range` loop that used to follow —
+		// 8 KB of garbage per batch for a value both branches already have. sel
+		// is loop-invariant, so the branch inside the loop is perfectly
+		// predicted, and the visit order is unchanged: selection-vector order
+		// where one is installed, ascending row order where none is.
+		sel := pBatch.SelVec
+		rows := n
+		if sel != nil {
+			rows = len(sel)
 		}
+		pv := pBatch.Vectors[j.probeKey]
 
-		for _, rowIdx := range probeIndices {
-			pv := pBatch.Vectors[j.probeKey]
+		for i := 0; i < rows; i++ {
+			rowIdx := i
+			if sel != nil {
+				rowIdx = int(sel[i])
+			}
 			if pv.IsNull(rowIdx) {
 				continue
 			}
@@ -189,22 +193,29 @@ func forEachBuildRow(ctx context.Context, src Operator, keyIdx int, visit func(k
 			return nil
 		}
 
-		n := batch.Length
-		var indices []int
-		if batch.SelVec != nil {
-			indices = make([]int, len(batch.SelVec))
-			for i, v := range batch.SelVec {
-				indices[i] = int(v)
-			}
-		} else {
-			indices = make([]int, n)
-			for i := range indices {
-				indices[i] = i
-			}
+		// Walk the batch's rows without materialising their indices — the same
+		// widening HashJoin.Next used to do, and the reason it is eliminated here
+		// rather than buffered on a receiver is that this is a free function
+		// called concurrently by the parallel build's workers, so there is no
+		// single-goroutine owner to hang scratch off.
+		//
+		// The visit order is exactly what it was: selection-vector order where
+		// one is installed, ascending row order where none is. That is load
+		// bearing — BuildSharedHashTableParallel's determinism guarantee (per-key
+		// build-row order identical to a serial drain) is stated in terms of the
+		// order this loop hands rows to visit.
+		sel := batch.SelVec
+		rows := batch.Length
+		if sel != nil {
+			rows = len(sel)
 		}
 
 		kv := batch.Vectors[keyIdx]
-		for _, rowIdx := range indices {
+		for i := 0; i < rows; i++ {
+			rowIdx := i
+			if sel != nil {
+				rowIdx = int(sel[i])
+			}
 			if kv.IsNull(rowIdx) {
 				continue
 			}
@@ -335,21 +346,35 @@ func (j *HashJoin) probeColumnFromRows(rows []joinRow, colIdx int, t DataType, n
 		return out
 	case TypeString:
 		sv := src.(*StringVector)
-		db := storage.NewDictBuilder()
+		// Carry the probe batch's dictionary through and copy the codes, rather
+		// than decoding every row to a string and rebuilding a dictionary per
+		// emitted batch. Project.materialize and copyVector already reproject a
+		// StringVector this way; the reason it is safe is that a Dictionary is
+		// immutable once UnmarshalDictionary returns it and nothing rewrites one
+		// in place — ColumnReader.Dictionary builds exactly one per row group
+		// under a sync.Once and replaces the pointer when the scan moves on, so a
+		// batch that outlives its row group keeps its own dictionary alive rather
+		// than seeing it change underneath.
+		//
+		// Codes are still copied into a fresh slice: sv.Codes is one of
+		// TableScan's reused decode buffers (scan.go), so aliasing it would leak
+		// the next block's codes into an already-emitted batch.
+		//
+		// The dictionary may describe more strings than this batch uses, which is
+		// the same over-approximation materialize produces and costs nothing to
+		// read. It also gives the int-key aggregate a stable dictionary pointer
+		// per row group instead of a fresh one per batch, so its remap cache
+		// (agg_intkey.go getOrBuildRemap) hits instead of rebuilding.
 		codes := make([]uint32, n)
 		nullBmp := make([]byte, (n+7)/8)
 		for i, r := range rows {
 			pRow := int(r.probe)
 			if !sv.IsNull(pRow) {
-				var s string
-				if sv.Dict != nil {
-					s = sv.Dict.Get(sv.Codes[pRow])
-				}
-				codes[i] = db.Add(s)
+				codes[i] = sv.Codes[pRow]
 				storage.SetValidBit(nullBmp, i)
 			}
 		}
-		return newStringVector(db, codes, nullBmp)
+		return &StringVector{Codes: codes, Dict: sv.Dict, NullBitmap: nullBmp}
 	default: // TypeBool
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, r := range rows {
