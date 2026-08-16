@@ -8,7 +8,7 @@ Built a vectorized analytical SQL execution engine in Go using columnar storage,
 
 vexq is a complete analytical query engine — from a custom on-disk columnar file format through a SQL parser, rule-based optimizer, and vectorized execution engine. The design shares structural principles with [distrikv](https://github.com/ryderpongracic1/distrikv) (append-only manifest, block CRCs, atomic writes via temp+rename) while adding a columnar-vectorized execution model suited for OLAP workloads.
 
-On TPC-H Q1 (GROUP BY aggregate over 6M rows), vexq end-to-end (all cores) is faster than DuckDB end-to-end on the same machine (22 ms vs 25 ms), and within 1.2× single-threaded — the result of dictionary-code integer-keyed aggregation, coarse-grained I/O, join column pruning, a radix-partitioned parallel join, and a systematic allocation-elimination campaign verified by GOGC ablation. vexq is faster than SQLite on all four benchmarked TPC-H queries (3.0–18.4×).
+On TPC-H Q1 (GROUP BY aggregate over 6M rows), vexq end-to-end (all cores) is faster than DuckDB end-to-end on the same machine (22 ms vs 25 ms), and within 1.2× single-threaded — the result of dictionary-code integer-keyed aggregation, coarse-grained I/O, join column pruning, a radix-partitioned parallel join, and a systematic allocation-elimination campaign verified by GOGC ablation. vexq is faster than SQLite on all four benchmarked TPC-H queries (3.0–18.4×), and its morsel-driven scheduler reaches 8.6× scaling on 14 cores — ~86% efficiency against the 10-performance-core ceiling, exceeding DuckDB's own scaling on every benchmarked query.
 
 The engine processes data in batches of 1024 rows, designed to saturate L1 cache and amortize operator dispatch overhead. A pushed-down predicate + zone-map pruning layer skips entire row groups before any I/O, and dictionary encoding reduces string comparisons to integer equality in the filter hot loop.
 
@@ -152,7 +152,7 @@ Requires Go 1.22+. No external runtime dependencies (SQLite and DuckDB are bench
 
 ## Benchmarks
 
-TPC-H scale factor 1 (6M lineitem rows) on Apple M4 Pro (14-core, 192 KB L1D per performance core, 36 MB SLC). Page cache warm. Each benchmark run 10×; numbers are median wall time. The headline results: on Q1, vexq parallel (22 ms) is faster end-to-end than DuckDB all-cores (25 ms) on this machine, and within 1.2× of DuckDB single-threaded per core; vexq is faster than SQLite on all four queries (3.0–18.4×); see the DuckDB decomposition below.
+TPC-H scale factor 1 (6M lineitem rows) on Apple M4 Pro (14-core, 192 KB L1D per performance core, 36 MB SLC). Page cache warm. Each benchmark run 10×; numbers are median wall time. All ratios are computed from unrounded medians, so a ratio may differ slightly from one recomputed from the rounded milliseconds shown. The headline results: on Q1, vexq parallel (22 ms) is faster end-to-end than DuckDB all-cores (25 ms) on this machine, and within 1.2× of DuckDB single-threaded per core; vexq is faster than SQLite on all four queries (3.0–18.4×); see the DuckDB decomposition below.
 
 **Query provenance:** The harness runs the canonical TPC-H Q6 (`SUM(l_extendedprice * l_discount)`, inclusive `BETWEEN`). Earlier revisions used a simplified variant (`SUM(l_extendedprice)`) because aggregates over expressions crashed the planner; that bug is fixed (plan-time type coercion + a column-pruning fix), and both engines in every table below now run identical query text. vexq's canonical Q6 result (123,141,078.23) matches SQLite (asserted in-harness to 1e-9 relative tolerance) and DuckDB's canonical result (123141078.2283) exactly. Where a table below reports the *simplified* variant for like-for-like comparison across revisions, it is labeled as such.
 
@@ -183,7 +183,7 @@ Note: this comparison runs DuckDB on ARM64, where its strongest x86 SIMD paths (
 
 - **Q3 (2.2× per-core) / Q12 (2.9× per-core):** These gaps were 11× and 13× three rounds ago. Join column pruning took serial Q3 684 → 188 ms; the flat open-addressed join table (one 16-byte slot per key, duplicate rows chained through a row-major store, no per-key allocation), the dictionary string memo, and rowStore presizing took Q3 to 137 ms and Q12 from 585 to 238 ms in the following round. vexq parallel Q3 (36 ms) is now well below DuckDB single-threaded (62 ms). The remaining gap is DuckDB's SIMD-probed, cache-resident join: partitioning only the build side does not make probes cache-resident (measured flat from 1 to 256 partitions) — closing it needs the **probe** stream partitioned as well. Q12's larger gap adds the CASE WHEN aggregate that DuckDB JIT-compiles.
 
-- **Parallelism gap (closed):** DuckDB achieves 3.6–6.4× scaling from threads=1 to threads=14 (from the table above: Q1 6.4×, Q6 4.6×, Q12 5.1×, Q3 3.6×). vexq now achieves 8.6× (Q1), 6.7× (Q12), 6.5× (Q6), and 3.8× (Q3) — exceeding DuckDB's scaling on three of four queries. All four take the parallel path; the GOGC ablation below shows GC — formerly 26–50% of parallel wall time — is now 0–19% after the allocation campaign.
+- **Parallelism gap (closed):** DuckDB achieves 3.6–6.4× scaling from threads=1 to threads=14 (from the table above: Q1 6.4×, Q6 4.6×, Q12 5.1×, Q3 3.6×). vexq now achieves 8.6× (Q1), 6.7× (Q12), 6.5× (Q6), and 3.8× (Q3) — exceeding DuckDB's scaling on all four queries (Q3: 3.8× vs 3.65×). All four take the parallel path; the GOGC ablation below shows GC — formerly 26–50% of parallel wall time — is now 0–19% after the allocation campaign.
 
 ### Hardware migration and normalization
 
@@ -275,7 +275,7 @@ The `GOGC=off` ablation — now with both denominators measured — tells the al
 
 Serial GOGC=off is now flat-to-slightly-slower than GC on (Q1 +3%, Q3 +7%) — the signature of an engine that no longer allocates enough for GC to matter, paying heap-growth overhead with nothing to amortize it against.
 
-GOGC=off is a diagnostic, not a production configuration — unbounded heap growth is not viable. The realistic mitigations are the buffer-reuse work already applied to TableScan (extending to Filter/Project/join operators), and GOMEMLIMIT as a bounded middle ground.
+GOGC=off is a diagnostic, not a production configuration — unbounded heap growth is not viable. The realistic mitigation was the allocation campaign itself (Phase 20), now landed across scan, filter, project, aggregate, join, and storage; GOMEMLIMIT remains available as a bounded middle ground for whatever residual pressure appears under new workloads.
 
 #### Worker sweep (GOGC=off, Q6-shaped simple-aggregate query)
 
