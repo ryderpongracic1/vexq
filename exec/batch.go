@@ -54,6 +54,44 @@ func evalLen(b *Batch) int {
 	return physicalLen(b)
 }
 
+// rowSet names the physical row indices an operator must visit in one batch.
+//
+// It exists so a per-row consumer can honour a selection vector without first
+// widening the batch's []uint16 into a []int of physical indices. That widening
+// was HashAggregate.accumulate's single largest cost in the allocation profile —
+// 285 MB of 393 MB sampled over three parallel benchmarks, an 8 KB throwaway per
+// 1024-row batch per worker for the whole scan — and the []int it produced was a
+// pure adapter: every consumer only ever read it back one index at a time.
+//
+// A rowSet is a value with no backing buffer, so constructing one allocates
+// nothing and there is no scratch to own, grow, or reset between batches (see
+// the ownership rules in scratch.go — this sidesteps them rather than obeying
+// them). sel == nil means the identity range 0..n-1, which is Batch.SelVec's own
+// convention, so an unfiltered batch needs no index storage at all.
+type rowSet struct {
+	sel SelectionVector // nil means the identity range
+	n   int
+}
+
+// batchRows returns the rows of b a per-row consumer must visit, honouring
+// b.SelVec when one is installed.
+func batchRows(b *Batch) rowSet {
+	if b.SelVec != nil {
+		return rowSet{sel: b.SelVec, n: len(b.SelVec)}
+	}
+	return rowSet{n: b.Length}
+}
+
+// at returns the physical row index of the i-th selected row. i must be in
+// [0, n). Both this and the nil check inline; the branch is loop-invariant
+// across a batch and so predicts perfectly.
+func (r rowSet) at(i int) int {
+	if r.sel == nil {
+		return i
+	}
+	return int(r.sel[i])
+}
+
 func makeVector(t DataType) Vector {
 	switch t {
 	case TypeInt64:

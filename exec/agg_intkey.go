@@ -37,6 +37,28 @@ type intKeyState struct {
 	intGroups  map[uint64][]int64      // key → accumulators
 	intNonNull map[uint64][]int64      // key → per-aggregate non-null count
 	intSamples map[uint64][]groupByVal // key → representative values
+
+	// Reused per-batch buffers: the GROUP BY columns' string vectors and their
+	// local→global remap tables for the batch being accumulated. See
+	// acquireBatchBufs.
+	svecBuf  []*StringVector
+	remapBuf [][]uint32
+}
+
+// acquireBatchBufs returns the per-batch svec and remap buffers sized to n
+// GROUP BY columns, allocating on first use and reusing them afterwards.
+// accumulateIntKey writes every entry of both before reading either, so a reused
+// buffer is indistinguishable from a fresh one — a batch can never observe the
+// previous batch's dictionaries. n is len(HashAggregate.groupBy), fixed for the
+// operator's lifetime.
+func (ik *intKeyState) acquireBatchBufs(n int) ([]*StringVector, [][]uint32) {
+	if cap(ik.svecBuf) < n {
+		ik.svecBuf = make([]*StringVector, n)
+	}
+	if cap(ik.remapBuf) < n {
+		ik.remapBuf = make([][]uint32, n)
+	}
+	return ik.svecBuf[:n], ik.remapBuf[:n]
 }
 
 // initIntKeyState initializes the integer-key state for the fast path.
@@ -174,12 +196,15 @@ func appendUint32LE(buf []byte, v uint32) []byte {
 
 // accumulateIntKey is the integer-key fast path for accumulate.
 // It replaces the per-row string key construction with a packed uint64 lookup.
-func (h *HashAggregate) accumulateIntKey(batch *Batch, indices []int, aggVecs []Vector) error {
+//
+// rows names the physical rows of the batch to visit; see rowSet in batch.go.
+func (h *HashAggregate) accumulateIntKey(batch *Batch, rows rowSet, aggVecs []Vector) error {
 	ik := &h.intKey
 
 	// Resolve string vectors and build/retrieve remap tables for this batch.
-	svecs := make([]*StringVector, len(h.groupBy))
-	remaps := make([][]uint32, len(h.groupBy))
+	// Both buffers are per-instance scratch, fully rewritten here before either
+	// is read: one entry per GROUP BY column, and len(h.groupBy) never changes.
+	svecs, remaps := ik.acquireBatchBufs(len(h.groupBy))
 	for i, colIdx := range h.groupBy {
 		sv := batch.Vectors[colIdx].(*StringVector)
 		svecs[i] = sv
@@ -197,11 +222,12 @@ func (h *HashAggregate) accumulateIntKey(batch *Batch, indices []int, aggVecs []
 			ik.intNonNull = nil
 			ik.intSamples = nil
 		}
-		return h.accumulateStringKey(batch, indices, aggVecs)
+		return h.accumulateStringKey(batch, rows, aggVecs)
 	}
 
 	// Hot loop: build uint64 key and accumulate.
-	for _, rowIdx := range indices {
+	for ri := 0; ri < rows.n; ri++ {
+		rowIdx := rows.at(ri)
 		// Check for null group-by columns — use a special null-aware key.
 		hasNull := false
 		for i, sv := range svecs {
@@ -330,8 +356,11 @@ func (h *HashAggregate) accumulateIntKey(batch *Batch, indices []int, aggVecs []
 
 // accumulateStringKey is the original string-key path, extracted so it can be
 // called as a fallback when intkey overflows or encounters non-dict columns.
-func (h *HashAggregate) accumulateStringKey(batch *Batch, indices []int, aggVecs []Vector) error {
-	for _, rowIdx := range indices {
+//
+// rows names the physical rows of the batch to visit; see rowSet in batch.go.
+func (h *HashAggregate) accumulateStringKey(batch *Batch, rows rowSet, aggVecs []Vector) error {
+	for ri := 0; ri < rows.n; ri++ {
+		rowIdx := rows.at(ri)
 		key := h.buildKey(batch, rowIdx)
 		h.accumulateOneRow(key, batch, rowIdx, aggVecs)
 	}

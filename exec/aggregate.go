@@ -70,6 +70,10 @@ type HashAggregate struct {
 	distinctInts map[string][]map[int64]struct{}
 	distinctStrs map[string][]map[string]struct{}
 	hasDistinct  bool // true if any aggExpr has Distinct=true
+
+	// aggVecs is the reused per-batch buffer holding each aggregate's source
+	// vector; see acquireAggVecs and the scratch contract in scratch.go.
+	aggVecs []Vector
 }
 
 func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashAggregate, error) {
@@ -206,37 +210,45 @@ func (h *HashAggregate) consumeAll(ctx context.Context) error {
 	return nil
 }
 
+// acquireAggVecs returns the per-batch buffer holding one source vector per
+// aggregate. len(h.aggExprs) is fixed at construction, so this allocates on the
+// first batch and reuses that buffer for every batch after it — including across
+// morsels, since a worker keeps one pipeline and one HashAggregate for its whole
+// run (morsel.go). The caller must write every slot before reading any, which is
+// what makes reuse indistinguishable from a fresh make.
+func (h *HashAggregate) acquireAggVecs() []Vector {
+	if cap(h.aggVecs) < len(h.aggExprs) {
+		h.aggVecs = make([]Vector, len(h.aggExprs))
+	}
+	return h.aggVecs[:len(h.aggExprs)]
+}
+
 // accumulate processes one batch into the hash aggregate maps.
 // Uses AggExpr.AccumType to determine numeric encoding; no child schema needed.
 func (h *HashAggregate) accumulate(batch *Batch) error {
-	n := batch.Length
-
 	// Resolve each aggregate's source vector once per batch, not once per row.
 	// batch.Vectors[ae.ColIdx] is a slice index + interface load — cheap, but
-	// multiplied by len(aggExprs) × len(indices) it becomes a non-trivial cost.
-	aggVecs := make([]Vector, len(h.aggExprs))
+	// multiplied by len(aggExprs) × the row count it becomes a non-trivial cost.
+	//
+	// aggVecs is per-instance scratch: one HashAggregate accumulates on one
+	// goroutine (newPartialAggregate in parallel.go gives every worker its own),
+	// and every slot is written below — including the nil for COUNT(*), which a
+	// fresh make used to supply and a reused buffer must not inherit from the
+	// previous batch.
+	aggVecs := h.acquireAggVecs()
 	for j, ae := range h.aggExprs {
 		if ae.ColIdx >= 0 {
 			aggVecs[j] = batch.Vectors[ae.ColIdx]
+		} else {
+			aggVecs[j] = nil
 		}
 	}
 
-	var indices []int
-	if batch.SelVec != nil {
-		indices = make([]int, len(batch.SelVec))
-		for i, v := range batch.SelVec {
-			indices[i] = int(v)
-		}
-	} else {
-		indices = make([]int, n)
-		for i := range indices {
-			indices[i] = i
-		}
-	}
+	rows := batchRows(batch)
 
 	// Fast path: no GROUP BY eliminates per-row map lookup (e.g. Q6 SUM with no groups).
 	if len(h.groupBy) == 0 {
-		return h.accumulateDirect(indices, aggVecs)
+		return h.accumulateDirect(rows, aggVecs)
 	}
 
 	// Integer-key fast path: when all GROUP BY columns are dict-encoded strings,
@@ -252,10 +264,11 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 	}
 
 	if h.intKey.enabled {
-		return h.accumulateIntKey(batch, indices, aggVecs)
+		return h.accumulateIntKey(batch, rows, aggVecs)
 	}
 
-	for _, rowIdx := range indices {
+	for ri := 0; ri < rows.n; ri++ {
+		rowIdx := rows.at(ri)
 		key := h.buildKey(batch, rowIdx)
 		accs, exists := h.groups[key]
 		if !exists {
@@ -409,7 +422,9 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 // Skipping per-row map lookup and key serialisation is the dominant win for
 // queries like Q6 (SUM with no GROUP BY) — the inner loop reduces to a tight
 // float64 addition or integer increment with no hash overhead.
-func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error {
+//
+// rows names the physical rows of the batch to visit; see rowSet in batch.go.
+func (h *HashAggregate) accumulateDirect(rows rowSet, aggVecs []Vector) error {
 	const key = ""
 	accs, exists := h.groups[key]
 	if !exists {
@@ -447,10 +462,11 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 		switch ae.Kind {
 		case AggCount:
 			if ae.ColIdx < 0 {
-				accs[j] += int64(len(indices)) // COUNT(*): no per-row null check needed
-				nonNull[j] += int64(len(indices))
+				accs[j] += int64(rows.n) // COUNT(*): no per-row null check needed
+				nonNull[j] += int64(rows.n)
 			} else {
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !v.IsNull(rowIdx) {
 						accs[j]++
 						nonNull[j]++
@@ -458,7 +474,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				}
 			}
 		case AggCountDistinct:
-			for _, rowIdx := range indices {
+			for ri := 0; ri < rows.n; ri++ {
+				rowIdx := rows.at(ri)
 				if v.IsNull(rowIdx) {
 					continue // NULL excluded from DISTINCT set
 				}
@@ -484,7 +501,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 			if ae.AccumType == TypeFloat64 {
 				fv := v.(*Float64Vector)
 				cur := math.Float64frombits(uint64(accs[j]))
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !fv.IsNull(rowIdx) {
 						cur += fv.Values[rowIdx]
 						nonNull[j]++
@@ -492,7 +510,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				}
 				accs[j] = int64(math.Float64bits(cur))
 			} else {
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !v.IsNull(rowIdx) {
 						accs[j] += extractInt64(v, rowIdx)
 						nonNull[j]++
@@ -502,7 +521,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 		case AggAvg:
 			if fv, ok := v.(*Float64Vector); ok {
 				cur := math.Float64frombits(uint64(accs[j]))
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !fv.IsNull(rowIdx) {
 						cur += fv.Values[rowIdx]
 						nonNull[j]++
@@ -511,7 +531,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				accs[j] = int64(math.Float64bits(cur))
 			} else {
 				cur := math.Float64frombits(uint64(accs[j]))
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !v.IsNull(rowIdx) {
 						cur += float64(extractInt64(v, rowIdx))
 						nonNull[j]++
@@ -523,7 +544,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 			if ae.AccumType == TypeFloat64 {
 				fv := v.(*Float64Vector)
 				cur := math.Float64frombits(uint64(accs[j]))
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !fv.IsNull(rowIdx) {
 						if fv.Values[rowIdx] < cur {
 							cur = fv.Values[rowIdx]
@@ -533,7 +555,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				}
 				accs[j] = int64(math.Float64bits(cur))
 			} else {
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !v.IsNull(rowIdx) {
 						if val := extractInt64(v, rowIdx); val < accs[j] {
 							accs[j] = val
@@ -546,7 +569,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 			if ae.AccumType == TypeFloat64 {
 				fv := v.(*Float64Vector)
 				cur := math.Float64frombits(uint64(accs[j]))
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !fv.IsNull(rowIdx) {
 						if fv.Values[rowIdx] > cur {
 							cur = fv.Values[rowIdx]
@@ -556,7 +580,8 @@ func (h *HashAggregate) accumulateDirect(indices []int, aggVecs []Vector) error 
 				}
 				accs[j] = int64(math.Float64bits(cur))
 			} else {
-				for _, rowIdx := range indices {
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
 					if !v.IsNull(rowIdx) {
 						if val := extractInt64(v, rowIdx); val > accs[j] {
 							accs[j] = val
