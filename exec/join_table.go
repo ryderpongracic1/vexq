@@ -72,6 +72,14 @@ const (
 	// Integers rather than a float so capacity arithmetic is exact.
 	joinTableLoadNum = 7
 	joinTableLoadDen = 10
+
+	// rowStoreMinRows is the row capacity a growing store jumps to on its first
+	// append. It is deliberately small: the doubling below is what makes growth
+	// cheap, not the floor, and an empty or near-empty store is common (a radix
+	// build morsel whose rows all filtered out, a probe-only test fixture), so
+	// paying a batch's worth of payload up front would be waste rather than
+	// headroom.
+	rowStoreMinRows = 8
 )
 
 // ---- Flat build-row store ---------------------------------------------------
@@ -93,9 +101,13 @@ const (
 // Q12's pruned orders side is four columns of which one is a string, so the
 // window is a quarter the width it would otherwise be.
 //
-// A store is append-only. Rows are never moved or rewritten after they are
-// appended, so a row index stays valid for the store's lifetime, and the arrays
-// may be read concurrently once the build phase has published them.
+// A store is append-only. A row is never renumbered or rewritten after it is
+// appended, so a row index stays valid for the store's lifetime — that is what
+// joinHashTable.insert, the next chain and the probe all rely on. Growth does
+// reallocate and copy, so the *address* of a row is not stable while a store is
+// still being appended to; nothing may hold a pointer into the arrays across a
+// reserve. Once the build phase has published the store the arrays stop growing
+// and may be read concurrently.
 type rowStore struct {
 	numCols  int
 	strWidth int     // number of TypeString columns
@@ -109,10 +121,26 @@ type rowStore struct {
 	next []int32
 
 	n int32 // rows appended (or, for a sized store, rows reserved up front)
+
+	// capRows is the row count the arrays are currently allocated for: every
+	// array's capacity is at least capRows times that array's per-row width.
+	// Tracked explicitly rather than read back from cap(), because the allocator
+	// rounds a capacity up to a size class and it rounds each of the four arrays
+	// up by a different amount — a single row capacity all four agree on is what
+	// lets reserve reslice them in lockstep without a bounds check per array.
+	//
+	// Written only by the one goroutine that appends to a store. A sized store
+	// (newSizedRowStore) sets it once at construction and never grows, so the
+	// parallel build's assembling goroutines never touch it.
+	capRows int
 }
 
 // newRowStore returns an empty store for rows of the given schema, growing on
-// demand. capRows is a hint for the initial allocation; 0 means "no idea".
+// demand. capRows is a hint for the initial allocation; 0 means "no idea", and
+// the store then doubles its way up from rowStoreMinRows. A caller that knows the
+// row count should say so: the hint removes the growth entirely, and growth —
+// even the geometric growth reserve now does — is the largest single allocator in
+// the join path.
 func newRowStore(schema Schema, capRows int) *rowStore {
 	s := &rowStore{numCols: len(schema.Fields)}
 	s.strSlot = make([]int32, s.numCols)
@@ -131,6 +159,7 @@ func newRowStore(schema Schema, capRows int) *rowStore {
 		if s.strWidth > 0 {
 			s.strs = make([]string, 0, capRows*s.strWidth)
 		}
+		s.capRows = capRows
 	}
 	return s
 }
@@ -148,6 +177,7 @@ func newSizedRowStore(schema Schema, rows int) *rowStore {
 		s.strs = make([]string, rows*s.strWidth)
 	}
 	s.n = int32(rows)
+	s.capRows = rows
 	return s
 }
 
@@ -155,29 +185,103 @@ func newSizedRowStore(schema Schema, rows int) *rowStore {
 func (s *rowStore) rows() int { return int(s.n) }
 
 // reserve adds one row and returns its index, growing the arrays as needed.
+//
+// The row index is stable for the store's lifetime: growth copies rows to a
+// larger allocation, it never renumbers them, so an index handed out here stays
+// valid for joinHashTable.insert, for the next chain, and for the probe.
+//
+// The elements the new row exposes are zero — which is what an all-NULL-free row
+// looks like before writeRow fills it, and "" for strs. next is the exception that
+// does not matter: its zero is 0 rather than noRow, but no reader can observe it,
+// because joinHashTable.insert writes next[row] before that row is reachable from
+// any chain.
+//
+// The zero holds because nothing ever writes past the arrays' length: every write
+// is indexed by a row below s.n, so the region between length and capacity is
+// untouched allocator-zeroed memory from the moment it is allocated until the
+// reslices below expose it.
 func (s *rowStore) reserve() (int32, error) {
 	if int64(s.n) >= maxBuildRows {
 		return noRow, fmt.Errorf("exec: hash join: build side exceeds %d rows", maxBuildRows)
 	}
 	row := s.n
 	s.n++
-
-	// append picks the growth factor, so growth is amortised, and the new
-	// elements are zero — which is what an all-NULL-free row looks like before
-	// appendFrom writes it.
-	if need := int(s.n) * s.numCols; len(s.values) < need {
-		s.values = append(s.values, make([]int64, need-len(s.values))...)
-		s.nulls = append(s.nulls, make([]bool, need-len(s.nulls))...)
+	rows := int(s.n)
+	if rows > s.capRows {
+		s.reallocate(rows)
 	}
+	// Lengths track the row count exactly, so an index past the last appended row
+	// panics rather than reading a row that was never appended.
+	s.values = s.values[:rows*s.numCols]
+	s.nulls = s.nulls[:rows*s.numCols]
+	s.next = s.next[:rows]
 	if s.strWidth > 0 {
-		if need := int(s.n) * s.strWidth; len(s.strs) < need {
-			s.strs = append(s.strs, make([]string, need-len(s.strs))...)
-		}
-	}
-	if len(s.next) < int(s.n) {
-		s.next = append(s.next, make([]int32, int(s.n)-len(s.next))...)
+		s.strs = s.strs[:rows*s.strWidth]
 	}
 	return row, nil
+}
+
+// reallocate moves the arrays to allocations big enough for at least rows rows,
+// doubling the row capacity. Lengths are unchanged; only capacity grows.
+//
+// Doubling is the point of this function rather than a detail of it. Go's own
+// append growth is what reserve used to rely on, and above ~256 elements
+// append grows a slice by only ~1.25x (runtime.nextslicecap), so filling an
+// array of N elements one row at a time churns roughly N * 1.25/0.25 = 5N
+// elements of total allocation. Doubling churns 2N, and it is the whole win
+// here: on the four join benchmarks reserve was 41% of every byte the join path
+// allocated.
+//
+// The remaining 2N is growth that a caller-supplied row count would remove
+// outright — see newRowStore's capRows hint.
+func (s *rowStore) reallocate(rows int) {
+	capRows := nextRowCap(s.capRows, rows)
+	// Written out per array rather than through one shared helper: this package
+	// is developed against `pprof -top`/`-list`, and a helper — generic most of
+	// all, which pprof reports per instantiated shape — moves these bytes off
+	// reallocate and onto a symbol that says nothing about which array grew.
+	//
+	// make zeroes the whole allocation and copy writes only the prefix, so
+	// everything past the length is zero. That is the invariant reserve exposes.
+	values := make([]int64, len(s.values), capRows*s.numCols)
+	copy(values, s.values)
+	s.values = values
+
+	nulls := make([]bool, len(s.nulls), capRows*s.numCols)
+	copy(nulls, s.nulls)
+	s.nulls = nulls
+
+	next := make([]int32, len(s.next), capRows)
+	copy(next, s.next)
+	s.next = next
+
+	if s.strWidth > 0 {
+		strs := make([]string, len(s.strs), capRows*s.strWidth)
+		copy(strs, s.strs)
+		s.strs = strs
+	}
+	s.capRows = capRows
+}
+
+// nextRowCap returns the row capacity to grow to when a store allocated for cur
+// rows needs to hold need rows: double, but never below the floor, never short of
+// need, and never past what an int32 row index can address.
+func nextRowCap(cur, need int) int {
+	capRows := cur * 2
+	if capRows < need {
+		capRows = need
+	}
+	if capRows < rowStoreMinRows {
+		capRows = rowStoreMinRows
+	}
+	// reserve refuses to hand out a row at or past maxBuildRows, so there is
+	// never a reason to allocate past it — doubling must not turn a store that
+	// is about to report overflow into an allocation twice the size of the one
+	// that is already the largest the row index can address.
+	if int64(capRows) > maxBuildRows {
+		capRows = int(maxBuildRows)
+	}
+	return capRows
 }
 
 // appendFrom materialises row rowIdx of batch into a new store row and returns
@@ -193,6 +297,14 @@ func (s *rowStore) appendFrom(batch *Batch, rowIdx int) (int32, error) {
 	if err != nil {
 		return noRow, err
 	}
+	s.writeRow(row, batch, rowIdx)
+	return row, nil
+}
+
+// writeRow copies row rowIdx of batch into the already-reserved store row row.
+// Split out of appendFrom so that growth and payload can be exercised
+// independently — see BenchmarkRowStoreGrowth and the growth-equivalence test.
+func (s *rowStore) writeRow(row int32, batch *Batch, rowIdx int) {
 	vOff := int(row) * s.numCols
 	sOff := int(row) * s.strWidth
 	for c := 0; c < s.numCols; c++ {
@@ -213,7 +325,6 @@ func (s *rowStore) appendFrom(batch *Batch, rowIdx int) (int32, error) {
 		}
 		s.values[vOff+c] = extractInt64(v, rowIdx)
 	}
-	return row, nil
 }
 
 // setFrom copies row srcRow of src into this store's row dst, which must already
