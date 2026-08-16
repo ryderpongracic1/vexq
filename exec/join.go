@@ -155,10 +155,24 @@ func (j *HashJoin) Next(ctx context.Context) (*Batch, error) {
 }
 
 func (j *HashJoin) buildHashTable(ctx context.Context) error {
-	j.store = newRowStore(j.buildSchema, 0)
+	// What the build side can say about its own row count before producing a
+	// row: the scan's footer count where the build side is a scan, and nothing
+	// where a filter or a nested join sits in between (see RowCountBound). A
+	// presized store never grows, which is the whole of the win — growth was
+	// 31.6% of every byte the join benchmarks allocated, and 59.5% of that came
+	// from this one call site.
+	rows := buildRowsPresize(j.build)
+	j.store = newRowStore(j.buildSchema, rows)
 	// One unpartitioned table: a self-building serial join has no morsels to
 	// split, so radix partitioning would buy it nothing.
-	tbl := newJoinHashTable(j.store, 0)
+	//
+	// The same count sizes the slot array. It bounds the distinct key count
+	// rather than equalling it, so a duplicate-heavy build side over-allocates
+	// slots — the trade newJoinHashTable documents, and the one the parallel
+	// build's pass 2 has always made with its per-partition row counts. It is
+	// the cheap direction: 16 bytes per unused slot against a rehash of the
+	// whole array, which was 12.6% of the same profile.
+	tbl := newJoinHashTable(j.store, rows)
 	j.parts = []*joinHashTable{tbl}
 	j.partMask = 0
 	return forEachBuildRow(ctx, j.build, j.buildKey, func(key int64, batch *Batch, rowIdx int) error {

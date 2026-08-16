@@ -237,9 +237,24 @@ func BuildSharedHashTableRadix(ctx context.Context, build Operator, buildKeyIdx,
 	if buildKeyIdx < 0 || buildKeyIdx >= len(schema.Fields) {
 		return nil, fmt.Errorf("exec: shared hash table: build key %d out of range", buildKeyIdx)
 	}
-	// Row count unknown before the drain, so both the store and the partition
-	// tables grow on demand.
-	sht := newSharedHashTable(schema, buildKeyIdx, clampRadixBits(radixBits), 0, 0)
+	// The build side's own row bound where it has one — a scan-rooted build side
+	// the planner could not split into morsels still lands here, and still gets
+	// to skip its growth. A filtered or nested build side reports no tight bound
+	// and both the store and the partition tables grow on demand, as they always
+	// did (see RowCountBound).
+	bits := clampRadixBits(radixBits)
+	rows := buildRowsPresize(build)
+	// Keys spread evenly across partitions by construction — radixHash mixes
+	// every bit of the key before the partition bits are taken — so an even split
+	// of the row bound is the per-partition key estimate. A partition that lands
+	// above its share rehashes once, which is the same cost it paid for every
+	// doubling before.
+	keysPerPart := 0
+	if rows > 0 {
+		numParts := 1 << bits
+		keysPerPart = (rows + numParts - 1) / numParts
+	}
+	sht := newSharedHashTable(schema, buildKeyIdx, bits, rows, keysPerPart)
 	err := forEachBuildRow(ctx, build, buildKeyIdx, func(key int64, batch *Batch, rowIdx int) error {
 		row, err := sht.store.appendFrom(batch, rowIdx)
 		if err != nil {
@@ -285,6 +300,50 @@ type keyedRow struct {
 type morselBucket struct {
 	store *rowStore
 	rows  [][]keyedRow // indexed by partition
+}
+
+// partitionMorsel drains one build morsel's pipeline into its own store and
+// records, per partition, the rows that belong to it in the order the pipeline
+// produced them. This is pass 1's whole body for one morsel; it is a function
+// rather than an inline block so a test can drive the real code path and inspect
+// the bucket it produces, which is otherwise a local of a worker goroutine.
+//
+// The store is presized from what the pipeline can say about its own row count.
+// For the shape this matters most for — a scan-rooted build side, which is what
+// makes a build side partitionable in the first place — that count is exact: the
+// footer row counts of the row groups in the claimed range, less any the zone map
+// prunes. The bound is asked for after the pipeline has been positioned on this
+// morsel, so a pipeline reused across morsels (MorselPipeline) reports the morsel
+// it is on rather than the one before it. A filtered or nested-join build side
+// reports no tight bound and the store grows as it did before — see
+// RowCountBound.
+//
+// The caller owns pipeline: this function neither closes nor repositions it.
+func partitionMorsel(
+	ctx context.Context,
+	pipeline Operator,
+	schema Schema,
+	buildKeyIdx, numParts int,
+	partMask uint64,
+) (*morselBucket, error) {
+	local := &morselBucket{
+		store: newRowStore(schema, buildRowsPresize(pipeline)),
+		rows:  make([][]keyedRow, numParts),
+	}
+	err := forEachBuildRow(ctx, pipeline, buildKeyIdx,
+		func(key int64, batch *Batch, rowIdx int) error {
+			row, err := local.store.appendFrom(batch, rowIdx)
+			if err != nil {
+				return err
+			}
+			p := radixPart(key, partMask)
+			local.rows[p] = append(local.rows[p], keyedRow{key: key, row: row})
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return local, nil
 }
 
 // BuildSharedHashTableParallel materialises the build side with numWorkers
@@ -394,20 +453,7 @@ func BuildSharedHashTableParallel(
 					errCh <- fmt.Errorf("radix build worker [%d,%d): pipeline: %w", start, stop, err)
 					return
 				}
-				local := &morselBucket{
-					store: newRowStore(schema, 0),
-					rows:  make([][]keyedRow, numParts),
-				}
-				err = forEachBuildRow(wCtx, pipeline, buildKeyIdx,
-					func(key int64, batch *Batch, rowIdx int) error {
-						row, err := local.store.appendFrom(batch, rowIdx)
-						if err != nil {
-							return err
-						}
-						p := radixPart(key, partMask)
-						local.rows[p] = append(local.rows[p], keyedRow{key: key, row: row})
-						return nil
-					})
+				local, err := partitionMorsel(wCtx, pipeline, schema, buildKeyIdx, numParts, partMask)
 				runner.release(pipeline)
 				if err != nil {
 					errCh <- fmt.Errorf("radix build worker [%d,%d): %w", start, stop, err)

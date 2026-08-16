@@ -133,6 +133,13 @@ type rowStore struct {
 	// (newSizedRowStore) sets it once at construction and never grows, so the
 	// parallel build's assembling goroutines never touch it.
 	capRows int
+
+	// grows counts reallocate calls. It exists so a test can assert the property
+	// presizing is for — a store told its row count up front never grows —
+	// directly, rather than inferring it from a capRows value that a different
+	// growth policy could also produce. Written by the same single goroutine that
+	// owns capRows, and read only by tests.
+	grows int
 }
 
 // newRowStore returns an empty store for rows of the given schema, growing on
@@ -162,6 +169,31 @@ func newRowStore(schema Schema, capRows int) *rowStore {
 		s.capRows = capRows
 	}
 	return s
+}
+
+// presizeRows clamps a row-count bound to what a store may be preallocated for,
+// returning 0 for "do not presize".
+//
+// Two bounds are refused rather than clamped down to a legal value:
+//
+//   - A non-positive count is no information at all.
+//   - A count above maxBuildRows is a build side reserve is going to refuse
+//     anyway. Presizing for it would try to allocate tens of gigabytes and be
+//     killed by the allocator *before* reserve reports the overflow, turning a
+//     clean error into an OOM. Refusing to presize leaves the growth path in
+//     place, so the refusal fires exactly where it did before — at the row that
+//     reaches maxBuildRows, having allocated for the rows below it and no more.
+//     Clamping to maxBuildRows instead would attempt that same doomed
+//     allocation, so the guard has to be a refusal.
+//
+// A bound at or just below maxBuildRows and honest about it still ends up
+// allocating tens of gigabytes, and still should: that is the size of the data.
+// What this function prevents is spending it on a bound that is wrong.
+func presizeRows(rows int) int {
+	if rows <= 0 || int64(rows) > maxBuildRows {
+		return 0
+	}
+	return rows
 }
 
 // newSizedRowStore returns a store whose rows are all allocated up front and
@@ -235,6 +267,7 @@ func (s *rowStore) reserve() (int32, error) {
 // The remaining 2N is growth that a caller-supplied row count would remove
 // outright — see newRowStore's capRows hint.
 func (s *rowStore) reallocate(rows int) {
+	s.grows++
 	capRows := nextRowCap(s.capRows, rows)
 	// Written out per array rather than through one shared helper: this package
 	// is developed against `pprof -top`/`-list`, and a helper — generic most of
