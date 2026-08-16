@@ -650,14 +650,13 @@ func evaluateGroupedQuery(stmt *sql.SelectStmt, rows []Row, cm colMap) (*RefResu
 		result.Rows = append(result.Rows, outRow)
 	}
 
-	// Handle empty-input global aggregate: emit one row with COUNT=0, other aggs=NULL.
-	if len(stmt.GroupBy) == 0 && len(rows) == 0 {
-		outRow, err := evaluateGroupOutput(stmt, nil, cm)
-		if err != nil {
-			return nil, err
-		}
-		result.Rows = append(result.Rows, outRow)
-	}
+	// An empty-input global aggregate needs no special case here: the ungrouped
+	// branch above always seeds the single implicit group, so the loop has
+	// already emitted its one row (COUNT=0, everything else NULL) from an empty
+	// group. This function used to append that row a second time, which made the
+	// reference report two rows where SQL — and the engine — produce one, and
+	// which also re-added the row after HAVING had rejected it. No corpus query
+	// reached it until MIN/MAX over an empty result set was added.
 
 	return result, nil
 }
@@ -674,17 +673,25 @@ func buildGroupKey(row Row, groupExprs []sql.Expr, cm colMap) (string, error) {
 	return strings.Join(parts, "|"), nil
 }
 
+// valueToKey renders a Value as an identity key, used for GROUP BY grouping,
+// DISTINCT, and COUNT(DISTINCT)'s seen-set.
+//
+// Value carries no type tag, so this has to key on every field rather than guess
+// which one is populated from which are zero. Guessing is what it used to do, and
+// it silently conflated values that are not equal: a BOOL column's true and false
+// both have Str "", Float 0 and Int64 0, so they produced the same key and
+// collapsed into one group; every DATE value did too, since Date was never read.
+// GROUP BY over a BOOL or DATE column, and COUNT(DISTINCT) over either, were
+// therefore wrong in the reference — under-counting groups and distinct values.
+// No corpus query reached it until GROUP BY over a BOOL column was added.
+//
+// Keying on all five fields is total and unambiguous. It cannot conflate two
+// different values, and it cannot separate two equal ones.
 func valueToKey(v Value) string {
 	if v.IsNull {
 		return "<NULL>"
 	}
-	if v.Str != "" {
-		return "s:" + v.Str
-	}
-	if v.Float != 0 || v.Int64 == 0 {
-		return fmt.Sprintf("f:%v", v.Float)
-	}
-	return fmt.Sprintf("i:%d", v.Int64)
+	return fmt.Sprintf("i:%d|f:%v|s:%q|b:%t|d:%d", v.Int64, v.Float, v.Str, v.Bool, v.Date)
 }
 
 func evaluateGroupOutput(stmt *sql.SelectStmt, groupRows []Row, cm colMap) (Row, error) {

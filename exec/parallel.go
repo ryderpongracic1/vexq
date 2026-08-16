@@ -227,6 +227,13 @@ func newPartialAggregate(groupBy []int, aggExprs []AggExpr, schema Schema) *Hash
 //   - If the key exists: combine accumulators per AggKind/AccumType.
 //
 // groupCnt (used for AVG) is always summed.
+//
+// String-valued MIN/MAX (AccumType == TypeString) merge from strAccs rather than
+// from the int64 accumulators: the IEEE-bit re-encoding that lets a float64
+// partial travel inside an int64 has no string analogue. Their merge is guarded
+// by the pre-merge non-null counts, because "" is a legitimate value and so
+// cannot double as "this partial saw nothing" — a worker whose morsels held only
+// NULLs must not win the comparison with an empty string.
 func mergePartialAgg(dst, src *HashAggregate) {
 	for _, key := range src.keys {
 		srcAccs := src.groups[key]
@@ -244,7 +251,20 @@ func mergePartialAgg(dst, src *HashAggregate) {
 				copy(copiedNN, srcNN)
 				dst.aggNonNull[key] = copiedNN
 			}
+			if dst.hasStrAgg {
+				if srcStrs := src.strAccs[key]; srcStrs != nil {
+					copiedStrs := make([]string, len(srcStrs))
+					copy(copiedStrs, srcStrs)
+					dst.strAccs[key] = copiedStrs
+				} else {
+					dst.strAccs[key] = dst.newStrAccums()
+				}
+			}
 		} else {
+			// Read the non-null counts before they are summed below: string
+			// MIN/MAX needs each side's pre-merge emptiness, not the total.
+			dstNN, srcNN := dst.aggNonNull[key], src.aggNonNull[key]
+			dstStrs, srcStrs := dst.strAccs[key], src.strAccs[key]
 			for j, ae := range dst.aggExprs {
 				switch ae.Kind {
 				case AggCount:
@@ -258,34 +278,31 @@ func mergePartialAgg(dst, src *HashAggregate) {
 					} else {
 						dstAccs[j] += srcAccs[j]
 					}
-				case AggMin:
-					if ae.AccumType == TypeFloat64 {
-						df := math.Float64frombits(uint64(dstAccs[j]))
-						sf := math.Float64frombits(uint64(srcAccs[j]))
-						if sf < df {
-							dstAccs[j] = srcAccs[j]
+				case AggMin, AggMax:
+					less := ae.Kind == AggMin
+					if ae.AccumType == TypeString {
+						if dstNN == nil || srcNN == nil || dstStrs == nil || srcStrs == nil {
+							continue
 						}
-					} else {
-						if srcAccs[j] < dstAccs[j] {
-							dstAccs[j] = srcAccs[j]
+						if srcNN[j] == 0 {
+							continue // src contributed no value to compare
 						}
+						minMaxString(dstStrs, j, srcStrs[j], dstNN[j] > 0, less)
+						continue
 					}
-				case AggMax:
 					if ae.AccumType == TypeFloat64 {
 						df := math.Float64frombits(uint64(dstAccs[j]))
 						sf := math.Float64frombits(uint64(srcAccs[j]))
-						if sf > df {
+						if (less && sf < df) || (!less && sf > df) {
 							dstAccs[j] = srcAccs[j]
 						}
-					} else {
-						if srcAccs[j] > dstAccs[j] {
-							dstAccs[j] = srcAccs[j]
-						}
+					} else if (less && srcAccs[j] < dstAccs[j]) || (!less && srcAccs[j] > dstAccs[j]) {
+						dstAccs[j] = srcAccs[j]
 					}
 				}
 			}
 			// Existing group: add this partial aggregate's non-null counts.
-			if dstNN, srcNN := dst.aggNonNull[key], src.aggNonNull[key]; dstNN != nil && srcNN != nil {
+			if dstNN != nil && srcNN != nil {
 				for j := range dstNN {
 					dstNN[j] += srcNN[j]
 				}

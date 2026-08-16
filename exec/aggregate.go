@@ -27,10 +27,48 @@ type AggExpr struct {
 	ColIdx    int      // source column index (-1 for COUNT(*))
 	OutName   string   // output column name
 	Distinct  bool     // true for COUNT(DISTINCT col)
-	AccumType DataType // type of bits stored in the groups accumulator:
-	// TypeInt64   for COUNT, SUM/MIN/MAX over integer/date columns
+	AccumType DataType // encoding of the accumulator this aggregate runs in:
+	// TypeInt64   for COUNT, SUM/MIN/MAX over integer/date/bool columns
 	// TypeFloat64 for SUM/MIN/MAX over float64 columns, and always for AVG
-	// Set by the planner; used by mergePartialAgg in parallel execution.
+	// TypeString  for MIN/MAX over string columns — the running value lives in
+	//             HashAggregate.strAccs, not in the int64 groups accumulator
+	// Set by the planner (or by NewHashAggregate when left zero) via
+	// AccumTypeFor; used by mergePartialAgg in parallel execution.
+}
+
+// AccumTypeFor returns the accumulator encoding an aggregate of kind must use
+// over a source column of type srcType. Pass TypeInt64 as srcType for kinds that
+// read no column (COUNT(*)).
+//
+// This is the single definition of that mapping, and it is shared rather than
+// duplicated on purpose: NewHashAggregate applies it when the caller left
+// AccumType zero, and the planner applies it when resolving AggExprs, because
+// the parallel path builds its per-worker partial aggregates directly
+// (newPartialAggregate) rather than through NewHashAggregate. If the two ever
+// disagreed, a partial accumulated under one encoding would be merged and
+// decoded under another — the failure mode is a silently wrong answer, not a
+// crash, which is exactly how MIN/MAX over string columns came to return 0.
+func AccumTypeFor(kind AggKind, srcType DataType) DataType {
+	switch kind {
+	case AggAvg:
+		return TypeFloat64
+	case AggSum:
+		if srcType == TypeFloat64 {
+			return TypeFloat64
+		}
+		return TypeInt64
+	case AggMin, AggMax:
+		switch srcType {
+		case TypeFloat64:
+			return TypeFloat64
+		case TypeString:
+			return TypeString
+		default:
+			return TypeInt64
+		}
+	default: // AggCount, AggCountDistinct
+		return TypeInt64
+	}
 }
 
 // groupByVal stores one group-by column value for a representative row.
@@ -56,6 +94,20 @@ type HashAggregate struct {
 	samples    map[string][]groupByVal // key → representative group-by values
 	done       bool
 	outPos     int
+
+	// strAccs holds the running values for MIN/MAX over STRING columns, which
+	// have no int64 encoding to live in: strAccs[key][j] is aggregate j's
+	// running min/max for group key. Only slots whose AggExpr.AccumType is
+	// TypeString are ever written; the rest stay "".
+	//
+	// There is no "empty" sentinel, because "" is a legitimate string value.
+	// aggNonNull[key][j] == 0 is the emptiness test instead: the first non-null
+	// row of a group takes its value unconditionally, and a group that saw no
+	// non-null row outputs NULL, so the zero value is never read as data.
+	//
+	// Allocated only when hasStrAgg — a numeric-only aggregate pays nothing.
+	strAccs   map[string][]string
+	hasStrAgg bool
 
 	// Integer-key fast path: eliminates string allocation in the hot loop
 	// when all GROUP BY columns are dict-encoded strings.
@@ -96,51 +148,42 @@ func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashA
 	hasDistinct := false
 	for i := range resolved {
 		ae := &resolved[i]
+		srcType := TypeInt64
+		if ae.ColIdx >= 0 {
+			if ae.ColIdx >= len(childSchema.Fields) {
+				return nil, fmt.Errorf("exec: hash aggregate: aggregate column %d out of range", ae.ColIdx)
+			}
+			srcType = childSchema.Fields[ae.ColIdx].Type
+		}
+		if ae.AccumType == 0 {
+			ae.AccumType = AccumTypeFor(ae.Kind, srcType)
+		}
 		var t DataType
 		switch ae.Kind {
 		case AggCount, AggCountDistinct:
 			t = TypeInt64
-			if ae.AccumType == 0 {
-				ae.AccumType = TypeInt64
-			}
 			if ae.Kind == AggCountDistinct {
 				hasDistinct = true
 			}
 		case AggSum, AggMin, AggMax:
-			if ae.ColIdx < 0 {
-				t = TypeInt64
-			} else {
-				t = childSchema.Fields[ae.ColIdx].Type
-			}
-			if ae.AccumType == 0 {
-				if ae.ColIdx >= 0 && childSchema.Fields[ae.ColIdx].Type == TypeFloat64 {
-					ae.AccumType = TypeFloat64
-				} else {
-					ae.AccumType = TypeInt64
-				}
-			}
+			// MIN/MAX return a value of the input type; buildOutputBatch emits a
+			// vector matching this declared type for every column type.
+			t = srcType
 		case AggAvg:
 			t = TypeFloat64
-			if ae.AccumType == 0 {
-				ae.AccumType = TypeFloat64
-			}
 		}
 		outFields = append(outFields, Field{Name: ae.OutName, Type: t, Nullable: true})
 	}
 
-	return &HashAggregate{
-		child:        child,
-		groupBy:      groupBy,
-		aggExprs:     resolved,
-		schema:       Schema{Fields: outFields},
-		groups:       make(map[string][]int64),
-		groupCnt:     make(map[string]int64),
-		aggNonNull:   make(map[string][]int64),
-		samples:      make(map[string][]groupByVal),
-		hasDistinct:  hasDistinct,
-		distinctInts: make(map[string][]map[int64]struct{}),
-		distinctStrs: make(map[string][]map[string]struct{}),
-	}, nil
+	h := &HashAggregate{
+		child:       child,
+		groupBy:     groupBy,
+		aggExprs:    resolved,
+		schema:      Schema{Fields: outFields},
+		hasDistinct: hasDistinct,
+	}
+	h.initMaps()
+	return h, nil
 }
 
 func (h *HashAggregate) Schema() Schema { return h.schema }
@@ -174,7 +217,8 @@ func (h *HashAggregate) Next(ctx context.Context) (*Batch, error) {
 }
 
 // initMaps resets the internal accumulator maps. Called at the start of
-// consumeAll and by parallel workers before their first accumulate call.
+// consumeAll, by NewHashAggregate, and by parallel workers before their first
+// accumulate call.
 func (h *HashAggregate) initMaps() {
 	h.keys = nil
 	h.groups = make(map[string][]int64)
@@ -183,9 +227,98 @@ func (h *HashAggregate) initMaps() {
 	h.samples = make(map[string][]groupByVal)
 	h.intKeyDecided = false
 	h.intKey = intKeyState{}
+	// Derived here rather than in NewHashAggregate because newPartialAggregate
+	// (parallel.go) builds a HashAggregate by struct literal and reaches this
+	// function as its only initialisation step.
+	h.hasStrAgg = false
+	for _, ae := range h.aggExprs {
+		if ae.AccumType == TypeString {
+			h.hasStrAgg = true
+			break
+		}
+	}
+	if h.hasStrAgg {
+		h.strAccs = make(map[string][]string)
+	} else {
+		h.strAccs = nil
+	}
 	if h.hasDistinct {
 		h.distinctInts = make(map[string][]map[int64]struct{})
 		h.distinctStrs = make(map[string][]map[string]struct{})
+	}
+}
+
+// newAccums allocates and seeds the int64 accumulator slice for a new group.
+// MIN/MAX start at the identity for their comparison so the first value always
+// wins; SUM/COUNT/AVG start at zero. Aggregates running in a TypeString
+// accumulator keep their slot at zero and are tracked in strAccs instead.
+func (h *HashAggregate) newAccums() []int64 {
+	accs := make([]int64, len(h.aggExprs))
+	for j, ae := range h.aggExprs {
+		switch ae.Kind {
+		case AggMin:
+			switch ae.AccumType {
+			case TypeFloat64:
+				accs[j] = int64(math.Float64bits(math.MaxFloat64))
+			case TypeString:
+				// no sentinel: aggNonNull is the emptiness test (see strAccs)
+			default:
+				accs[j] = math.MaxInt64
+			}
+		case AggMax:
+			switch ae.AccumType {
+			case TypeFloat64:
+				accs[j] = int64(math.Float64bits(-math.MaxFloat64))
+			case TypeString:
+			default:
+				accs[j] = math.MinInt64
+			}
+		}
+	}
+	return accs
+}
+
+// newStrAccums allocates the string accumulator slice for a new group, or nil
+// when this operator has no string-valued aggregate.
+func (h *HashAggregate) newStrAccums() []string {
+	if !h.hasStrAgg {
+		return nil
+	}
+	return make([]string, len(h.aggExprs))
+}
+
+// checkStrAggVecs verifies that every aggregate declared to accumulate strings
+// was handed a string vector. AccumType comes from the plan and the vector comes
+// from the batch; if they disagree the row values cannot be read, so this reports
+// it once per batch instead of letting the per-row assertion panic or — worse —
+// letting a fallback path record a zero value.
+func (h *HashAggregate) checkStrAggVecs(aggVecs []Vector) error {
+	for j, ae := range h.aggExprs {
+		if ae.AccumType != TypeString {
+			continue
+		}
+		if _, ok := aggVecs[j].(*StringVector); !ok {
+			return fmt.Errorf("exec: aggregate %q accumulates strings but column %d is %T",
+				ae.OutName, ae.ColIdx, aggVecs[j])
+		}
+	}
+	return nil
+}
+
+// minMaxString folds one non-null string value into aggregate j's running
+// min (less) or max. seen reports whether this group has already taken a value;
+// the first value always wins, since "" is data rather than an empty marker.
+func minMaxString(strs []string, j int, s string, seen bool, less bool) {
+	if !seen {
+		strs[j] = s
+		return
+	}
+	if less {
+		if s < strs[j] {
+			strs[j] = s
+		}
+	} else if s > strs[j] {
+		strs[j] = s
 	}
 }
 
@@ -244,6 +377,12 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 		}
 	}
 
+	if h.hasStrAgg {
+		if err := h.checkStrAggVecs(aggVecs); err != nil {
+			return err
+		}
+	}
+
 	rows := batchRows(batch)
 
 	// Fast path: no GROUP BY eliminates per-row map lookup (e.g. Q6 SUM with no groups).
@@ -272,25 +411,12 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 		key := h.buildKey(batch, rowIdx)
 		accs, exists := h.groups[key]
 		if !exists {
-			accs = make([]int64, len(h.aggExprs))
-			for j, ae := range h.aggExprs {
-				switch ae.Kind {
-				case AggMin:
-					if ae.AccumType == TypeFloat64 {
-						accs[j] = int64(math.Float64bits(math.MaxFloat64))
-					} else {
-						accs[j] = math.MaxInt64
-					}
-				case AggMax:
-					if ae.AccumType == TypeFloat64 {
-						accs[j] = int64(math.Float64bits(-math.MaxFloat64))
-					} else {
-						accs[j] = math.MinInt64
-					}
-				}
-			}
+			accs = h.newAccums()
 			h.groups[key] = accs
 			h.aggNonNull[key] = make([]int64, len(h.aggExprs))
+			if h.hasStrAgg {
+				h.strAccs[key] = h.newStrAccums()
+			}
 			h.keys = append(h.keys, key)
 			sample := make([]groupByVal, len(h.groupBy))
 			for si, colIdx := range h.groupBy {
@@ -330,6 +456,10 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 		}
 
 		nonNull := h.aggNonNull[key]
+		var strs []string
+		if h.hasStrAgg {
+			strs = h.strAccs[key]
+		}
 		for j, ae := range h.aggExprs {
 			v := aggVecs[j] // hoisted: resolved once per batch above
 			switch ae.Kind {
@@ -390,6 +520,11 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				if v.IsNull(rowIdx) {
 					continue
 				}
+				if ae.AccumType == TypeString {
+					minMaxString(strs, j, v.(*StringVector).Get(rowIdx), nonNull[j] > 0, true)
+					nonNull[j]++
+					continue
+				}
 				nonNull[j]++
 				val := extractInt64(v, rowIdx)
 				if ae.AccumType == TypeFloat64 {
@@ -401,6 +536,11 @@ func (h *HashAggregate) accumulate(batch *Batch) error {
 				}
 			case AggMax:
 				if v.IsNull(rowIdx) {
+					continue
+				}
+				if ae.AccumType == TypeString {
+					minMaxString(strs, j, v.(*StringVector).Get(rowIdx), nonNull[j] > 0, false)
+					nonNull[j]++
 					continue
 				}
 				nonNull[j]++
@@ -428,25 +568,12 @@ func (h *HashAggregate) accumulateDirect(rows rowSet, aggVecs []Vector) error {
 	const key = ""
 	accs, exists := h.groups[key]
 	if !exists {
-		accs = make([]int64, len(h.aggExprs))
-		for j, ae := range h.aggExprs {
-			switch ae.Kind {
-			case AggMin:
-				if ae.AccumType == TypeFloat64 {
-					accs[j] = int64(math.Float64bits(math.MaxFloat64))
-				} else {
-					accs[j] = math.MaxInt64
-				}
-			case AggMax:
-				if ae.AccumType == TypeFloat64 {
-					accs[j] = int64(math.Float64bits(-math.MaxFloat64))
-				} else {
-					accs[j] = math.MinInt64
-				}
-			}
-		}
+		accs = h.newAccums()
 		h.groups[key] = accs
 		h.aggNonNull[key] = make([]int64, len(h.aggExprs))
+		if h.hasStrAgg {
+			h.strAccs[key] = h.newStrAccums()
+		}
 		h.keys = append(h.keys, key)
 		// Initialize distinct sets for the single implicit group.
 		if h.hasDistinct {
@@ -456,6 +583,10 @@ func (h *HashAggregate) accumulateDirect(rows rowSet, aggVecs []Vector) error {
 	}
 
 	nonNull := h.aggNonNull[key]
+	var strs []string
+	if h.hasStrAgg {
+		strs = h.strAccs[key]
+	}
 
 	for j, ae := range h.aggExprs {
 		v := aggVecs[j]
@@ -541,7 +672,16 @@ func (h *HashAggregate) accumulateDirect(rows rowSet, aggVecs []Vector) error {
 				accs[j] = int64(math.Float64bits(cur))
 			}
 		case AggMin:
-			if ae.AccumType == TypeFloat64 {
+			if ae.AccumType == TypeString {
+				sv := v.(*StringVector)
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
+					if !sv.IsNull(rowIdx) {
+						minMaxString(strs, j, sv.Get(rowIdx), nonNull[j] > 0, true)
+						nonNull[j]++
+					}
+				}
+			} else if ae.AccumType == TypeFloat64 {
 				fv := v.(*Float64Vector)
 				cur := math.Float64frombits(uint64(accs[j]))
 				for ri := 0; ri < rows.n; ri++ {
@@ -566,7 +706,16 @@ func (h *HashAggregate) accumulateDirect(rows rowSet, aggVecs []Vector) error {
 				}
 			}
 		case AggMax:
-			if ae.AccumType == TypeFloat64 {
+			if ae.AccumType == TypeString {
+				sv := v.(*StringVector)
+				for ri := 0; ri < rows.n; ri++ {
+					rowIdx := rows.at(ri)
+					if !sv.IsNull(rowIdx) {
+						minMaxString(strs, j, sv.Get(rowIdx), nonNull[j] > 0, false)
+						nonNull[j]++
+					}
+				}
+			} else if ae.AccumType == TypeFloat64 {
 				fv := v.(*Float64Vector)
 				cur := math.Float64frombits(uint64(accs[j]))
 				for ri := 0; ri < rows.n; ri++ {
@@ -673,8 +822,8 @@ func (h *HashAggregate) buildOutputBatch(keys []string) *Batch {
 				out.Values[i] = count
 			}
 			vecs[outIdx] = out
-		case AggSum, AggMin, AggMax:
-			// SUM/MIN/MAX return NULL when all inputs were null.
+		case AggSum:
+			// SUM returns NULL when all inputs were null.
 			if ae.AccumType == TypeFloat64 {
 				fOut := &Float64Vector{Values: make([]float64, n), NullBitmap: storage.FullBitmap(n)}
 				for i, key := range keys {
@@ -698,6 +847,14 @@ func (h *HashAggregate) buildOutputBatch(keys []string) *Batch {
 				}
 				vecs[outIdx] = out
 			}
+		case AggMin, AggMax:
+			// MIN/MAX return a value of the input type, so the vector kind is
+			// chosen by the declared output type rather than by the accumulator
+			// encoding. Returning an Int64Vector for every non-float column was
+			// what made MIN over a STRING column emit 0, and over a DATE column
+			// emit raw day numbers, under a schema that claimed otherwise.
+			// SUM/MIN/MAX return NULL when all inputs were null.
+			vecs[outIdx] = h.buildMinMaxVector(keys, j, h.schema.Fields[outIdx].Type, n)
 		case AggAvg:
 			// AVG divides by non-null count; returns NULL when no non-null inputs.
 			fOut := &Float64Vector{Values: make([]float64, n), NullBitmap: storage.FullBitmap(n)}
@@ -718,6 +875,85 @@ func (h *HashAggregate) buildOutputBatch(keys []string) *Batch {
 	return &Batch{Schema: h.schema, Vectors: vecs, Length: n}
 }
 
+// buildMinMaxVector materialises aggregate j's MIN/MAX result for the given
+// group keys as a vector of outType — the type the operator's schema declares for
+// that column, which for MIN/MAX is the input column's type.
+//
+// A group whose non-null input count is zero produces NULL, which is also what
+// keeps the accumulators' zero values from ever being read as data: an
+// untouched int64 slot still holds its MaxInt64/MinInt64 sentinel and an
+// untouched strAccs slot still holds "".
+func (h *HashAggregate) buildMinMaxVector(keys []string, j int, outType DataType, n int) Vector {
+	nullBmp := storage.FullBitmap(n)
+	isNull := func(key string) bool { return h.aggNonNull[key][j] == 0 }
+
+	switch outType {
+	case TypeString:
+		// Codes index a fresh output dictionary; the input dictionaries are per
+		// row group and carry codes in first-occurrence order, so they cannot be
+		// reused or compared here.
+		db := storage.NewDictBuilder()
+		codes := make([]uint32, n)
+		bmp := make([]byte, (n+7)/8)
+		for i, key := range keys {
+			if isNull(key) {
+				continue // leave invalid: NULL
+			}
+			var s string
+			if strs := h.strAccs[key]; strs != nil {
+				s = strs[j]
+			}
+			codes[i] = db.Add(s)
+			storage.SetValidBit(bmp, i)
+		}
+		return newStringVector(db, codes, bmp)
+
+	case TypeFloat64:
+		out := &Float64Vector{Values: make([]float64, n), NullBitmap: nullBmp}
+		for i, key := range keys {
+			if isNull(key) {
+				storage.SetNullBit(out.NullBitmap, i)
+				continue
+			}
+			out.Values[i] = math.Float64frombits(uint64(h.groups[key][j]))
+		}
+		return out
+
+	case TypeDate:
+		out := &DateVector{Values: make([]int32, n), NullBitmap: nullBmp}
+		for i, key := range keys {
+			if isNull(key) {
+				storage.SetNullBit(out.NullBitmap, i)
+				continue
+			}
+			out.Values[i] = int32(h.groups[key][j])
+		}
+		return out
+
+	case TypeBool:
+		out := &BoolVector{Bits: make([]byte, (n+7)/8), NullBitmap: nullBmp, Length: n}
+		for i, key := range keys {
+			if isNull(key) {
+				storage.SetNullBit(out.NullBitmap, i)
+				continue
+			}
+			out.Set(i, h.groups[key][j] != 0)
+		}
+		return out
+
+	default: // TypeInt64
+		out := &Int64Vector{Values: make([]int64, n), NullBitmap: nullBmp}
+		for i, key := range keys {
+			if isNull(key) {
+				storage.SetNullBit(out.NullBitmap, i)
+				continue
+			}
+			out.Values[i] = h.groups[key][j]
+		}
+		return out
+	}
+}
+
 // buildEmptyGlobalResult creates a single-row batch for a global aggregate
 // (no GROUP BY) that consumed zero input rows. SQL requires:
 //   - COUNT -> 0 (never NULL)
@@ -728,7 +964,10 @@ func (h *HashAggregate) buildEmptyGlobalResult() *Batch {
 		switch ae.Kind {
 		case AggCount, AggCountDistinct:
 			vecs[j] = &Int64Vector{Values: []int64{0}, NullBitmap: storage.FullBitmap(1)}
-		case AggSum, AggMin, AggMax:
+		case AggMin, AggMax:
+			// One all-NULL row, in the type the schema declares for this column.
+			vecs[j] = nullVectorOfType(h.schema.Fields[j].Type)
+		case AggSum:
 			if ae.AccumType == TypeFloat64 {
 				vecs[j] = &Float64Vector{Values: []float64{0}, NullBitmap: make([]byte, 1)}
 			} else {
@@ -740,6 +979,24 @@ func (h *HashAggregate) buildEmptyGlobalResult() *Batch {
 	}
 	h.outPos = 1 // mark as emitted so subsequent Next returns nil
 	return &Batch{Schema: h.schema, Vectors: vecs, Length: 1}
+}
+
+// nullVectorOfType returns a single-row vector of type t holding one NULL.
+// The null bitmap is all-zero, which is "invalid" in this codebase's LSB-first
+// convention, so no value byte is ever read.
+func nullVectorOfType(t DataType) Vector {
+	switch t {
+	case TypeString:
+		return &StringVector{Codes: []uint32{0}, Dict: nil, NullBitmap: make([]byte, 1)}
+	case TypeFloat64:
+		return &Float64Vector{Values: []float64{0}, NullBitmap: make([]byte, 1)}
+	case TypeDate:
+		return &DateVector{Values: []int32{0}, NullBitmap: make([]byte, 1)}
+	case TypeBool:
+		return &BoolVector{Bits: make([]byte, 1), NullBitmap: make([]byte, 1), Length: 1}
+	default: // TypeInt64
+		return &Int64Vector{Values: []int64{0}, NullBitmap: make([]byte, 1)}
+	}
 }
 
 // buildGroupByVector reconstructs the group-by column values from stored samples.
@@ -785,7 +1042,19 @@ func buildGroupByVector(h *HashAggregate, keys []string, gbPos int, srcType Data
 		}
 		return out
 
-	default: // TypeInt64, TypeBool
+	case TypeBool:
+		out := &BoolVector{Bits: make([]byte, (n+7)/8), NullBitmap: make([]byte, (n+7)/8), Length: n}
+		for i, key := range keys {
+			sample := h.samples[key]
+			if sample == nil || sample[gbPos].isNull {
+				continue
+			}
+			out.Set(i, sample[gbPos].bits != 0)
+			storage.SetValidBit(out.NullBitmap, i)
+		}
+		return out
+
+	default: // TypeInt64
 		out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}
 		for i, key := range keys {
 			sample := h.samples[key]
@@ -801,6 +1070,16 @@ func buildGroupByVector(h *HashAggregate, keys []string, gbPos int, srcType Data
 
 // extractInt64 returns the raw int64 bits of a value at row index i.
 // For float64 columns, returns the IEEE bits.
+//
+// The default arm returns 0 for any vector kind with no int64 encoding — today
+// that is only *StringVector. Callers must not route a string column here
+// expecting a comparable value: this silent 0 is what made MIN/MAX over a STRING
+// column return 0 for every input, since 0 beats both MaxInt64 and MinInt64.
+// MIN/MAX now run strings through a TypeString accumulator (see strAccs) and
+// never reach this function. SUM over a STRING column still does, and still
+// yields 0 — a pre-existing defect left untouched here, since a numeric SUM of
+// text has no correct answer to converge on and rejecting it is a separate
+// behavioural change.
 func extractInt64(v Vector, i int) int64 {
 	switch col := v.(type) {
 	case *Int64Vector:

@@ -155,6 +155,59 @@ func runGoldenCase(t *testing.T, ctx context.Context, tc queryCase, cat *catalog
 	}
 }
 
+// TestStringMinMaxTakesParallelPath asserts that the string MIN/MAX corpus cases
+// are genuinely oracled against the parallel engine, not just the serial one.
+//
+// planner.Parallel falls back to planner.Physical for any plan shape it cannot
+// partition, and it does so silently — so "the parallel path agrees with the
+// reference" and "the parallel path was never built" are indistinguishable from
+// the result alone. Without this check, both the corpus's /parallel comparison
+// and any worker-invariance measurement over these queries could be vacuous.
+func TestStringMinMaxTakesParallelPath(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	_, paths := GenerateDataset(t, dir, DefaultConfig())
+	cat, err := catalog.OpenMulti(ctx, paths)
+	if err != nil {
+		t.Fatalf("OpenMulti: %v", err)
+	}
+
+	// One per parallel operator the string accumulator can end up inside.
+	queries := map[string]string{
+		"ungrouped":     "SELECT MIN(status), MAX(status) FROM orders",
+		"grouped":       "SELECT status, MIN(status) AS lo, MAX(status) AS hi FROM orders GROUP BY status",
+		"grouped_mixed": "SELECT status, MIN(status), MAX(status), SUM(amount), COUNT(*) FROM orders GROUP BY status",
+		"over_join":     "SELECT orders.status, MIN(items.category) AS lo, MAX(items.category) AS hi FROM orders, items WHERE orders.order_id = items.order_id GROUP BY orders.status",
+	}
+
+	for name, q := range queries {
+		t.Run(name, func(t *testing.T) {
+			p := sql.NewParser(q)
+			node, err := p.ParseStatement()
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			logical, err := planner.Build(ctx, node.(*sql.SelectStmt), cat)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			op, err := planner.Parallel(ctx, planner.Optimize(logical), 4)
+			if err != nil {
+				t.Fatalf("parallel plan: %v", err)
+			}
+			defer op.Close()
+
+			switch op.(type) {
+			case *exec.ParallelHashAggregate, *exec.ParallelHashJoinAggregate:
+				// genuinely parallel
+			default:
+				t.Fatalf("planner.Parallel fell back to a serial plan (%T); the /parallel "+
+					"oracle comparison for this shape would be vacuous", op)
+			}
+		})
+	}
+}
+
 // executeEngineStackedFilters runs the optimized plan with every scan predicate
 // duplicated into a LogicalFilter directly above its scan. Returns nil,nil when
 // the plan has no pushed-down predicate to duplicate.
@@ -552,6 +605,46 @@ func buildCorpus() []queryCase {
 			query: "SELECT MIN(amount), MAX(amount) FROM orders",
 		},
 
+		// --- MIN/MAX over non-numeric column types ---
+		//
+		// These were absent from the corpus, which is the whole reason the oracle
+		// never caught MIN/MAX over a STRING column returning 0: the reference
+		// evaluator has always compared strings correctly (computeAggregate →
+		// compareValues), so any one of these queries would have failed here.
+		// MIN/MAX over DATE and BOOL columns were mistyped in the same switch —
+		// the declared output type disagreed with the emitted vector — so they are
+		// covered too.
+		//
+		// The dataset's string values are drawn in random order per row group, so
+		// their dictionary codes are not in lexicographic order (codes are
+		// assigned by first occurrence). A result that agrees with the reference
+		// therefore also demonstrates the engine compares values rather than
+		// dictionary codes.
+		{
+			name:  "min_max_string",
+			query: "SELECT MIN(status), MAX(status) FROM orders",
+		},
+		{
+			name:  "min_max_string_and_count",
+			query: "SELECT MIN(status) AS lo, MAX(status) AS hi, COUNT(status) AS non_null, COUNT(*) AS total FROM orders",
+		},
+		{
+			name:  "min_max_string_all_null",
+			query: "SELECT MIN(status), MAX(status), COUNT(status) FROM orders WHERE status IS NULL",
+		},
+		{
+			name:  "min_max_string_no_rows",
+			query: "SELECT MIN(status), MAX(status), COUNT(*) FROM orders WHERE order_id > 999999",
+		},
+		{
+			name:  "min_max_date",
+			query: "SELECT MIN(order_date), MAX(order_date) FROM orders",
+		},
+		{
+			name:  "min_max_bool",
+			query: "SELECT MIN(is_express), MAX(is_express) FROM orders",
+		},
+
 		// --- GROUP BY ---
 		{
 			name:  "group_by_string",
@@ -560,6 +653,46 @@ func buildCorpus() []queryCase {
 		{
 			name:  "group_by_multi_agg",
 			query: "SELECT status, COUNT(*), SUM(amount), AVG(amount) FROM orders GROUP BY status",
+		},
+
+		// --- GROUP BY with string MIN/MAX ---
+		//
+		// Two group-key shapes on purpose: grouping by a dict-encoded STRING
+		// column takes the packed-dictionary-code integer-key fast path
+		// (exec.canUseIntKey), while grouping by any other type falls back to the
+		// composite string-key path. They keep separate accumulator maps, so a fix
+		// to one does not cover the other.
+		{
+			name:  "min_max_string_grouped_by_string",
+			query: "SELECT status, MIN(status) AS lo, MAX(status) AS hi, COUNT(*) AS cnt FROM orders GROUP BY status",
+		},
+		{
+			name:  "min_max_string_grouped_by_bool",
+			query: "SELECT is_express, MIN(status) AS lo, MAX(status) AS hi FROM orders GROUP BY is_express",
+		},
+		{
+			name:  "min_max_string_grouped_by_int",
+			query: "SELECT customer_id, MIN(status) AS lo, MAX(status) AS hi, COUNT(status) AS n FROM orders GROUP BY customer_id",
+		},
+		{
+			name:  "min_max_string_mixed_with_numeric",
+			query: "SELECT status, COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount), MIN(order_date), MAX(order_date), MIN(status), MAX(status) FROM orders GROUP BY status",
+		},
+		{
+			name:  "min_max_string_grouped_filtered",
+			query: "SELECT status, MIN(status) AS lo, MAX(status) AS hi FROM orders WHERE amount > 5000.0 GROUP BY status",
+		},
+		{
+			name:    "min_max_string_ordered",
+			query:   "SELECT status, MIN(status) AS lo, MAX(status) AS hi FROM orders GROUP BY status ORDER BY status",
+			ordered: true,
+		},
+		{
+			// Cross-column: the aggregated string comes from the probe side of a
+			// join, so this covers the parallel join → partial aggregate → merge
+			// path with a string accumulator in it.
+			name:  "min_max_string_over_join",
+			query: "SELECT orders.status, MIN(items.category) AS lo, MAX(items.category) AS hi, COUNT(*) AS cnt FROM orders, items WHERE orders.order_id = items.order_id GROUP BY orders.status",
 		},
 
 		// --- HAVING ---

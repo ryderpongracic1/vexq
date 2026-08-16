@@ -37,6 +37,7 @@ type intKeyState struct {
 	intGroups  map[uint64][]int64      // key → accumulators
 	intNonNull map[uint64][]int64      // key → per-aggregate non-null count
 	intSamples map[uint64][]groupByVal // key → representative values
+	intStrAccs map[uint64][]string     // key → string MIN/MAX values (see HashAggregate.strAccs)
 
 	// Reused per-batch buffers: the GROUP BY columns' string vectors and their
 	// local→global remap tables for the batch being accumulated. See
@@ -68,6 +69,7 @@ func (ik *intKeyState) init(numGroupByCols int) {
 	ik.intGroups = make(map[uint64][]int64)
 	ik.intNonNull = make(map[uint64][]int64)
 	ik.intSamples = make(map[uint64][]groupByVal)
+	ik.intStrAccs = make(map[uint64][]string)
 	ik.globalDicts = make([]*storage.DictBuilder, numGroupByCols)
 	ik.shifts = make([]uint8, numGroupByCols)
 	ik.widths = make([]uint8, numGroupByCols)
@@ -164,6 +166,9 @@ func (ik *intKeyState) materializeToStringMaps(h *HashAggregate) {
 		h.groups[strKey] = ik.intGroups[intKey]
 		h.aggNonNull[strKey] = ik.intNonNull[intKey]
 		h.samples[strKey] = ik.intSamples[intKey]
+		if h.hasStrAgg {
+			h.strAccs[strKey] = ik.intStrAccs[intKey]
+		}
 	}
 }
 
@@ -221,6 +226,7 @@ func (h *HashAggregate) accumulateIntKey(batch *Batch, rows rowSet, aggVecs []Ve
 			ik.intGroups = nil
 			ik.intNonNull = nil
 			ik.intSamples = nil
+			ik.intStrAccs = nil
 		}
 		return h.accumulateStringKey(batch, rows, aggVecs)
 	}
@@ -256,25 +262,12 @@ func (h *HashAggregate) accumulateIntKey(batch *Batch, rows rowSet, aggVecs []Ve
 
 		accs, exists := ik.intGroups[key]
 		if !exists {
-			accs = make([]int64, len(h.aggExprs))
-			for j, ae := range h.aggExprs {
-				switch ae.Kind {
-				case AggMin:
-					if ae.AccumType == TypeFloat64 {
-						accs[j] = int64(math.Float64bits(math.MaxFloat64))
-					} else {
-						accs[j] = math.MaxInt64
-					}
-				case AggMax:
-					if ae.AccumType == TypeFloat64 {
-						accs[j] = int64(math.Float64bits(-math.MaxFloat64))
-					} else {
-						accs[j] = math.MinInt64
-					}
-				}
-			}
+			accs = h.newAccums()
 			ik.intGroups[key] = accs
 			ik.intNonNull[key] = make([]int64, len(h.aggExprs))
+			if h.hasStrAgg {
+				ik.intStrAccs[key] = h.newStrAccums()
+			}
 			ik.intKeys = append(ik.intKeys, key)
 
 			// Store sample for output reconstruction.
@@ -287,129 +280,27 @@ func (h *HashAggregate) accumulateIntKey(batch *Batch, rows rowSet, aggVecs []Ve
 		}
 
 		nonNull := ik.intNonNull[key]
-		for j, ae := range h.aggExprs {
-			v := aggVecs[j]
-			switch ae.Kind {
-			case AggCount:
-				if ae.ColIdx < 0 {
-					accs[j]++
-					nonNull[j]++
-				} else if !v.IsNull(rowIdx) {
-					accs[j]++
-					nonNull[j]++
-				}
-			case AggSum:
-				if v.IsNull(rowIdx) {
-					continue
-				}
-				nonNull[j]++
-				if ae.AccumType == TypeFloat64 {
-					fv := v.(*Float64Vector)
-					cur := math.Float64frombits(uint64(accs[j]))
-					accs[j] = int64(math.Float64bits(cur + fv.Values[rowIdx]))
-				} else {
-					accs[j] += extractInt64(v, rowIdx)
-				}
-			case AggAvg:
-				if v.IsNull(rowIdx) {
-					continue
-				}
-				nonNull[j]++
-				if fv, ok := v.(*Float64Vector); ok {
-					cur := math.Float64frombits(uint64(accs[j]))
-					accs[j] = int64(math.Float64bits(cur + fv.Values[rowIdx]))
-				} else {
-					cur := math.Float64frombits(uint64(accs[j]))
-					accs[j] = int64(math.Float64bits(cur + float64(extractInt64(v, rowIdx))))
-				}
-			case AggMin:
-				if v.IsNull(rowIdx) {
-					continue
-				}
-				nonNull[j]++
-				val := extractInt64(v, rowIdx)
-				if ae.AccumType == TypeFloat64 {
-					if math.Float64frombits(uint64(val)) < math.Float64frombits(uint64(accs[j])) {
-						accs[j] = val
-					}
-				} else if val < accs[j] {
-					accs[j] = val
-				}
-			case AggMax:
-				if v.IsNull(rowIdx) {
-					continue
-				}
-				nonNull[j]++
-				val := extractInt64(v, rowIdx)
-				if ae.AccumType == TypeFloat64 {
-					if math.Float64frombits(uint64(val)) > math.Float64frombits(uint64(accs[j])) {
-						accs[j] = val
-					}
-				} else if val > accs[j] {
-					accs[j] = val
-				}
-			}
+		var strs []string
+		if h.hasStrAgg {
+			strs = ik.intStrAccs[key]
 		}
+		h.foldRow(accs, nonNull, strs, aggVecs, rowIdx)
 	}
 	return nil
 }
 
-// accumulateStringKey is the original string-key path, extracted so it can be
-// called as a fallback when intkey overflows or encounters non-dict columns.
+// foldRow folds one input row into a single group's accumulators.
 //
-// rows names the physical rows of the batch to visit; see rowSet in batch.go.
-func (h *HashAggregate) accumulateStringKey(batch *Batch, rows rowSet, aggVecs []Vector) error {
-	for ri := 0; ri < rows.n; ri++ {
-		rowIdx := rows.at(ri)
-		key := h.buildKey(batch, rowIdx)
-		h.accumulateOneRow(key, batch, rowIdx, aggVecs)
-	}
-	return nil
-}
-
-// accumulateOneRow inserts or updates a single row into the string-keyed maps.
-func (h *HashAggregate) accumulateOneRow(key string, batch *Batch, rowIdx int, aggVecs []Vector) {
-	accs, exists := h.groups[key]
-	if !exists {
-		accs = make([]int64, len(h.aggExprs))
-		for j, ae := range h.aggExprs {
-			switch ae.Kind {
-			case AggMin:
-				if ae.AccumType == TypeFloat64 {
-					accs[j] = int64(math.Float64bits(math.MaxFloat64))
-				} else {
-					accs[j] = math.MaxInt64
-				}
-			case AggMax:
-				if ae.AccumType == TypeFloat64 {
-					accs[j] = int64(math.Float64bits(-math.MaxFloat64))
-				} else {
-					accs[j] = math.MinInt64
-				}
-			}
-		}
-		h.groups[key] = accs
-		h.aggNonNull[key] = make([]int64, len(h.aggExprs))
-		h.keys = append(h.keys, key)
-		sample := make([]groupByVal, len(h.groupBy))
-		for si, colIdx := range h.groupBy {
-			v := batch.Vectors[colIdx]
-			if v.IsNull(rowIdx) {
-				sample[si] = groupByVal{isNull: true}
-			} else if sv, ok := v.(*StringVector); ok {
-				var s string
-				if sv.Dict != nil {
-					s = sv.Dict.Get(sv.Codes[rowIdx])
-				}
-				sample[si] = groupByVal{strVal: s}
-			} else {
-				sample[si] = groupByVal{bits: uint64(extractInt64(v, rowIdx))}
-			}
-		}
-		h.samples[key] = sample
-	}
-
-	nonNull := h.aggNonNull[key]
+// It is shared by accumulateIntKey and accumulateOneRow, which previously each
+// carried their own copy of this switch alongside the two in aggregate.go. Four
+// copies of one fold is how MIN/MAX over strings had to be fixed in four places
+// at once; two of them now route here.
+//
+// accs, nonNull and strs are the group's int64 accumulators, per-aggregate
+// non-null counts, and string accumulators (nil when the operator has no
+// string-valued aggregate). COUNT(DISTINCT) is not handled: both callers run
+// only when h.hasDistinct is false.
+func (h *HashAggregate) foldRow(accs, nonNull []int64, strs []string, aggVecs []Vector, rowIdx int) {
 	for j, ae := range h.aggExprs {
 		v := aggVecs[j]
 		switch ae.Kind {
@@ -438,39 +329,82 @@ func (h *HashAggregate) accumulateOneRow(key string, batch *Batch, rowIdx int, a
 				continue
 			}
 			nonNull[j]++
+			cur := math.Float64frombits(uint64(accs[j]))
 			if fv, ok := v.(*Float64Vector); ok {
-				cur := math.Float64frombits(uint64(accs[j]))
 				accs[j] = int64(math.Float64bits(cur + fv.Values[rowIdx]))
 			} else {
-				cur := math.Float64frombits(uint64(accs[j]))
 				accs[j] = int64(math.Float64bits(cur + float64(extractInt64(v, rowIdx))))
 			}
-		case AggMin:
+		case AggMin, AggMax:
 			if v.IsNull(rowIdx) {
+				continue
+			}
+			less := ae.Kind == AggMin
+			if ae.AccumType == TypeString {
+				minMaxString(strs, j, v.(*StringVector).Get(rowIdx), nonNull[j] > 0, less)
+				nonNull[j]++
 				continue
 			}
 			nonNull[j]++
 			val := extractInt64(v, rowIdx)
 			if ae.AccumType == TypeFloat64 {
-				if math.Float64frombits(uint64(val)) < math.Float64frombits(uint64(accs[j])) {
+				cur := math.Float64frombits(uint64(accs[j]))
+				fv := math.Float64frombits(uint64(val))
+				if (less && fv < cur) || (!less && fv > cur) {
 					accs[j] = val
 				}
-			} else if val < accs[j] {
-				accs[j] = val
-			}
-		case AggMax:
-			if v.IsNull(rowIdx) {
-				continue
-			}
-			nonNull[j]++
-			val := extractInt64(v, rowIdx)
-			if ae.AccumType == TypeFloat64 {
-				if math.Float64frombits(uint64(val)) > math.Float64frombits(uint64(accs[j])) {
-					accs[j] = val
-				}
-			} else if val > accs[j] {
+			} else if (less && val < accs[j]) || (!less && val > accs[j]) {
 				accs[j] = val
 			}
 		}
 	}
+}
+
+// accumulateStringKey is the original string-key path, extracted so it can be
+// called as a fallback when intkey overflows or encounters non-dict columns.
+//
+// rows names the physical rows of the batch to visit; see rowSet in batch.go.
+func (h *HashAggregate) accumulateStringKey(batch *Batch, rows rowSet, aggVecs []Vector) error {
+	for ri := 0; ri < rows.n; ri++ {
+		rowIdx := rows.at(ri)
+		key := h.buildKey(batch, rowIdx)
+		h.accumulateOneRow(key, batch, rowIdx, aggVecs)
+	}
+	return nil
+}
+
+// accumulateOneRow inserts or updates a single row into the string-keyed maps.
+func (h *HashAggregate) accumulateOneRow(key string, batch *Batch, rowIdx int, aggVecs []Vector) {
+	accs, exists := h.groups[key]
+	if !exists {
+		accs = h.newAccums()
+		h.groups[key] = accs
+		h.aggNonNull[key] = make([]int64, len(h.aggExprs))
+		if h.hasStrAgg {
+			h.strAccs[key] = h.newStrAccums()
+		}
+		h.keys = append(h.keys, key)
+		sample := make([]groupByVal, len(h.groupBy))
+		for si, colIdx := range h.groupBy {
+			v := batch.Vectors[colIdx]
+			if v.IsNull(rowIdx) {
+				sample[si] = groupByVal{isNull: true}
+			} else if sv, ok := v.(*StringVector); ok {
+				var s string
+				if sv.Dict != nil {
+					s = sv.Dict.Get(sv.Codes[rowIdx])
+				}
+				sample[si] = groupByVal{strVal: s}
+			} else {
+				sample[si] = groupByVal{bits: uint64(extractInt64(v, rowIdx))}
+			}
+		}
+		h.samples[key] = sample
+	}
+
+	var strs []string
+	if h.hasStrAgg {
+		strs = h.strAccs[key]
+	}
+	h.foldRow(accs, h.aggNonNull[key], strs, aggVecs, rowIdx)
 }
