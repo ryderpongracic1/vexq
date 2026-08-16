@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/ryderpongracic1/vexq/storage"
@@ -575,6 +576,369 @@ func probeSteps(t *joinHashTable, key int64) int {
 		}
 		i = (i + 1) & t.mask
 	}
+}
+
+// ---- Row store growth policy ------------------------------------------------
+
+// TestNextRowCap pins the growth policy: double, floored, never short of what was
+// asked for, and never past the largest row an int32 index can address.
+func TestNextRowCap(t *testing.T) {
+	cases := []struct {
+		cur, need, want int
+	}{
+		{0, 1, rowStoreMinRows},                                     // first append jumps to the floor
+		{0, rowStoreMinRows + 1, rowStoreMinRows + 1},               // ... unless more is needed at once
+		{rowStoreMinRows, rowStoreMinRows + 1, 2 * rowStoreMinRows}, // then doubling takes over
+		{1000, 1001, 2000},
+		{1 << 20, (1 << 20) + 1, 1 << 21},
+		// Near the ceiling: doubling is clamped, and the clamp still satisfies
+		// need, because reserve refuses to ask for more than maxBuildRows rows.
+		{int(maxBuildRows) - 10, int(maxBuildRows) - 9, int(maxBuildRows)},
+		{int(maxBuildRows), int(maxBuildRows), int(maxBuildRows)},
+	}
+	for _, c := range cases {
+		got := nextRowCap(c.cur, c.need)
+		if got != c.want {
+			t.Errorf("nextRowCap(%d, %d) = %d, want %d", c.cur, c.need, got, c.want)
+		}
+		if got < c.need {
+			t.Errorf("nextRowCap(%d, %d) = %d, short of need", c.cur, c.need, got)
+		}
+		if int64(got) > maxBuildRows {
+			t.Errorf("nextRowCap(%d, %d) = %d, past maxBuildRows", c.cur, c.need, got)
+		}
+	}
+}
+
+// TestRowStoreGrowthDoubles pins the mechanism the allocation win rests on: the
+// row capacity doubles rather than creeping, so filling N rows costs O(log N)
+// reallocations, and a store presized to N never reallocates at all.
+func TestRowStoreGrowthDoubles(t *testing.T) {
+	schema, batch := mixedTypeBuildBatch()
+	store := newRowStore(schema, 0)
+	var caps []int
+	for range 200 {
+		before := store.capRows
+		if _, err := store.appendFrom(batch, 0); err != nil {
+			t.Fatalf("appendFrom: %v", err)
+		}
+		if store.capRows != before {
+			caps = append(caps, store.capRows)
+		}
+	}
+	want := []int{8, 16, 32, 64, 128, 256}
+	if !reflect.DeepEqual(caps, want) {
+		t.Errorf("capacity steps = %v, want %v", caps, want)
+	}
+
+	presized := newRowStore(schema, 200)
+	for range 200 {
+		if _, err := presized.appendFrom(batch, 0); err != nil {
+			t.Fatalf("appendFrom: %v", err)
+		}
+	}
+	if presized.capRows != 200 {
+		t.Errorf("presized store reallocated: capRows = %d, want 200", presized.capRows)
+	}
+}
+
+// TestRowStoreGrowthMatchesAppendGrowth is the equivalence statement for the
+// growth rewrite: the doubling policy must leave the arrays exactly what the
+// previous append-per-row policy left them — same lengths, same payloads at the
+// same indices, and the same zero fill where nothing has been written.
+//
+// Both stores are filled with the same real rows through the same writeRow, so
+// the only difference between them is the growth policy. That is what makes this
+// an equivalence test rather than a length check.
+func TestRowStoreGrowthMatchesAppendGrowth(t *testing.T) {
+	schema, batch := mixedTypeBuildBatch()
+	// Row counts either side of every doubling boundary, so a policy that grew
+	// by too little or reslice arithmetic that was off by a row would show up.
+	for _, rows := range []int{0, 1, 2, 7, 8, 9, 15, 16, 17, 100, 255, 256, 257, 1000} {
+		got := newRowStore(schema, 0)  // doubling: the policy under test
+		want := newRowStore(schema, 0) // append-per-row: the previous policy
+		for i := range rows {
+			src := i % batch.Length
+			row, err := got.appendFrom(batch, src)
+			if err != nil {
+				t.Fatalf("rows=%d: appendFrom: %v", rows, err)
+			}
+			appendGrowOneRow(want)
+			want.writeRow(row, batch, src)
+		}
+		if !reflect.DeepEqual(got.values, want.values) {
+			t.Errorf("rows=%d: values differ (len %d vs %d)", rows, len(got.values), len(want.values))
+		}
+		if !reflect.DeepEqual(got.nulls, want.nulls) {
+			t.Errorf("rows=%d: nulls differ (len %d vs %d)", rows, len(got.nulls), len(want.nulls))
+		}
+		if !reflect.DeepEqual(got.strs, want.strs) {
+			t.Errorf("rows=%d: strs differ (len %d vs %d)", rows, len(got.strs), len(want.strs))
+		}
+		if !reflect.DeepEqual(got.next, want.next) {
+			t.Errorf("rows=%d: next differs (len %d vs %d)", rows, len(got.next), len(want.next))
+		}
+		if got.rows() != want.rows() || got.rows() != rows {
+			t.Errorf("rows=%d: row counts %d and %d", rows, got.rows(), want.rows())
+		}
+	}
+}
+
+// TestRowStoreReservedRowIsZero covers the invariant appendFrom depends on: a row
+// the growth path has just exposed reads as an all-NULL-free row of zeros, with
+// "" in its string slot, before anything writes to it.
+func TestRowStoreReservedRowIsZero(t *testing.T) {
+	schema, _ := mixedTypeBuildBatch()
+	store := newRowStore(schema, 0)
+	// Reserve across several doublings; check every row, because a growth path
+	// that failed to zero would most likely do so only for the copied region.
+	for i := range 300 {
+		row, err := store.reserve()
+		if err != nil {
+			t.Fatalf("reserve: %v", err)
+		}
+		if int(row) != i {
+			t.Fatalf("reserve returned row %d, want %d", row, i)
+		}
+		for col := range schema.Fields {
+			if store.isNull(row, col) {
+				t.Errorf("row %d col %d: fresh row reports NULL, want NULL-free", row, col)
+			}
+			if v := store.value(row, col); v != 0 {
+				t.Errorf("row %d col %d: fresh row value = %d, want 0", row, col, v)
+			}
+			if s := store.str(row, col); s != "" {
+				t.Errorf("row %d col %d: fresh row string = %q, want empty", row, col, s)
+			}
+		}
+		if store.next[row] != 0 {
+			t.Errorf("row %d: fresh next = %d, want 0", row, store.next[row])
+		}
+	}
+}
+
+// TestRowStoreGrowthKeepsEarlierRows crosses many growth steps with a multi-column
+// schema that includes a string column — the string window is the array whose
+// per-row width differs from numCols, so it is where growth arithmetic is most
+// likely to go wrong — and checks every earlier row still resolves to its own
+// payload at its original index.
+func TestRowStoreGrowthKeepsEarlierRows(t *testing.T) {
+	const n = 3000
+	schema, batch := mixedTypeBuildBatch()
+	store := newRowStore(schema, 0)
+	rows := make([]int32, n)
+	for i := range n {
+		row, err := store.appendFrom(batch, i%batch.Length)
+		if err != nil {
+			t.Fatalf("appendFrom(%d): %v", i, err)
+		}
+		rows[i] = row
+	}
+	for i, row := range rows {
+		src := i % batch.Length
+		if got, want := store.value(row, 0), int64(7+src); got != want {
+			t.Fatalf("row %d key = %d, want %d", i, got, want)
+		}
+		wantStr := []string{"alpha", "", "beta"}[src]
+		if got := store.str(row, 1); got != wantStr {
+			t.Fatalf("row %d string = %q, want %q", i, got, wantStr)
+		}
+		// Row 1 of the fixture is NULL in every non-key column.
+		for col := 1; col < len(schema.Fields); col++ {
+			if got, want := store.isNull(row, col), src == 1; got != want {
+				t.Fatalf("row %d col %d NULL = %v, want %v", i, col, got, want)
+			}
+		}
+	}
+}
+
+// TestRowStoreOverflowFiresBeforeAllocating pins maxBuildRows: the error fires at
+// the same threshold as before, and it fires before the growth path allocates —
+// so a store at the ceiling cannot be made to attempt a doubled allocation.
+//
+// There is deliberately no positive case one row below the ceiling: accepting
+// that row means growing to maxBuildRows rows, which is tens of gigabytes. The
+// threshold is pinned by the constant below and the refusal above; that the
+// growth policy respects the same ceiling is TestNextRowCap's last two cases.
+func TestRowStoreOverflowFiresBeforeAllocating(t *testing.T) {
+	if maxBuildRows != int64(math.MaxInt32) {
+		t.Errorf("maxBuildRows = %d, want %d — the overflow threshold moved", maxBuildRows, math.MaxInt32)
+	}
+
+	store := newRowStore(oneColSchema(), 0)
+	// Fake a full store rather than materialising 2^31 rows: reserve reads only
+	// s.n to decide, which is exactly the behaviour under test.
+	store.n = int32(maxBuildRows)
+	capBefore, lenBefore := store.capRows, len(store.values)
+
+	row, err := store.reserve()
+	if err == nil {
+		t.Fatal("reserve at maxBuildRows returned no error")
+	}
+	if row != noRow {
+		t.Errorf("reserve returned row %d, want noRow", row)
+	}
+	if store.n != int32(maxBuildRows) {
+		t.Errorf("n = %d after a refused reserve, want %d", store.n, maxBuildRows)
+	}
+	if store.capRows != capBefore || len(store.values) != lenBefore {
+		t.Errorf("refused reserve allocated: capRows %d->%d, len %d->%d",
+			capBefore, store.capRows, lenBefore, len(store.values))
+	}
+}
+
+// TestSizedRowStoreConcurrentSetFromTouchesNoSharedState is the parallel build's
+// pass-2 contract. A sized store must need no growth and hold no cursor, so
+// several goroutines can fill disjoint index ranges at once. Run under -race this
+// fails if the growth rewrite introduced any shared mutable state.
+func TestSizedRowStoreConcurrentSetFromTouchesNoSharedState(t *testing.T) {
+	const (
+		workers = 8
+		perWork = 250
+		total   = workers * perWork
+	)
+	schema, batch := mixedTypeBuildBatch()
+	src := newRowStore(schema, 0)
+	for i := range total {
+		if _, err := src.appendFrom(batch, i%batch.Length); err != nil {
+			t.Fatalf("appendFrom: %v", err)
+		}
+	}
+
+	dst := newSizedRowStore(schema, total)
+	capBefore := dst.capRows
+	lens := [4]int{len(dst.values), len(dst.nulls), len(dst.strs), len(dst.next)}
+
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := w * perWork; i < (w+1)*perWork; i++ {
+				dst.setFrom(int32(i), src, int32(i))
+			}
+		}()
+	}
+	wg.Wait()
+
+	if dst.capRows != capBefore {
+		t.Errorf("capRows moved during concurrent setFrom: %d -> %d", capBefore, dst.capRows)
+	}
+	if got := [4]int{len(dst.values), len(dst.nulls), len(dst.strs), len(dst.next)}; got != lens {
+		t.Errorf("array lengths moved during concurrent setFrom: %v -> %v", lens, got)
+	}
+	for i := range total {
+		r := int32(i)
+		for col := range schema.Fields {
+			if src.value(r, col) != dst.value(r, col) || src.str(r, col) != dst.str(r, col) ||
+				src.isNull(r, col) != dst.isNull(r, col) {
+				t.Fatalf("row %d col %d not copied", i, col)
+			}
+		}
+	}
+}
+
+// appendGrowOneRow grows a store by one row the way reserve did before this
+// change: extend each array with append(sl, make([]T, k)...), letting append pick
+// the growth factor. Kept as a test fixture because the growth rewrite's whole
+// claim is that it is equivalent to this but allocates less, and both halves of
+// that claim need this shape to compare against — the equivalence test above and
+// BenchmarkRowStoreGrowth below.
+//
+// FROZEN: this is a replica of the pre-rewrite growth path, not a second
+// implementation of the current one. Do not "fix" it to match reserve — that
+// would delete the comparison. It does need updating if rowStore gains another
+// per-row array, so that it keeps growing everything reserve grows.
+func appendGrowOneRow(s *rowStore) {
+	s.n++
+	if need := int(s.n) * s.numCols; len(s.values) < need {
+		s.values = append(s.values, make([]int64, need-len(s.values))...)
+		s.nulls = append(s.nulls, make([]bool, need-len(s.nulls))...)
+	}
+	if s.strWidth > 0 {
+		if need := int(s.n) * s.strWidth; len(s.strs) < need {
+			s.strs = append(s.strs, make([]string, need-len(s.strs))...)
+		}
+	}
+	if len(s.next) < int(s.n) {
+		s.next = append(s.next, make([]int32, int(s.n)-len(s.next))...)
+	}
+}
+
+// BenchmarkRowStoreGrowth is the measurement the growth design rests on. It
+// separates the two candidate causes of reserve's 41% share of join-path bytes:
+//
+//	append-from-zero   the previous policy — one append(sl, make([]T, k)...) per
+//	                   row per array, growing from no capacity at all
+//	doubling-from-zero this policy — explicit make+copy at twice the row capacity
+//	presized           the ceiling — a caller-supplied row count, no growth at all
+//
+// Read the allocs/op of append-from-zero against the row count: a per-row make
+// temporary would put it at ~4 allocations per row. It does not, which refutes
+// the temporary as a cause (the compiler's extendslice optimisation turns the
+// pattern into growslice+memclr — confirmed in the generated assembly, no
+// runtime.makeslice call in reserve). What is left is the growth factor: append
+// grows a large slice by ~1.25x, so it churns ~5x the final payload, where
+// doubling churns ~2x and presizing churns 1x.
+func BenchmarkRowStoreGrowth(b *testing.B) {
+	const rows = 200_000
+	schema, batch := mixedTypeBuildBatch()
+
+	b.Run("append-from-zero", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			s := newRowStore(schema, 0)
+			for range rows {
+				appendGrowOneRow(s)
+			}
+		}
+	})
+	b.Run("doubling-from-zero", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			s := newRowStore(schema, 0)
+			for range rows {
+				if _, err := s.reserve(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("presized", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			s := newRowStore(schema, rows)
+			for range rows {
+				if _, err := s.reserve(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	// The same three policies with real row payloads, so the growth cost is
+	// measured against the work it carries rather than in isolation.
+	b.Run("appendFrom-doubling", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			s := newRowStore(schema, 0)
+			for i := range rows {
+				if _, err := s.appendFrom(batch, i%batch.Length); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("appendFrom-presized", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			s := newRowStore(schema, rows)
+			for i := range rows {
+				if _, err := s.appendFrom(batch, i%batch.Length); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
 }
 
 // ---- Fixtures ---------------------------------------------------------------
