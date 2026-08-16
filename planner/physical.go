@@ -172,6 +172,31 @@ func buildPreProjection(n *LogicalAggregate, child exec.Operator) (exec.Operator
 // will be presented to the aggregate operator (post-pre-projection if any).
 // Called by both physicalAggregate and Parallel.
 func resolveAggConfig(n *LogicalAggregate, schema exec.Schema) (groupByIdxs []int, aggExprs []exec.AggExpr, err error) {
+	// Known limitation — GROUP BY resolves only against the child's schema.
+	//
+	// Two things are unsupported here, and a GROUP BY on a CASE WHEN output alias
+	// needs both, which is why it is not a small fix:
+	//
+	//  1. Output aliases. buildAggregate (build.go) passes stmt.GroupBy through
+	//     verbatim, so nothing maps a SELECT-list alias back to the expression it
+	//     names. This is not specific to CASE WHEN — `SELECT c AS x ... GROUP BY x`
+	//     fails for a plain column too. The error a user sees comes from further
+	//     down: pruneColumns collects predicateCols(gb) into the scan's
+	//     needed-column set, so an alias reaches TableScan as a column name and
+	//     the failure reads `scan "t": column "x" not found` rather than naming
+	//     GROUP BY.
+	//  2. Expressions. Resolving the alias in case 1 yields a non-ColumnRefExpr,
+	//     which the check below rejects. Supporting it needs the same treatment
+	//     aggregate arguments get — a pre-projection materialising the expression
+	//     into a synthetic column (buildPreProjection, the _agg_N path), the
+	//     expression's real source columns pushed to the scan instead of the
+	//     synthetic name, the group-by output column typed and named from the
+	//     alias, and the equivalent per-morsel pre-projection on the parallel
+	//     path (planner/parallel.go).
+	//
+	// Fixing only (1) would move a CASE WHEN alias from "column not found" to
+	// "GROUP BY only supports column references" without making the query work,
+	// so both belong in one change, scoped as a feature rather than a bug fix.
 	for _, gbExpr := range n.GroupBy {
 		cr, ok := gbExpr.(*sql.ColumnRefExpr)
 		if !ok {
@@ -205,7 +230,6 @@ func resolveAggConfig(n *LogicalAggregate, schema exec.Schema) (groupByIdxs []in
 			ae.ColIdx = schema.IndexOf(agg.ColName)
 		case "AVG":
 			ae.Kind = exec.AggAvg
-			ae.AccumType = exec.TypeFloat64
 			ae.ColIdx = schema.IndexOf(agg.ColName)
 		case "MIN":
 			ae.Kind = exec.AggMin
@@ -220,14 +244,15 @@ func resolveAggConfig(n *LogicalAggregate, schema exec.Schema) (groupByIdxs []in
 		if ae.ColIdx == -1 && !(ae.Kind == exec.AggCount && agg.ColName == "") {
 			return nil, nil, fmt.Errorf("planner: aggregate column %q not found in schema", agg.ColName)
 		}
-		// Set AccumType for SUM/MIN/MAX based on source column type.
-		if ae.Kind == exec.AggSum || ae.Kind == exec.AggMin || ae.Kind == exec.AggMax {
-			if ae.ColIdx >= 0 && schema.Fields[ae.ColIdx].Type == exec.TypeFloat64 {
-				ae.AccumType = exec.TypeFloat64
-			} else {
-				ae.AccumType = exec.TypeInt64
-			}
+		// Resolve the accumulator encoding. Shared with exec.NewHashAggregate
+		// via exec.AccumTypeFor so the serial and parallel paths cannot
+		// disagree: the parallel path builds its per-worker partial aggregates
+		// directly from these AggExprs, never through NewHashAggregate.
+		srcType := exec.TypeInt64
+		if ae.ColIdx >= 0 {
+			srcType = schema.Fields[ae.ColIdx].Type
 		}
+		ae.AccumType = exec.AccumTypeFor(ae.Kind, srcType)
 		aggExprs = append(aggExprs, ae)
 	}
 	return groupByIdxs, aggExprs, nil
