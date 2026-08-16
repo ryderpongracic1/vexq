@@ -106,16 +106,80 @@ func (db *DictBuilder) Marshal() []byte {
 // ---- Dictionary (reader side) ----------------------------------------------
 
 // Dictionary is the read-side representation of a per-row-group string dictionary.
+//
+// Content immutability: Offsets and Data are written once, by the constructor,
+// and never again. Data is always a private allocation — UnmarshalDictionary
+// copies out of the buffer it parses — so it is never a view into a Reader's
+// pooled section window and never changes under a string that Get returned.
+//
+// Single-goroutine ownership: Get memoises into cache, so Get is a mutating
+// method and a *Dictionary must not be read by two goroutines at once. Every
+// production path satisfies this because a Dictionary is reachable only from the
+// thing that made it:
+//
+//   - Read path: ColumnReader.Dictionary() parses one per (row group, column)
+//     behind a sync.Once and caches it on that ColumnReader. ColumnReaders belong
+//     to one Reader, a Reader is single-goroutine by contract, and each parallel
+//     worker opens its own Reader — so two workers never hold the same
+//     *Dictionary even when they scan the same file.
+//   - Output path: newStringVector marshals a DictBuilder and parses the result,
+//     producing a fresh Dictionary per output batch in the goroutine that built
+//     it.
+//   - Cross-goroutine handoffs materialise strings before they hand anything off:
+//     the join's build side copies Get's results into rowStore.strs, and the
+//     parallel aggregate flattens its integer-key state to string keys, both
+//     inside the owning worker and before the channel send. No *Dictionary and no
+//     Batch is ever sent to another goroutine, so a Dictionary is never live in
+//     two goroutines at once.
+//
+// A future operator that hands batches across a goroutine boundary would break
+// this — but it would first break TableScan's rule that a Batch is only valid
+// until the next Next() call, which is the louder of the two.
 type Dictionary struct {
 	Offsets []uint32
 	Data    []byte
+
+	// cache memoises Get per code. Sized len(Offsets) on first use; see Get.
+	cache []string
 }
 
 // Get returns the string for code. Panics if code is out of range.
+//
+// The result is memoised per code. A dictionary-encoded column repeats a small
+// number of distinct values across a row group's 65,536 rows — three return
+// flags, seven ship modes — so the first lookup of a code copies out of Data and
+// every later lookup of it is a slice index. Before memoisation this copied per
+// lookup, which at 13.4M lookups was 88% of every object the join path
+// allocated.
+//
+// The cost is one []string of len(Offsets) per Dictionary that is read at all:
+// 16 bytes per entry, so 112 bytes for a seven-value column and 1 MB for a
+// pathological 65,536-entry one. That is bounded per row group and dies with the
+// ColumnReader that parsed it.
+//
+// Get mutates the memo, so it is not safe to call on one Dictionary from two
+// goroutines at once. See the ownership note on Dictionary.
 func (d *Dictionary) Get(code uint32) string {
 	if int(code) >= len(d.Offsets) {
 		panic(fmt.Sprintf("storage: dict code %d out of range (len %d)", code, len(d.Offsets)))
 	}
+	if int(code) < len(d.cache) {
+		// "" doubles as the not-yet-memoised sentinel, and that costs nothing:
+		// an empty dictionary entry is a zero-length []byte→string conversion,
+		// which Go satisfies with the empty string constant and no allocation.
+		// So a miss on an empty entry is exactly as cheap as a hit would have
+		// been, and no parallel "is populated" bitmap is needed to tell a
+		// cached empty string from an unpopulated slot.
+		if s := d.cache[code]; s != "" {
+			return s
+		}
+	} else {
+		// Sized on first use rather than in the constructor, so a Dictionary
+		// that is parsed but never read costs nothing, and a Dictionary built as
+		// a struct literal (which tests do) needs no constructor to be correct.
+		d.cache = make([]string, len(d.Offsets))
+	}
+
 	start := d.Offsets[code]
 	var end uint32
 	if int(code)+1 < len(d.Offsets) {
@@ -123,7 +187,9 @@ func (d *Dictionary) Get(code uint32) string {
 	} else {
 		end = uint32(len(d.Data))
 	}
-	return string(d.Data[start:end])
+	s := string(d.Data[start:end])
+	d.cache[code] = s
+	return s
 }
 
 // Len returns the number of entries in the dictionary.
@@ -141,6 +207,12 @@ func (d *Dictionary) Lookup(s string) (uint32, bool) {
 }
 
 // UnmarshalDictionary parses a dictionary blob (including its trailing CRC).
+//
+// Data is copied rather than aliased into b on purpose: b is often a Reader's
+// pooled section window, which is handed back on ColumnReader.Close and reused by
+// the next row group. Owning the bytes is what lets a Dictionary outlive the
+// buffer it was parsed from, and what makes the immutability the ownership note
+// on Dictionary relies on a property of this package rather than of its callers.
 func UnmarshalDictionary(b []byte) (*Dictionary, error) {
 	payload, err := enc.VerifyTrailing(b)
 	if err != nil {
