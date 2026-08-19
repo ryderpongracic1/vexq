@@ -617,8 +617,7 @@ func BenchmarkVexqQ1(b *testing.B) {
 	path := vxqPath(b, "lineitem")
 	ctx := context.Background()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenSingle(ctx, "lineitem", path)
 		p := vsql.NewParser(q1)
 		stmt, _ := p.ParseStatement()
@@ -628,13 +627,12 @@ func BenchmarkVexqQ1(b *testing.B) {
 		op, _ := planner.Physical(ctx, logical)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func BenchmarkSQLiteQ1(b *testing.B) {
 	dbPath := sqliteDB(b)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		db, _ := sql.Open("sqlite3", dbPath+"?_cache_size=-262144")
 		rows, err := db.Query(q1SQLite)
 		if err != nil {
@@ -642,15 +640,14 @@ func BenchmarkSQLiteQ1(b *testing.B) {
 		}
 		drainSQLite(b, rows)
 		db.Close()
-	}
+	})
 }
 
 func BenchmarkVexqQ6(b *testing.B) {
 	path := vxqPath(b, "lineitem")
 	ctx := context.Background()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenSingle(ctx, "lineitem", path)
 		p := vsql.NewParser(q6)
 		stmt, _ := p.ParseStatement()
@@ -660,13 +657,12 @@ func BenchmarkVexqQ6(b *testing.B) {
 		op, _ := planner.Physical(ctx, logical)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func BenchmarkSQLiteQ6(b *testing.B) {
 	dbPath := sqliteDB(b)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		db, _ := sql.Open("sqlite3", dbPath+"?_cache_size=-262144")
 		rows, err := db.Query(q6SQLite)
 		if err != nil {
@@ -674,15 +670,14 @@ func BenchmarkSQLiteQ6(b *testing.B) {
 		}
 		drainSQLite(b, rows)
 		db.Close()
-	}
+	})
 }
 
 func BenchmarkVexqQ3(b *testing.B) {
 	tables := vxqPaths(b, "customer", "orders", "lineitem")
 	ctx := context.Background()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenMulti(ctx, tables)
 		p := vsql.NewParser(q3)
 		stmt, _ := p.ParseStatement()
@@ -692,13 +687,12 @@ func BenchmarkVexqQ3(b *testing.B) {
 		op, _ := planner.Physical(ctx, logical)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func BenchmarkSQLiteQ3(b *testing.B) {
 	dbPath := sqliteDB(b)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		db, _ := sql.Open("sqlite3", dbPath+"?_cache_size=-262144")
 		rows, err := db.Query(q3SQLite)
 		if err != nil {
@@ -706,15 +700,14 @@ func BenchmarkSQLiteQ3(b *testing.B) {
 		}
 		drainSQLite(b, rows)
 		db.Close()
-	}
+	})
 }
 
 func BenchmarkVexqQ12(b *testing.B) {
 	tables := vxqPaths(b, "orders", "lineitem")
 	ctx := context.Background()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenMulti(ctx, tables)
 		p := vsql.NewParser(q12)
 		stmt, _ := p.ParseStatement()
@@ -724,13 +717,12 @@ func BenchmarkVexqQ12(b *testing.B) {
 		op, _ := planner.Physical(ctx, logical)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func BenchmarkSQLiteQ12(b *testing.B) {
 	dbPath := sqliteDB(b)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		db, _ := sql.Open("sqlite3", dbPath+"?_cache_size=-262144")
 		rows, err := db.Query(q12SQLite)
 		if err != nil {
@@ -738,7 +730,7 @@ func BenchmarkSQLiteQ12(b *testing.B) {
 		}
 		drainSQLite(b, rows)
 		db.Close()
-	}
+	})
 }
 
 func drainOp(b *testing.B, ctx context.Context, op exec.Operator) {
@@ -932,8 +924,7 @@ func BenchmarkVexqQ1Parallel(b *testing.B) {
 	ctx := context.Background()
 	workers := runtime.NumCPU()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenSingle(ctx, "lineitem", path)
 		p := vsql.NewParser(q1)
 		stmt, _ := p.ParseStatement()
@@ -943,7 +934,7 @@ func BenchmarkVexqQ1Parallel(b *testing.B) {
 		op, _ := planner.Parallel(ctx, logical, workers)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func BenchmarkVexqQ6Parallel(b *testing.B) {
@@ -951,8 +942,7 @@ func BenchmarkVexqQ6Parallel(b *testing.B) {
 	ctx := context.Background()
 	workers := runtime.NumCPU()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenSingle(ctx, "lineitem", path)
 		p := vsql.NewParser(q6)
 		stmt, _ := p.ParseStatement()
@@ -962,7 +952,7 @@ func BenchmarkVexqQ6Parallel(b *testing.B) {
 		op, _ := planner.Parallel(ctx, logical, workers)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func BenchmarkVexqQ3Parallel(b *testing.B) {
@@ -970,8 +960,7 @@ func BenchmarkVexqQ3Parallel(b *testing.B) {
 	ctx := context.Background()
 	workers := runtime.NumCPU()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenMulti(ctx, tables)
 		p := vsql.NewParser(q3)
 		stmt, _ := p.ParseStatement()
@@ -981,7 +970,7 @@ func BenchmarkVexqQ3Parallel(b *testing.B) {
 		op, _ := planner.Parallel(ctx, logical, workers)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func BenchmarkVexqQ12Parallel(b *testing.B) {
@@ -989,8 +978,7 @@ func BenchmarkVexqQ12Parallel(b *testing.B) {
 	ctx := context.Background()
 	workers := runtime.NumCPU()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	runTimed(b, func() {
 		cat, _ := catalog.OpenMulti(ctx, tables)
 		p := vsql.NewParser(q12)
 		stmt, _ := p.ParseStatement()
@@ -1000,7 +988,7 @@ func BenchmarkVexqQ12Parallel(b *testing.B) {
 		op, _ := planner.Parallel(ctx, logical, workers)
 		drainOp(b, ctx, op)
 		op.Close()
-	}
+	})
 }
 
 func drainSQLite(b *testing.B, rows *sql.Rows) {
@@ -1017,4 +1005,27 @@ func drainSQLite(b *testing.B, rows *sql.Rows) {
 			b.Fatalf("scan: %v", err)
 		}
 	}
+}
+
+// runTimed runs body b.N times, timing each iteration individually, and
+// reports the min/median/max per-iteration wall time in milliseconds
+// alongside the standard ns/op mean. ns/op alone reports only a mean, which
+// cannot distinguish a small headline margin (e.g. Q1's 22 ms vs 25 ms
+// crossover) from run-to-run noise; the spread makes the margin's width
+// visible in the same output line.
+func runTimed(b *testing.B, body func()) {
+	b.Helper()
+	samples := make([]time.Duration, 0, b.N)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		body()
+		samples = append(samples, time.Since(start))
+	}
+	b.StopTimer()
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	ms := func(d time.Duration) float64 { return float64(d.Nanoseconds()) / 1e6 }
+	b.ReportMetric(ms(samples[0]), "min-ms")
+	b.ReportMetric(ms(samples[len(samples)/2]), "med-ms")
+	b.ReportMetric(ms(samples[len(samples)-1]), "max-ms")
 }

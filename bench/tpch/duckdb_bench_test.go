@@ -52,9 +52,9 @@ func TestSetupDuckDB(t *testing.T) {
 	// the empty field after the trailing delimiter; the dummy column is excluded
 	// when inserting into the real table.
 	type tableSpec struct {
-		name       string
-		createDDL  string
-		loadSQL    string
+		name      string
+		createDDL string
+		loadSQL   string
 	}
 
 	tables := []tableSpec{
