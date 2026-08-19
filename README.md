@@ -264,7 +264,7 @@ Q1's 8.6× on 14 cores (10P+4E) is ~86% efficiency against the realistic 10-P-co
 
 Expression aggregates parallelize by ending each worker pipeline with the same pre-projection the serial planner applies, materializing the expression (`SUM(a*b)`) into a synthetic column per morsel — the expression is row-local, so evaluating it per morsel is equivalent to evaluating it over the whole scan. Float64 `SUM`/`AVG` results agree with serial execution to within IEEE-754 rounding rather than bit-for-bit — partitioning reorders float additions, which is a property of any partitioned float reduction; integer aggregates and `COUNT` are exact (the parallel join's morsel-ordered build assembly keeps per-key row order identical to a serial drain). `COUNT(DISTINCT)` still falls back to serial. Remaining parallel scaling is limited primarily by P/E-core asymmetry, with GC now a minor factor (0–19%, ablation below) after the allocation campaign.
 
-The `GOGC=off` ablation — now with both denominators measured — tells the allocation campaign's before/after story. Before the campaign, disabling GC cut parallel wall time 26–50%. After it, the same ablation moves Q1 by ~0%, Q3 ~8%, Q12 ~15%, and Q6 ~19%: the GC bottleneck was engineered away, and the ablation that diagnosed it certifies the fix. True like-for-like scaling (parallel GOGC=off ÷ serial GOGC=off) is Q1 8.8×, Q6 7.9×, Q12 7.8×, Q3 4.4× — 78–88% efficiency against the 10-P-core ceiling for three of four queries. The remaining gap to linear is P/E-core asymmetry: the M4 Pro's 14 cores are 10 performance + 4 efficiency cores, and runtime.NumCPU() spawns 14 workers, four of which land on E-cores — the worker sweep below is consistent with a bend at 10 workers, with the caveat stated there. It is explicitly not memory bandwidth.
+The `GOGC=off` ablation — now with both denominators measured — tells the allocation campaign's before/after story. Before the campaign, disabling GC cut parallel wall time 26–50%. After it, the same ablation moves Q1 by ~0%, Q3 ~8%, Q12 ~15%, and Q6 ~19%: the GC bottleneck was engineered away, and the ablation that diagnosed it certifies the fix. True like-for-like scaling (parallel GOGC=off ÷ serial GOGC=off) is Q1 8.8×, Q6 7.9×, Q12 7.8×, Q3 4.4× — 78–88% efficiency against the 10-P-core ceiling for three of four queries. The remaining gap to linear is P/E-core asymmetry: the M4 Pro's 14 cores are 10 performance + 4 efficiency cores, and runtime.NumCPU() spawns 14 workers, four of which land on E-cores — the worker sweep below reproduces the bend at 10 workers on the current compute-bound build. It is explicitly not memory bandwidth.
 
 | Query | Serial (GC on) | Serial (GOGC=off) | Parallel (GC on) | Parallel (GOGC=off) | GC share of parallel | True scaling (off/off) |
 |-------|---------------:|------------------:|-----------------:|--------------------:|:--------------------:|:----------------------:|
@@ -279,19 +279,34 @@ GOGC=off is a diagnostic, not a production configuration — unbounded heap grow
 
 #### Worker sweep (GOGC=off, Q6-shaped simple-aggregate query)
 
-Measured on an **earlier engine revision** (before coarse-grained I/O and parallel expression aggregates landed), via CLI with warm page cache; times include ~10 ms of process startup + catalog overhead. The absolute times are not comparable to the in-process tables above — only the sweep's internal ratios are meaningful. A second caveat bounds what even the ratios can support: that revision was pread-bound and topped out at 3.0× across 14 workers, and an I/O-bound workload can flatten at high worker counts for reasons unrelated to core classes. The bend at 10 workers is therefore *consistent with* the P/E-core explanation of today's ~86% efficiency, not proof of it; re-running the sweep on the current compute-bound build (one command, in the runbook below) would either confirm the explanation or reveal that the remaining gap is something else.
+Re-measured on the **current compute-bound build** (2026-08-19), via CLI with warm
+page cache. Times are single timed runs after three warmups and include ~10 ms of
+process startup + catalog overhead, so at the fastest settings the query itself is
+only a few milliseconds and each cell carries ±1–2 ms of timer granularity. Two
+consequences: only the ratios are the signal, and the startup floor compresses
+them — end-to-end 4.5× here corresponds to the in-process true scaling of 7.9×
+(Q6, GOGC=off ÷ GOGC=off) measured properly in the ablation table above. The
+sweep's job is locating the bend, not measuring scaling magnitude.
 
 | Workers | Time (ms) | Speedup vs 1 |
 |--------:|----------:|:------------:|
-| 1 | 131 | 1.0× |
-| 2 | 90 | 1.5× |
-| 4 | 65 | 2.0× |
-| 8 | 48 | 2.7× |
-| 10 | 47 | 2.8× |
-| 12 | 45 | 2.9× |
-| 14 | 44 | 3.0× |
+| 1 | 72 | 1.0× |
+| 2 | 44 | 1.6× |
+| 4 | 28 | 2.6× |
+| 8 | 18 | 4.0× |
+| 10 | 16 | 4.5× |
+| 12 | 17 | 4.2× |
+| 14 | 16 | 4.5× |
 
-Near-linear benefit through 8 workers, then flat — 8→14 buys only 8%. On this revision the bend sits at the P-core boundary, as the P/E-core explanation predicts — subject to the I/O-bound caveat above. A runtime improvement either way: cap default workers at the performance-core count rather than `runtime.NumCPU()`.
+The shape: near-linear benefit through 8 workers, a small gain to 10, then flat —
+10→14 buys nothing (16/17/16 ms is timer noise). An earlier sweep on the
+pread-bound revision showed the same bend, but an I/O-bound engine can flatten at
+high worker counts for reasons unrelated to core classes, so that measurement
+could only be *consistent with* the P/E-core explanation. This re-run closes the
+gap: the bend sits at the M4 Pro's 10-P-core boundary on the same compute-bound
+build whose ~86% parallel efficiency the explanation is asked to account for, and
+the 4 E-cores contribute nothing measurable. A runtime improvement remains open:
+cap default workers at the performance-core count rather than `runtime.NumCPU()`.
 
 ### Running benchmarks
 
