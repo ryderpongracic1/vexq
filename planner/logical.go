@@ -23,6 +23,46 @@ type LogicalScan struct {
 	Predicate sql.Expr
 	// Column set needed by ancestors (set by optimizer); nil = all.
 	NeededCols []string
+	// SourceNames maps an output column name in Schema to the column's name in
+	// the table file, for columns the planner renamed (see Build); nil when
+	// every column keeps its file name. Schema, NeededCols and Predicate all use
+	// output names.
+	SourceNames map[string]string
+}
+
+// openScan builds the exec scan for n over row groups [rgStart, rgEnd) of r,
+// reading the needed columns by their file names and emitting them under their
+// output names.
+func (n *LogicalScan) openScan(r *storage.Reader, zonePred exec.ZonePredicate, rgStart, rgEnd int) (*exec.TableScan, error) {
+	cols := n.NeededCols
+	if n.SourceNames != nil && len(cols) > 0 {
+		cols = make([]string, len(n.NeededCols))
+		for i, name := range n.NeededCols {
+			cols[i] = name
+			if src, ok := n.SourceNames[name]; ok {
+				cols[i] = src
+			}
+		}
+	}
+	ts, err := exec.NewTableScanRange(r, cols, zonePred, rgStart, rgEnd)
+	if err != nil {
+		return nil, err
+	}
+	if n.SourceNames == nil {
+		return ts, nil
+	}
+	out := n.NeededCols
+	if len(out) == 0 {
+		out = make([]string, len(n.Schema.Fields))
+		for i, f := range n.Schema.Fields {
+			out[i] = f.Name
+		}
+	}
+	if err := ts.SetOutputNames(out); err != nil {
+		// Not closed: the caller owns r and closes it on error.
+		return nil, err
+	}
+	return ts, nil
 }
 
 func (*LogicalScan) logicalTag() {}
@@ -98,7 +138,9 @@ func (n *LogicalAggregate) OutputSchema() exec.Schema {
 		case "COUNT":
 			t = exec.TypeInt64
 		case "SUM", "MIN", "MAX":
-			if agg.ColName == "" {
+			if agg.AggExpr != nil {
+				t = resolveExprType(agg.AggExpr, childSchema)
+			} else if agg.ColName == "" {
 				t = exec.TypeInt64
 			} else {
 				for _, f := range childSchema.Fields {
@@ -139,10 +181,12 @@ type LogicalSort struct {
 func (*LogicalSort) logicalTag()                 {}
 func (n *LogicalSort) OutputSchema() exec.Schema { return n.Child.OutputSchema() }
 
-// LogicalLimit limits output rows.
+// LogicalLimit skips Offset rows and then passes at most Count rows; a
+// negative Count passes every remaining row (OFFSET without LIMIT).
 type LogicalLimit struct {
-	Child LogicalNode
-	Count int64
+	Child  LogicalNode
+	Count  int64
+	Offset int64
 }
 
 func (*LogicalLimit) logicalTag()                 {}

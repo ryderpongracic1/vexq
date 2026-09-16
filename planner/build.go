@@ -11,12 +11,33 @@ import (
 )
 
 // Build converts a SQL AST into a logical plan tree.
+//
+// Every column reference in the statement is resolved here, against the tables
+// in FROM, before any plan node is built. Resolution replaces each reference
+// with the unique name its column carries through the plan: the bare column name
+// when only one FROM table has a column by that name, and "table.column" (using
+// the table's alias when it has one) when several do. Scans emit those names, so
+// every operator above a scan — joins, filters, projections, aggregates, sorts —
+// can locate columns by name without two tables' same-named columns being
+// confused. Unknown and ambiguous references are reported here, wherever in the
+// statement they appear.
+//
+// The plan shape, bottom to top:
+//
+//	scans and joins (with per-table filters pushed into the scans, and any WHERE
+//	term that is not a join key applied as a filter above the joins)
+//	→ Aggregate → Filter(HAVING)           (aggregate queries only)
+//	→ Project                              (SELECT list, plus hidden ORDER BY keys)
+//	→ Distinct → Sort → Limit
+//	→ Project                              (only when hidden keys or duplicate
+//	                                        output names must be removed)
+//
+// A Project that would pass its input through unchanged is omitted.
 func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (LogicalNode, error) {
 	if len(stmt.From) == 0 {
 		return nil, fmt.Errorf("planner: no FROM clause")
 	}
 
-	// Build a LogicalScan per table.
 	scans := make([]*LogicalScan, len(stmt.From))
 	schemas := make([]exec.Schema, len(stmt.From))
 	for i, ref := range stmt.From {
@@ -32,250 +53,252 @@ func Build(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (Log
 		schemas[i] = entry.Schema
 	}
 
+	st, err := newSymbolTable(schemas, stmt.From)
+	if err != nil {
+		return nil, err
+	}
+	for i, scan := range scans {
+		st.applyOutputNames(i, scan)
+	}
+
+	where, err := st.resolveScalar(stmt.Where, "WHERE")
+	if err != nil {
+		return nil, err
+	}
+
 	var root LogicalNode
 	if len(scans) == 1 {
 		root = scans[0]
-		if stmt.Where != nil {
-			root = &LogicalFilter{Child: root, Predicate: stmt.Where}
+		if where != nil {
+			root = &LogicalFilter{Child: root, Predicate: where}
 		}
 	} else {
-		// Multi-table: split WHERE into join conditions and per-table filters.
-		var err error
-		// Pass stmt.From so symbolTable can resolve qualified column references (table.col).
-		root, err = buildMultiTablePlan(scans, schemas, stmt.Where, stmt.From)
+		root, err = buildMultiTablePlan(scans, where, st)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// GROUP BY / aggregates.
-	hasAggs := hasAggregates(stmt.Columns)
-	if hasAggs || len(stmt.GroupBy) > 0 {
-		agg, err := buildAggregate(root, stmt)
-		if err != nil {
-			return nil, err
-		}
+	items := expandSelectList(stmt.Columns, st)
 
-		// HAVING — post-aggregate filter applied after aggregation.
-		// If the HAVING predicate contains aggregate function expressions
-		// (e.g. COUNT(*) > 3), we rewrite them to column references that
-		// point at matching output columns of the aggregate. If no match
-		// exists in the SELECT list, we add a hidden aggregate and strip
-		// it with a projection after the filter.
+	aggregating := len(stmt.GroupBy) > 0 || containsAggregate(stmt.Having)
+	for _, it := range items {
+		if containsAggregate(it.expr) {
+			aggregating = true
+		}
+	}
+
+	var q *selectQuery
+	if aggregating {
+		q, err = buildAggregation(root, stmt, items, st)
+	} else {
 		if stmt.Having != nil {
-			origAggCount := len(agg.Aggs)
-			rewritten := rewriteHavingAggs(stmt.Having, agg)
-			root = agg
-			root = &LogicalFilter{Child: root, Predicate: rewritten}
-			// If hidden aggregates were added, project them away so the
-			// output schema matches what the user's SELECT requested.
-			if len(agg.Aggs) > origAggCount {
-				root = buildHavingProjection(root, agg, origAggCount)
-			}
-		} else {
-			root = agg
+			return nil, fmt.Errorf("planner: HAVING requires GROUP BY or an aggregate function")
 		}
-	} else {
-		// Project.
-		if !isSelectStar(stmt.Columns) {
-			proj, err := buildProject(root, stmt)
-			if err != nil {
-				return nil, err
-			}
-			root = proj
-		}
+		q, err = buildScalarSelect(root, items, st)
 	}
-
-	// DISTINCT — deduplicate after projection/aggregation but before ORDER BY/LIMIT.
-	if stmt.Distinct {
-		root = &LogicalDistinct{Child: root}
+	if err != nil {
+		return nil, err
 	}
-
-	// ORDER BY.
-	if len(stmt.OrderBy) > 0 {
-		root = &LogicalSort{Child: root, OrderBy: stmt.OrderBy}
-	}
-
-	// LIMIT.
-	if stmt.Limit != nil {
-		root = &LogicalLimit{Child: root, Count: *stmt.Limit}
-	}
-
-	return root, nil
+	return q.finish(stmt)
 }
 
-// qualifiedCol records the position of a column within the multi-table context.
-type qualifiedCol struct {
-	tableIdx int
-	colIdx   int
+// ---- Column resolution -------------------------------------------------------
+
+// columnBinding is one column of one FROM table.
+type columnBinding struct {
+	table  int
+	source string // column name in the table file
+	out    string // name the column carries through the plan
 }
 
-// symbolTable maps qualified "table.col" and unqualified "col" names to their
-// positions across all tables in a FROM clause.
+// symbolTable maps qualified "table.col" and unqualified "col" references to
+// the columns of the tables in a FROM clause.
 type symbolTable struct {
-	qualified   map[string]qualifiedCol // "tableName.colName" → location
-	unqualified map[string]qualifiedCol // "colName" → location (only if unambiguous)
-	ambiguous   map[string]bool         // "colName" → true if appears in multiple tables
-	tableNames  []string                // table name (or alias) for each index
+	tableNames []string                    // table name or alias, per FROM position
+	qualified  map[string]*columnBinding   // "table.col" → binding
+	byName     map[string][]*columnBinding // "col" → every table's binding for it
+	tableOfOut map[string]int              // output name → FROM position
+	columns    [][]*columnBinding          // per table, in schema order
 }
 
 // newSymbolTable builds a symbol table from the given schemas and table refs.
-func newSymbolTable(schemas []exec.Schema, tableRefs []sql.TableRef) *symbolTable {
+func newSymbolTable(schemas []exec.Schema, tableRefs []sql.TableRef) (*symbolTable, error) {
 	st := &symbolTable{
-		qualified:   make(map[string]qualifiedCol),
-		unqualified: make(map[string]qualifiedCol),
-		ambiguous:   make(map[string]bool),
-		tableNames:  make([]string, len(schemas)),
+		tableNames: make([]string, len(schemas)),
+		qualified:  make(map[string]*columnBinding),
+		byName:     make(map[string][]*columnBinding),
+		tableOfOut: make(map[string]int),
+		columns:    make([][]*columnBinding, len(schemas)),
 	}
 	for i, ref := range tableRefs {
 		name := ref.Alias
 		if name == "" {
 			name = ref.Name
 		}
-		st.tableNames[i] = name
-		for j, f := range schemas[i].Fields {
-			qc := qualifiedCol{tableIdx: i, colIdx: j}
-			st.qualified[name+"."+f.Name] = qc
-			if st.ambiguous[f.Name] {
-				continue
-			}
-			if existing, exists := st.unqualified[f.Name]; exists {
-				if existing.tableIdx != i {
-					st.ambiguous[f.Name] = true
-					delete(st.unqualified, f.Name)
-				}
-			} else {
-				st.unqualified[f.Name] = qc
+		for j := 0; j < i; j++ {
+			if st.tableNames[j] == name {
+				return nil, fmt.Errorf("planner: table name %q specified more than once; give one of them an alias", name)
 			}
 		}
+		st.tableNames[i] = name
+		for _, f := range schemas[i].Fields {
+			b := &columnBinding{table: i, source: f.Name}
+			st.qualified[name+"."+f.Name] = b
+			st.byName[f.Name] = append(st.byName[f.Name], b)
+			st.columns[i] = append(st.columns[i], b)
+		}
 	}
-	return st
+	for i := range st.columns {
+		for _, b := range st.columns[i] {
+			b.out = b.source
+			if len(st.byName[b.source]) > 1 {
+				b.out = st.tableNames[i] + "." + b.source
+			}
+			st.tableOfOut[b.out] = i
+		}
+	}
+	return st, nil
+}
+
+// applyOutputNames renames scan's schema to the plan-wide output names of its
+// table's columns, recording the file column names the scan must read.
+func (st *symbolTable) applyOutputNames(table int, scan *LogicalScan) {
+	fields := make([]exec.Field, len(scan.Schema.Fields))
+	copy(fields, scan.Schema.Fields)
+	for i, b := range st.columns[table] {
+		if b.out == b.source {
+			continue
+		}
+		if scan.SourceNames == nil {
+			scan.SourceNames = make(map[string]string)
+		}
+		scan.SourceNames[b.out] = b.source
+		fields[i].Name = b.out
+	}
+	scan.Schema = exec.Schema{Fields: fields}
 }
 
 // resolve looks up a column reference in the symbol table.
-func (st *symbolTable) resolve(ref *sql.ColumnRefExpr) (qualifiedCol, error) {
+func (st *symbolTable) resolve(ref *sql.ColumnRefExpr) (*columnBinding, error) {
 	if ref.Table != "" {
-		key := ref.Table + "." + ref.Name
-		qc, ok := st.qualified[key]
+		b, ok := st.qualified[ref.Table+"."+ref.Name]
 		if !ok {
-			return qualifiedCol{}, fmt.Errorf("column %q not found in table %q", ref.Name, ref.Table)
+			return nil, fmt.Errorf("column %q not found in table %q", ref.Name, ref.Table)
 		}
-		return qc, nil
+		return b, nil
 	}
-	if st.ambiguous[ref.Name] {
-		return qualifiedCol{}, fmt.Errorf("column %q is ambiguous; qualify with table name", ref.Name)
+	switch bs := st.byName[ref.Name]; len(bs) {
+	case 0:
+		return nil, fmt.Errorf("column %q not found in any table", ref.Name)
+	case 1:
+		return bs[0], nil
+	default:
+		return nil, fmt.Errorf("column %q is ambiguous; qualify with table name", ref.Name)
 	}
-	qc, ok := st.unqualified[ref.Name]
-	if !ok {
-		return qualifiedCol{}, fmt.Errorf("column %q not found in any table", ref.Name)
-	}
-	return qc, nil
 }
 
-// resolveTableIdx returns the table index for a column reference.
-func (st *symbolTable) resolveTableIdx(ref *sql.ColumnRefExpr) (int, bool) {
-	qc, err := st.resolve(ref)
-	if err != nil {
-		return 0, false
-	}
-	return qc.tableIdx, true
+// resolveColumns rewrites every column reference in e to its output name. It
+// does not look inside aggregates' arguments differently from anything else; the
+// caller decides whether aggregates are allowed.
+func (st *symbolTable) resolveColumns(e sql.Expr) (sql.Expr, error) {
+	return rewriteExpr(e, func(n sql.Expr) (sql.Expr, bool, error) {
+		ref, ok := n.(*sql.ColumnRefExpr)
+		if !ok {
+			return nil, false, nil
+		}
+		b, err := st.resolve(ref)
+		if err != nil {
+			return nil, true, fmt.Errorf("planner: %w", err)
+		}
+		return &sql.ColumnRefExpr{Name: b.out}, true, nil
+	})
 }
 
-// predicateColRefs collects all ColumnRefExpr nodes from an expression tree.
-func predicateColRefs(e sql.Expr) []*sql.ColumnRefExpr {
+// resolveScalar resolves an expression that is evaluated per input row, where
+// aggregate functions are not allowed. clause names the clause for errors.
+func (st *symbolTable) resolveScalar(e sql.Expr, clause string) (sql.Expr, error) {
 	if e == nil {
-		return nil
+		return nil, nil
 	}
-	var refs []*sql.ColumnRefExpr
-	collectColRefs(e, &refs)
-	return refs
+	if containsAggregate(e) {
+		return nil, fmt.Errorf("planner: aggregate functions are not allowed in %s", clause)
+	}
+	return st.resolveColumns(e)
 }
 
-func collectColRefs(e sql.Expr, out *[]*sql.ColumnRefExpr) {
-	if e == nil {
-		return
-	}
-	switch x := e.(type) {
-	case *sql.ColumnRefExpr:
-		*out = append(*out, x)
-	case *sql.BinaryExpr:
-		collectColRefs(x.Left, out)
-		collectColRefs(x.Right, out)
-	case *sql.UnaryExpr:
-		collectColRefs(x.Expr, out)
-	case *sql.IsNullExpr:
-		collectColRefs(x.Expr, out)
-	case *sql.BetweenExpr:
-		collectColRefs(x.Expr, out)
-		collectColRefs(x.Lo, out)
-		collectColRefs(x.Hi, out)
-	case *sql.InExpr:
-		collectColRefs(x.Expr, out)
-		for _, item := range x.List {
-			collectColRefs(item, out)
-		}
-	case *sql.CaseExpr:
-		for _, w := range x.Whens {
-			collectColRefs(w.Cond, out)
-			collectColRefs(w.Result, out)
-		}
-		collectColRefs(x.Else, out)
-	case *sql.AggFuncExpr:
-		collectColRefs(x.Arg, out)
-	}
-}
-
-// buildMultiTablePlan builds a left-deep join tree from multiple table scans,
-// pushing single-table predicates into each scan and join conditions into
-// LogicalJoin nodes.
-func buildMultiTablePlan(scans []*LogicalScan, schemas []exec.Schema, where sql.Expr, tableRefs []sql.TableRef) (LogicalNode, error) {
-	st := newSymbolTable(schemas, tableRefs)
-
-	// Validate all column references in WHERE upfront.
-	if where != nil {
-		for _, ref := range predicateColRefs(where) {
-			if _, err := st.resolve(ref); err != nil {
-				return nil, fmt.Errorf("planner: %w", err)
+// tablesOf returns the set of FROM positions whose columns a resolved expression
+// references.
+func (st *symbolTable) tablesOf(e sql.Expr) map[int]bool {
+	set := make(map[int]bool)
+	walkExpr(e, func(n sql.Expr) {
+		if ref, ok := n.(*sql.ColumnRefExpr); ok {
+			if t, found := st.tableOfOut[ref.Name]; found {
+				set[t] = true
 			}
 		}
-	}
+	})
+	return set
+}
 
-	// Partition WHERE terms into per-table filters and join conditions.
+// ---- Joins -------------------------------------------------------------------
+
+// buildMultiTablePlan builds a left-deep join tree from multiple table scans.
+// where must already be resolved.
+//
+// Every WHERE conjunct ends up in exactly one place, so none can be lost:
+//
+//   - an equality between join-compatible columns of two different tables is a
+//     join-key candidate; the ones the join tree uses become join conditions and
+//     the rest are applied as filters above the joins;
+//   - a term that references one table is pushed into that table's scan;
+//   - a term that references no column at all (1 = 0) is pushed into the first
+//     scan, which filters the whole inner join equally well;
+//   - anything else (a.x < b.y, a.x + 1 = b.y, an OR across tables) is applied
+//     as a filter above the joins.
+func buildMultiTablePlan(scans []*LogicalScan, where sql.Expr, st *symbolTable) (LogicalNode, error) {
 	perTableFilters := make([]sql.Expr, len(scans))
-	var joinConds []sql.Expr
-	if where != nil {
-		for _, term := range flattenAnd(where) {
-			lt, rt, ok := isEqualityJoinCond(term, st)
-			if ok {
-				_ = lt
-				_ = rt
-				joinConds = append(joinConds, term)
-			} else {
-				refs := predicateColRefs(term)
-				tableSet := make(map[int]bool)
-				for _, ref := range refs {
-					if t, found := st.resolveTableIdx(ref); found {
-						tableSet[t] = true
-					}
-				}
-				if len(tableSet) == 1 {
-					for t := range tableSet {
-						perTableFilters[t] = andExpr(perTableFilters[t], term)
-					}
-				}
+	var edges []joinEdge
+	var residual []sql.Expr
+	for _, term := range flattenAnd(where) {
+		if e, ok := joinEdgeOf(term, scans, st); ok {
+			edges = append(edges, e)
+			continue
+		}
+		tables := st.tablesOf(term)
+		switch len(tables) {
+		case 0:
+			perTableFilters[0] = andExpr(perTableFilters[0], term)
+		case 1:
+			for t := range tables {
+				perTableFilters[t] = andExpr(perTableFilters[t], term)
 			}
+		default:
+			residual = append(residual, term)
 		}
 	}
 
-	// Push per-table filters into scan predicates.
 	for i, f := range perTableFilters {
 		if f != nil {
 			scans[i].Predicate = f
 		}
 	}
 
-	// Build left-deep join tree; returns error for disconnected (cross-join) tables.
-	return buildJoinTree(scans, joinConds, st)
+	root, unused, err := buildJoinTree(scans, edges)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range unused {
+		residual = append(residual, e.term)
+	}
+	if len(residual) > 0 {
+		var pred sql.Expr
+		for _, term := range residual {
+			pred = andExpr(pred, term)
+		}
+		root = &LogicalFilter{Child: root, Predicate: pred}
+	}
+	return root, nil
 }
 
 // flattenAnd flattens a nested AND tree into a list of terms.
@@ -298,155 +321,507 @@ func andExpr(a, b sql.Expr) sql.Expr {
 	return &sql.BinaryExpr{Op: sql.OpAnd, Left: a, Right: b}
 }
 
-// isEqualityJoinCond returns true if e is a col1 = col2 predicate where col1 and
-// col2 belong to different tables.
-func isEqualityJoinCond(e sql.Expr, st *symbolTable) (leftTable, rightTable int, ok bool) {
-	bin, isBin := e.(*sql.BinaryExpr)
-	if !isBin || bin.Op != sql.OpEQ {
-		return 0, 0, false
-	}
-	lCR, lok := bin.Left.(*sql.ColumnRefExpr)
-	rCR, rok := bin.Right.(*sql.ColumnRefExpr)
-	if !lok || !rok {
-		return 0, 0, false
-	}
-	lt, lfound := st.resolveTableIdx(lCR)
-	rt, rfound := st.resolveTableIdx(rCR)
-	if !lfound || !rfound || lt == rt {
-		return 0, 0, false
-	}
-	return lt, rt, true
-}
-
-// joinCondPair describes an equality join condition between two table indices.
-type joinCondPair struct {
+// joinEdge is an equality between a column of one table and a column of
+// another that the hash join can use as its key.
+type joinEdge struct {
 	leftTable, rightTable int
-	leftCol, rightCol     string
+	leftCol, rightCol     string // output names
+	term                  sql.Expr
 }
 
-// buildJoinTree builds a left-deep join tree using symbolTable for column resolution.
-// Returns an error if tables cannot be connected (cross joins unsupported).
-func buildJoinTree(scans []*LogicalScan, joinConds []sql.Expr, st *symbolTable) (LogicalNode, error) {
-	// Parse join conditions into pairs.
-	pairs := make([]joinCondPair, 0, len(joinConds))
-	for _, cond := range joinConds {
-		bin := cond.(*sql.BinaryExpr)
-		lCR := bin.Left.(*sql.ColumnRefExpr)
-		rCR := bin.Right.(*sql.ColumnRefExpr)
-		lt, _ := st.resolveTableIdx(lCR)
-		rt, _ := st.resolveTableIdx(rCR)
-		pairs = append(pairs, joinCondPair{
-			leftTable:  lt,
-			rightTable: rt,
-			leftCol:    lCR.Name,
-			rightCol:   rCR.Name,
-		})
+// joinEdgeOf reports whether a resolved WHERE term can be a hash-join key:
+// column = column across two different tables, both INT64 or both DATE. The
+// hash join keys rows by an int64 image of the key, which identifies equal
+// values only for those types; a STRING key's image is not its value, so an
+// equality on strings is kept as an ordinary predicate instead.
+func joinEdgeOf(term sql.Expr, scans []*LogicalScan, st *symbolTable) (joinEdge, bool) {
+	bin, ok := term.(*sql.BinaryExpr)
+	if !ok || bin.Op != sql.OpEQ {
+		return joinEdge{}, false
 	}
+	l, lok := bin.Left.(*sql.ColumnRefExpr)
+	r, rok := bin.Right.(*sql.ColumnRefExpr)
+	if !lok || !rok {
+		return joinEdge{}, false
+	}
+	lt, lfound := st.tableOfOut[l.Name]
+	rt, rfound := st.tableOfOut[r.Name]
+	if !lfound || !rfound || lt == rt {
+		return joinEdge{}, false
+	}
+	ltype := fieldType(scans[lt].Schema, l.Name)
+	rtype := fieldType(scans[rt].Schema, r.Name)
+	if ltype != rtype || (ltype != exec.TypeInt64 && ltype != exec.TypeDate) {
+		return joinEdge{}, false
+	}
+	return joinEdge{leftTable: lt, rightTable: rt, leftCol: l.Name, rightCol: r.Name, term: term}, true
+}
 
-	// Build left-deep tree: start with scan 0, repeatedly find a join condition
-	// that connects a new scan to the already-included set.
+func fieldType(schema exec.Schema, name string) exec.DataType {
+	if i := schema.IndexOf(name); i >= 0 {
+		return schema.Fields[i].Type
+	}
+	return 0
+}
+
+// buildJoinTree builds a left-deep join tree: starting from the first table, it
+// repeatedly joins a table that some edge connects to the tables already
+// joined. It returns the edges the tree did not use as join conditions — the
+// caller must still apply them — and an error if a table cannot be connected,
+// since cross joins are not supported.
+func buildJoinTree(scans []*LogicalScan, edges []joinEdge) (LogicalNode, []joinEdge, error) {
 	included := map[int]bool{0: true}
+	used := make([]bool, len(edges))
 	var root LogicalNode = scans[0]
 
 	for len(included) < len(scans) {
 		joined := false
-		for _, pair := range pairs {
+		for i, e := range edges {
+			if used[i] {
+				continue
+			}
 			var newTable int
-			var joinColInTree, joinColNew string
+			var inTree, inNew string
 			switch {
-			case included[pair.leftTable] && !included[pair.rightTable]:
-				newTable = pair.rightTable
-				joinColInTree = pair.leftCol
-				joinColNew = pair.rightCol
-			case included[pair.rightTable] && !included[pair.leftTable]:
-				newTable = pair.leftTable
-				joinColInTree = pair.rightCol
-				joinColNew = pair.leftCol
+			case included[e.leftTable] && !included[e.rightTable]:
+				newTable, inTree, inNew = e.rightTable, e.leftCol, e.rightCol
+			case included[e.rightTable] && !included[e.leftTable]:
+				newTable, inTree, inNew = e.leftTable, e.rightCol, e.leftCol
 			default:
 				continue
 			}
 			cond := &sql.BinaryExpr{
 				Op:    sql.OpEQ,
-				Left:  &sql.ColumnRefExpr{Name: joinColInTree},
-				Right: &sql.ColumnRefExpr{Name: joinColNew},
+				Left:  &sql.ColumnRefExpr{Name: inTree},
+				Right: &sql.ColumnRefExpr{Name: inNew},
 			}
 			root = &LogicalJoin{Left: root, Right: scans[newTable], Condition: cond}
 			included[newTable] = true
+			used[i] = true
 			joined = true
 			break
 		}
 		if !joined {
-			// No join condition found — cross joins not yet supported.
 			for i := range scans {
 				if !included[i] {
-					return nil, fmt.Errorf("planner: no join condition connects table %q to the query; cross joins are not supported", scans[i].TableName)
+					return nil, nil, fmt.Errorf("planner: no join condition connects table %q to the query; cross joins are not supported (join keys must be an equality between INT64 or DATE columns)", scans[i].TableName)
 				}
 			}
 		}
 	}
+
+	var unused []joinEdge
+	for i, e := range edges {
+		if !used[i] {
+			unused = append(unused, e)
+		}
+	}
+	return root, unused, nil
+}
+
+// ---- SELECT list --------------------------------------------------------------
+
+// selectItem is one SELECT-list entry as written, with * already expanded.
+type selectItem struct {
+	expr  sql.Expr // unresolved, as parsed
+	alias string   // explicit alias, or the header derived from expr
+	// userAlias is the explicit AS alias, which ORDER BY and HAVING may refer
+	// to. Empty for unaliased items.
+	userAlias string
+}
+
+func expandSelectList(cols []sql.SelectColumn, st *symbolTable) []selectItem {
+	var items []selectItem
+	for _, col := range cols {
+		if _, ok := col.Expr.(*sql.StarExpr); ok {
+			for t := range st.columns {
+				for _, b := range st.columns[t] {
+					items = append(items, selectItem{
+						expr:  &sql.ColumnRefExpr{Table: st.tableNames[t], Name: b.source},
+						alias: b.source,
+					})
+				}
+			}
+			continue
+		}
+		alias := col.Alias
+		if alias == "" {
+			alias = exprName(col.Expr)
+		}
+		items = append(items, selectItem{expr: col.Expr, alias: alias, userAlias: col.Alias})
+	}
+	return items
+}
+
+// selectQuery is a query whose FROM/WHERE (and, for aggregate queries, GROUP BY
+// and HAVING) are planned, with its SELECT list resolved against that plan.
+type selectQuery struct {
+	child LogicalNode
+	items []selectItem
+	exprs []sql.Expr // items[i] resolved against child's output
+
+	// orderExpr resolves an ORDER BY expression that is not a reference to a
+	// SELECT-list entry against child's output. For aggregate queries it may
+	// add aggregates to the aggregate node.
+	orderExpr func(sql.Expr) (sql.Expr, error)
+}
+
+func buildScalarSelect(child LogicalNode, items []selectItem, st *symbolTable) (*selectQuery, error) {
+	q := &selectQuery{child: child, items: items}
+	for _, it := range items {
+		e, err := st.resolveScalar(it.expr, "the SELECT list of a query without GROUP BY")
+		if err != nil {
+			return nil, err
+		}
+		q.exprs = append(q.exprs, e)
+	}
+	q.orderExpr = func(e sql.Expr) (sql.Expr, error) { return st.resolveScalar(e, "ORDER BY") }
+	return q, nil
+}
+
+// finish adds the SELECT-list projection, DISTINCT, ORDER BY and LIMIT/OFFSET.
+func (q *selectQuery) finish(stmt *sql.SelectStmt) (LogicalNode, error) {
+	// Internal names must be unique so that operators above the projection can
+	// address each column by name. A duplicate user-facing name (two columns
+	// both called "shared") gets an internal name and is renamed back at the top.
+	used := make(map[string]bool)
+	var items []ProjectItem
+	for i, it := range q.items {
+		name := it.alias
+		if used[name] {
+			name = uniqueName("_col", i, used)
+		}
+		used[name] = true
+		items = append(items, ProjectItem{Alias: name, Expr: q.exprs[i]})
+	}
+	visible := len(items)
+
+	var orderBy []sql.OrderByItem
+	for _, ob := range stmt.OrderBy {
+		idx, err := q.orderTarget(ob.Expr, items[:visible])
+		if err != nil {
+			return nil, err
+		}
+		if idx < 0 {
+			resolved, err := q.orderExpr(ob.Expr)
+			if err != nil {
+				return nil, err
+			}
+			idx = matchItem(resolved, items)
+			if idx < 0 {
+				if stmt.Distinct {
+					return nil, fmt.Errorf("planner: for SELECT DISTINCT, ORDER BY expression %s must appear in the select list", sql.FormatExpr(ob.Expr))
+				}
+				name := uniqueName("_order", len(items), used)
+				used[name] = true
+				items = append(items, ProjectItem{Alias: name, Expr: resolved})
+				idx = len(items) - 1
+			}
+		}
+		orderBy = append(orderBy, sql.OrderByItem{
+			Expr:       &sql.ColumnRefExpr{Name: items[idx].Alias},
+			Descending: ob.Descending,
+		})
+	}
+
+	// Typed only now: resolving ORDER BY can add aggregates, which changes the
+	// aggregate's output schema.
+	childSchema := q.child.OutputSchema()
+	for i := range items {
+		items[i].Type = resolveExprType(items[i].Expr, childSchema)
+	}
+
+	var root LogicalNode = q.child
+	if !isIdentityProject(items, childSchema) {
+		root = &LogicalProject{Child: root, Exprs: items}
+	}
+	if stmt.Distinct {
+		root = &LogicalDistinct{Child: root}
+	}
+	if len(orderBy) > 0 {
+		root = &LogicalSort{Child: root, OrderBy: orderBy}
+	}
+	if stmt.Limit != nil || stmt.Offset != nil {
+		lim := &LogicalLimit{Child: root, Count: -1}
+		if stmt.Limit != nil {
+			lim.Count = *stmt.Limit
+		}
+		if stmt.Offset != nil {
+			lim.Offset = *stmt.Offset
+		}
+		root = lim
+	}
+
+	renamed := false
+	for i := 0; i < visible; i++ {
+		if items[i].Alias != q.items[i].alias {
+			renamed = true
+		}
+	}
+	if renamed || len(items) > visible {
+		outSchema := root.OutputSchema()
+		final := make([]ProjectItem, visible)
+		for i := 0; i < visible; i++ {
+			final[i] = ProjectItem{
+				Alias: q.items[i].alias,
+				Expr:  &sql.ColumnRefExpr{Name: items[i].Alias},
+				Type:  outSchema.Fields[i].Type,
+			}
+		}
+		root = &LogicalProject{Child: root, Exprs: final}
+	}
 	return root, nil
 }
 
-func buildProject(child LogicalNode, stmt *sql.SelectStmt) (*LogicalProject, error) {
-	schema := child.OutputSchema()
-	var items []ProjectItem
-	for _, col := range stmt.Columns {
-		alias := col.Alias
-		if alias == "" {
-			alias = exprName(col.Expr)
-		}
-		t := resolveExprType(col.Expr, schema)
-		items = append(items, ProjectItem{Alias: alias, Expr: col.Expr, Type: t})
+// uniqueName returns prefix_n, or the first prefix_n_k not in used.
+func uniqueName(prefix string, n int, used map[string]bool) string {
+	name := fmt.Sprintf("%s_%d", prefix, n)
+	for k := 1; used[name]; k++ {
+		name = fmt.Sprintf("%s_%d_%d", prefix, n, k)
 	}
-	return &LogicalProject{Child: child, Exprs: items}, nil
+	return name
 }
 
-func buildAggregate(child LogicalNode, stmt *sql.SelectStmt) (*LogicalAggregate, error) {
-	schema := child.OutputSchema()
-	var aggs []AggItem
-	for _, col := range stmt.Columns {
-		ae, ok := col.Expr.(*sql.AggFuncExpr)
+// orderTarget resolves an ORDER BY expression that names a SELECT-list entry:
+// a 1-based position, or an unqualified name equal to an output column's
+// header. It returns -1 when the expression names no entry and must instead be
+// evaluated against the query's input.
+func (q *selectQuery) orderTarget(e sql.Expr, items []ProjectItem) (int, error) {
+	switch x := e.(type) {
+	case *sql.IntLiteral:
+		if x.Value < 1 || x.Value > int64(len(items)) {
+			return 0, fmt.Errorf("planner: ORDER BY position %d is not in the select list", x.Value)
+		}
+		return int(x.Value - 1), nil
+	case *sql.ColumnRefExpr:
+		if x.Table != "" {
+			return -1, nil
+		}
+		found := -1
+		for i := range items {
+			if q.items[i].alias != x.Name {
+				continue
+			}
+			if found >= 0 && sql.FormatExpr(q.exprs[found]) != sql.FormatExpr(q.exprs[i]) {
+				return 0, fmt.Errorf("planner: ORDER BY %q is ambiguous", x.Name)
+			}
+			if found < 0 {
+				found = i
+			}
+		}
+		return found, nil
+	}
+	return -1, nil
+}
+
+// matchItem returns the index of the projection item whose expression is e, or
+// -1. Resolved expressions use plan-unique column names, so equal renderings
+// mean equal expressions.
+func matchItem(e sql.Expr, items []ProjectItem) int {
+	want := sql.FormatExpr(e)
+	for i, it := range items {
+		if sql.FormatExpr(it.Expr) == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// isIdentityProject reports whether projecting items over a child with the
+// given schema would reproduce the child's output exactly, in which case the
+// projection is omitted.
+func isIdentityProject(items []ProjectItem, schema Schema) bool {
+	if len(items) != len(schema.Fields) {
+		return false
+	}
+	for i, it := range items {
+		ref, ok := it.Expr.(*sql.ColumnRefExpr)
+		if !ok || ref.Table != "" || ref.Name != schema.Fields[i].Name || it.Alias != schema.Fields[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
+// ---- Aggregation ---------------------------------------------------------------
+
+// aggBuilder plans an aggregate query: it collects the aggregates the query
+// computes and rewrites SELECT, HAVING and ORDER BY expressions to read the
+// aggregate's output columns.
+type aggBuilder struct {
+	st        *symbolTable
+	agg       *LogicalAggregate
+	groupCols map[string]bool // resolved GROUP BY column names
+	outNames  map[string]bool // names already used by the aggregate's output
+}
+
+func buildAggregation(child LogicalNode, stmt *sql.SelectStmt, items []selectItem, st *symbolTable) (*selectQuery, error) {
+	ab := &aggBuilder{
+		st:        st,
+		agg:       &LogicalAggregate{Child: child},
+		groupCols: make(map[string]bool),
+		outNames:  make(map[string]bool),
+	}
+
+	for _, gb := range stmt.GroupBy {
+		if containsAggregate(gb) {
+			return nil, fmt.Errorf("planner: aggregate functions are not allowed in GROUP BY")
+		}
+		cr, ok := gb.(*sql.ColumnRefExpr)
 		if !ok {
-			continue // group-by columns handled separately
+			return nil, fmt.Errorf("planner: GROUP BY only supports column references")
 		}
-		if ae.Distinct {
-			fn := strings.ToUpper(ae.Func)
-			if fn != "COUNT" {
-				return nil, fmt.Errorf("planner: %s(DISTINCT ...) is not supported; only COUNT(DISTINCT col) is implemented", ae.Func)
-			}
+		resolved, err := st.resolveColumns(cr)
+		if err != nil {
+			return nil, err
 		}
-		alias := col.Alias
-		if alias == "" {
-			alias = exprName(col.Expr)
-		}
-		colName := ""
-		var aggExpr sql.Expr
-		if ae.Arg != nil {
-			switch arg := ae.Arg.(type) {
-			case *sql.StarExpr:
-				// COUNT(*) — no source column.
-			case *sql.ColumnRefExpr:
-				colName = arg.Name
-			default:
-				// Complex expression (e.g. l_extendedprice * (1 - l_discount)).
-				// Generate a synthetic column name; the physical planner will
-				// insert a pre-projection to compute it.
-				colName = fmt.Sprintf("_agg_%d", len(aggs))
-				aggExpr = ae.Arg
-			}
-		}
-		_ = schema
-		aggs = append(aggs, AggItem{Func: ae.Func, ColName: colName, AggExpr: aggExpr, Alias: alias, Distinct: ae.Distinct})
+		name := resolved.(*sql.ColumnRefExpr).Name
+		ab.agg.GroupBy = append(ab.agg.GroupBy, resolved)
+		ab.groupCols[name] = true
+		ab.outNames[name] = true
 	}
-	return &LogicalAggregate{
-		Child:   child,
-		GroupBy: stmt.GroupBy,
-		Aggs:    aggs,
-	}, nil
+
+	q := &selectQuery{items: items}
+	for _, it := range items {
+		var e sql.Expr
+		var err error
+		if ae, ok := it.expr.(*sql.AggFuncExpr); ok {
+			// A top-level aggregate gets its own output column named after the
+			// SELECT entry, so the common SELECT group-cols, aggregates shape
+			// needs no projection above the aggregate.
+			e, err = ab.addAggregate(ae, it.alias)
+		} else {
+			e, err = ab.rewrite(it.expr, nil)
+		}
+		if err != nil {
+			return nil, err
+		}
+		q.exprs = append(q.exprs, e)
+	}
+
+	var root LogicalNode = ab.agg
+	if stmt.Having != nil {
+		pred, err := ab.rewrite(stmt.Having, func(name string) (sql.Expr, bool) {
+			for i, it := range items {
+				if it.userAlias == name {
+					return q.exprs[i], true
+				}
+			}
+			return nil, false
+		})
+		if err != nil {
+			return nil, err
+		}
+		root = &LogicalFilter{Child: root, Predicate: pred}
+	}
+
+	q.child = root
+	q.orderExpr = func(e sql.Expr) (sql.Expr, error) { return ab.rewrite(e, nil) }
+	return q, nil
 }
 
-func isSelectStar(cols []sql.SelectColumn) bool {
-	return len(cols) == 1 && isStarExpr(cols[0].Expr)
+// rewrite resolves e as an expression over the aggregate's output: each
+// aggregate becomes a reference to an aggregate output column (added if no
+// equal aggregate exists yet), and each column reference must name a GROUP BY
+// column. alias, when non-nil, is consulted for an unqualified name that is not
+// a column of any table, which is how HAVING refers to SELECT-list aliases.
+func (ab *aggBuilder) rewrite(e sql.Expr, alias func(string) (sql.Expr, bool)) (sql.Expr, error) {
+	return rewriteExpr(e, func(n sql.Expr) (sql.Expr, bool, error) {
+		switch x := n.(type) {
+		case *sql.AggFuncExpr:
+			out, err := ab.findOrAddAggregate(x)
+			return out, true, err
+		case *sql.ColumnRefExpr:
+			b, err := ab.st.resolve(x)
+			if err != nil {
+				if alias != nil && x.Table == "" && len(ab.st.byName[x.Name]) == 0 {
+					if sub, ok := alias(x.Name); ok {
+						return sub, true, nil
+					}
+				}
+				return nil, true, fmt.Errorf("planner: %w", err)
+			}
+			if !ab.groupCols[b.out] {
+				return nil, true, fmt.Errorf("planner: column %q must appear in the GROUP BY clause or be used in an aggregate function", sql.FormatExpr(x))
+			}
+			return &sql.ColumnRefExpr{Name: b.out}, true, nil
+		}
+		return nil, false, nil
+	})
+}
+
+// addAggregate appends an aggregate output column for ae, preferring name as
+// its column name, and returns a reference to it.
+func (ab *aggBuilder) addAggregate(ae *sql.AggFuncExpr, name string) (sql.Expr, error) {
+	fn := strings.ToUpper(ae.Func)
+	if ae.Distinct && fn != "COUNT" {
+		return nil, fmt.Errorf("planner: %s(DISTINCT ...) is not supported; only COUNT(DISTINCT col) is implemented", ae.Func)
+	}
+	var arg sql.Expr
+	if ae.Arg != nil {
+		if _, star := ae.Arg.(*sql.StarExpr); star {
+			if fn != "COUNT" || ae.Distinct {
+				return nil, fmt.Errorf("planner: %s(*) is not supported", ae.Func)
+			}
+		} else {
+			if containsAggregate(ae.Arg) {
+				return nil, fmt.Errorf("planner: aggregate function calls cannot be nested")
+			}
+			var err error
+			if arg, err = ab.st.resolveColumns(ae.Arg); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if name == "" || ab.outNames[name] {
+		name = uniqueName("_agg", len(ab.agg.Aggs), ab.outNames)
+	}
+	ab.outNames[name] = true
+
+	item := AggItem{Func: fn, Alias: name, Distinct: ae.Distinct}
+	switch a := arg.(type) {
+	case nil:
+		// COUNT(*) — no source column.
+	case *sql.ColumnRefExpr:
+		item.ColName = a.Name
+	default:
+		// Computed argument: the physical planner materialises it into this
+		// synthetic column before aggregating (buildPreProjection).
+		item.ColName = fmt.Sprintf("_agg_arg_%d", len(ab.agg.Aggs))
+		item.AggExpr = a
+	}
+	ab.agg.Aggs = append(ab.agg.Aggs, item)
+	return &sql.ColumnRefExpr{Name: name}, nil
+}
+
+// findOrAddAggregate returns a reference to an existing aggregate output equal
+// to ae, adding a hidden one when there is none.
+func (ab *aggBuilder) findOrAddAggregate(ae *sql.AggFuncExpr) (sql.Expr, error) {
+	var argKey string
+	if ae.Arg != nil {
+		if _, star := ae.Arg.(*sql.StarExpr); !star && !containsAggregate(ae.Arg) {
+			resolved, err := ab.st.resolveColumns(ae.Arg)
+			if err != nil {
+				return nil, err
+			}
+			argKey = sql.FormatExpr(resolved)
+		}
+	}
+	fn := strings.ToUpper(ae.Func)
+	for _, a := range ab.agg.Aggs {
+		if a.Func != fn || a.Distinct != ae.Distinct {
+			continue
+		}
+		key := a.ColName
+		if a.AggExpr != nil {
+			key = sql.FormatExpr(a.AggExpr)
+		}
+		if key == argKey {
+			return &sql.ColumnRefExpr{Name: a.Alias}, nil
+		}
+	}
+	return ab.addAggregate(ae, "")
 }
 
 func isStarExpr(e sql.Expr) bool {
@@ -454,15 +829,8 @@ func isStarExpr(e sql.Expr) bool {
 	return ok
 }
 
-func hasAggregates(cols []sql.SelectColumn) bool {
-	for _, col := range cols {
-		if _, ok := col.Expr.(*sql.AggFuncExpr); ok {
-			return true
-		}
-	}
-	return false
-}
-
+// resolveExprType infers the logical type of a resolved expression evaluated
+// over schema.
 func resolveExprType(expr sql.Expr, schema Schema) DataType {
 	switch e := expr.(type) {
 	case *sql.ColumnRefExpr:
@@ -477,15 +845,24 @@ func resolveExprType(expr sql.Expr, schema Schema) DataType {
 		return TypeFloat64
 	case *sql.StringLiteral:
 		return TypeString
-	case *sql.BoolLiteral:
+	case *sql.BoolLiteral, *sql.IsNullExpr, *sql.BetweenExpr, *sql.InExpr, *sql.LikeExpr:
 		return TypeBool
-	case *sql.BinaryExpr:
-		l := resolveExprType(e.Left, schema)
-		r := resolveExprType(e.Right, schema)
-		if l == TypeFloat64 || r == TypeFloat64 {
-			return TypeFloat64
+	case *sql.UnaryExpr:
+		if e.Op == sql.OpNot {
+			return TypeBool
 		}
-		return l
+		return resolveExprType(e.Expr, schema)
+	case *sql.BinaryExpr:
+		switch e.Op {
+		case sql.OpAdd, sql.OpSub, sql.OpMul, sql.OpDiv:
+			l := resolveExprType(e.Left, schema)
+			r := resolveExprType(e.Right, schema)
+			if l == TypeFloat64 || r == TypeFloat64 {
+				return TypeFloat64
+			}
+			return l
+		}
+		return TypeBool
 	case *sql.AggFuncExpr:
 		switch e.Func {
 		case "COUNT":
@@ -507,130 +884,4 @@ func resolveExprType(expr sql.Expr, schema Schema) DataType {
 		}
 	}
 	return TypeInt64
-}
-
-// rewriteHavingAggs walks a HAVING expression tree and replaces every
-// AggFuncExpr with a ColumnRefExpr pointing to a matching aggregate output
-// column. If no matching aggregate exists in the SELECT list, a hidden
-// aggregate is appended to the LogicalAggregate node.
-func rewriteHavingAggs(expr sql.Expr, agg *LogicalAggregate) sql.Expr {
-	if expr == nil {
-		return nil
-	}
-	switch e := expr.(type) {
-	case *sql.AggFuncExpr:
-		// Find a matching aggregate in the existing list.
-		alias := findMatchingAgg(e, agg.Aggs)
-		if alias != "" {
-			return &sql.ColumnRefExpr{Name: alias}
-		}
-		// No match — add a hidden aggregate.
-		alias = fmt.Sprintf("_having_agg_%d", len(agg.Aggs))
-		colName := ""
-		var aggExpr sql.Expr
-		if e.Arg != nil {
-			switch arg := e.Arg.(type) {
-			case *sql.StarExpr:
-				// COUNT(*) — no source column.
-			case *sql.ColumnRefExpr:
-				colName = arg.Name
-			default:
-				colName = alias
-				aggExpr = e.Arg
-			}
-		}
-		agg.Aggs = append(agg.Aggs, AggItem{
-			Func:    e.Func,
-			ColName: colName,
-			AggExpr: aggExpr,
-			Alias:   alias,
-		})
-		return &sql.ColumnRefExpr{Name: alias}
-
-	case *sql.BinaryExpr:
-		return &sql.BinaryExpr{
-			Op:    e.Op,
-			Left:  rewriteHavingAggs(e.Left, agg),
-			Right: rewriteHavingAggs(e.Right, agg),
-		}
-	case *sql.UnaryExpr:
-		return &sql.UnaryExpr{
-			Op:   e.Op,
-			Expr: rewriteHavingAggs(e.Expr, agg),
-		}
-	case *sql.IsNullExpr:
-		return &sql.IsNullExpr{
-			Expr:  rewriteHavingAggs(e.Expr, agg),
-			IsNot: e.IsNot,
-		}
-	case *sql.BetweenExpr:
-		return &sql.BetweenExpr{
-			Expr: rewriteHavingAggs(e.Expr, agg),
-			Lo:   rewriteHavingAggs(e.Lo, agg),
-			Hi:   rewriteHavingAggs(e.Hi, agg),
-			Not:  e.Not,
-		}
-	default:
-		// Literals, column references, etc. — return unchanged.
-		return expr
-	}
-}
-
-// findMatchingAgg checks if an AggFuncExpr structurally matches any existing
-// AggItem. A match means same function name and same argument structure.
-func findMatchingAgg(ae *sql.AggFuncExpr, aggs []AggItem) string {
-	for _, a := range aggs {
-		if a.Func != ae.Func {
-			continue
-		}
-		// Match argument structure.
-		if ae.Arg == nil {
-			// COUNT(*) with nil arg — matches COUNT with no source column.
-			if a.ColName == "" && a.AggExpr == nil {
-				return a.Alias
-			}
-			continue
-		}
-		switch arg := ae.Arg.(type) {
-		case *sql.StarExpr:
-			if a.ColName == "" && a.AggExpr == nil {
-				return a.Alias
-			}
-		case *sql.ColumnRefExpr:
-			if a.ColName == arg.Name && a.AggExpr == nil {
-				return a.Alias
-			}
-		default:
-			// Complex expression — structural match against AggExpr.
-			// For now, only match if both are the exact same pointer
-			// (which they will be if the optimizer didn't clone).
-			// In practice, HAVING expressions with complex args that aren't
-			// in SELECT will create hidden aggregates, which is correct.
-			if a.AggExpr == arg {
-				return a.Alias
-			}
-		}
-	}
-	return ""
-}
-
-// buildHavingProjection creates a LogicalProject that strips hidden aggregate
-// columns from the output. It projects only the GROUP BY columns plus the
-// original aggregates (those before the hidden ones were appended).
-func buildHavingProjection(child LogicalNode, agg *LogicalAggregate, origAggCount int) *LogicalProject {
-	childSchema := child.OutputSchema()
-	var items []ProjectItem
-	// The output schema of LogicalAggregate is: [group-by columns...] [aggregate columns...]
-	// We want to project everything except the hidden aggregates (indices after origAggCount).
-	numGroupBy := len(agg.GroupBy)
-	numOrigCols := numGroupBy + origAggCount
-	for i := 0; i < numOrigCols; i++ {
-		f := childSchema.Fields[i]
-		items = append(items, ProjectItem{
-			Alias: f.Name,
-			Expr:  &sql.ColumnRefExpr{Name: f.Name},
-			Type:  f.Type,
-		})
-	}
-	return &LogicalProject{Child: child, Exprs: items}
 }

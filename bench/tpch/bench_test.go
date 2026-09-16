@@ -10,7 +10,7 @@
 //
 // Then load SQLite:
 //
-//	go test ./bench/tpch/ -run TestSetupSQLite -v
+//	VEXQ_SETUP_SQLITE=1 go test ./bench/tpch/ -run TestSetupSQLite -v
 //
 // Run benchmarks:
 //
@@ -76,7 +76,7 @@ func vxqPath(t testing.TB, table string) string {
 func sqliteDB(t testing.TB) string {
 	p := dataPath(t, "tpch.db")
 	if _, err := os.Stat(p); err != nil {
-		t.Skipf("SQLite db not found: %s (run TestSetupSQLite first)", p)
+		t.Skipf("SQLite db not found: %s (run VEXQ_SETUP_SQLITE=1 go test ./bench/tpch/ -run TestSetupSQLite first)", p)
 	}
 	return p
 }
@@ -194,9 +194,14 @@ WHERE l_shipdate >= '1994-01-01'
 
 // ---- SQLite setup ----------------------------------------------------------
 
-// TestSetupSQLite loads the TPC-H .tbl files into a SQLite database.
-// Run once with -run TestSetupSQLite -v.
+// TestSetupSQLite loads the TPC-H .tbl files into a SQLite database, replacing
+// any existing one. Because it deletes data/tpch.db, it only runs when
+// VEXQ_SETUP_SQLITE=1 is set: an ordinary `go test ./...` must not destroy the
+// benchmark database it cannot rebuild without the .tbl inputs.
 func TestSetupSQLite(t *testing.T) {
+	if os.Getenv("VEXQ_SETUP_SQLITE") != "1" {
+		t.Skip("rebuilds data/tpch.db; set VEXQ_SETUP_SQLITE=1 to run")
+	}
 	dbPath := dataPath(t, "tpch.db")
 	os.Remove(dbPath) // start fresh
 

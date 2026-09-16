@@ -101,6 +101,13 @@ func runGoldenCase(t *testing.T, ctx context.Context, tc queryCase, cat *catalog
 		t.Fatalf("engine error: %v", engineErr)
 	}
 
+	// The output shape is part of the answer: a column the query did not ask
+	// for, or an alias that did not reach the header, is a wrong result even
+	// when every requested value is right. The reference's own headers are
+	// not comparable (it names unaliased aggregates differently), so check the
+	// column count and every explicit alias.
+	checkOutputColumns(t, stmt, engineResult)
+
 	// Compare results.
 	compareResults(t, tc, refResult, engineResult)
 
@@ -145,13 +152,38 @@ func runGoldenCase(t *testing.T, ctx context.Context, tc queryCase, cat *catalog
 		}, refResult, stackedResult)
 	}
 
-	// Also try the parallel path if the plan shape allows it.
+	// Also run the parallel planner. planner.Parallel builds a parallel plan
+	// when it recognizes the shape and otherwise falls back to the serial one,
+	// so for a query the serial engine answered it must answer too: an error
+	// here is a failure, not a signal that the shape is unsupported.
 	parallelResult, parallelErr := executeEngineParallel(ctx, stmt, cat)
-	if parallelErr == nil && parallelResult != nil {
-		compareResults(t, queryCase{
-			name:    tc.name + "/parallel",
-			ordered: tc.ordered,
-		}, refResult, parallelResult)
+	if parallelErr != nil {
+		t.Fatalf("engine error (parallel planner): %v", parallelErr)
+	}
+	checkOutputColumns(t, stmt, parallelResult)
+	compareResults(t, queryCase{
+		name:    tc.name + "/parallel",
+		ordered: tc.ordered,
+	}, refResult, parallelResult)
+}
+
+// checkOutputColumns asserts the engine produced one column per SELECT-list
+// entry, headed by the entry's alias when it has one. Queries with * are
+// skipped: their width depends on the tables, not the list.
+func checkOutputColumns(t *testing.T, stmt *sql.SelectStmt, engine *RefResult) {
+	t.Helper()
+	for _, col := range stmt.Columns {
+		if _, star := col.Expr.(*sql.StarExpr); star {
+			return
+		}
+	}
+	if len(engine.Columns) != len(stmt.Columns) {
+		t.Fatalf("engine returned %d columns %v for a %d-entry SELECT list", len(engine.Columns), engine.Columns, len(stmt.Columns))
+	}
+	for i, col := range stmt.Columns {
+		if col.Alias != "" && engine.Columns[i] != col.Alias {
+			t.Errorf("column %d: engine header %q, want alias %q", i, engine.Columns[i], col.Alias)
+		}
 	}
 }
 
@@ -256,7 +288,7 @@ func duplicateScanPredicates(node planner.LogicalNode) (planner.LogicalNode, boo
 		return &planner.LogicalSort{Child: child, OrderBy: n.OrderBy}, changed
 	case *planner.LogicalLimit:
 		child, changed := duplicateScanPredicates(n.Child)
-		return &planner.LogicalLimit{Child: child, Count: n.Count}, changed
+		return &planner.LogicalLimit{Child: child, Count: n.Count, Offset: n.Offset}, changed
 	case *planner.LogicalDistinct:
 		child, changed := duplicateScanPredicates(n.Child)
 		return &planner.LogicalDistinct{Child: child}, changed
@@ -302,7 +334,8 @@ func executeEngine(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catal
 	return drainOperator(ctx, op)
 }
 
-// executeEngineParallel tries the parallel path. Returns nil,nil if not applicable.
+// executeEngineParallel runs a query through planner.Parallel, which falls back
+// to serial planning for shapes it does not parallelize.
 func executeEngineParallel(ctx context.Context, stmt *sql.SelectStmt, cat *catalog.Catalog) (*RefResult, error) {
 	logical, err := planner.Build(ctx, stmt, cat)
 	if err != nil {
@@ -311,8 +344,7 @@ func executeEngineParallel(ctx context.Context, stmt *sql.SelectStmt, cat *catal
 	logical = planner.Optimize(logical)
 	op, err := planner.Parallel(ctx, logical, 4)
 	if err != nil {
-		// Parallel may fall back to Physical or return an error for unsupported shapes.
-		return nil, nil
+		return nil, err
 	}
 	defer op.Close()
 	return drainOperator(ctx, op)
@@ -923,6 +955,174 @@ func buildCorpus() []queryCase {
 			name:    "having_with_literal_projection",
 			query:   "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status HAVING COUNT(*) > 30 ORDER BY status",
 			ordered: true,
+		},
+
+		// --- Join WHERE terms that are not the join key ----------------------
+		//
+		// Each term must survive planning: none may be dropped because it is
+		// not a single-table filter or the equality the join tree used.
+		{
+			name:  "join_constant_false_term",
+			query: "SELECT orders.order_id FROM orders, items WHERE orders.order_id = items.order_id AND 1 = 0",
+		},
+		{
+			name:  "join_like_term",
+			query: "SELECT orders.order_id, items.category FROM orders, items WHERE orders.order_id = items.order_id AND items.category LIKE 'a%'",
+		},
+		{
+			name:  "join_cross_table_inequality",
+			query: "SELECT orders.order_id, items.item_id FROM orders, items WHERE orders.order_id = items.order_id AND orders.amount > items.price * 50.0",
+		},
+		{
+			name:  "join_second_equality",
+			query: "SELECT orders.order_id, items.item_id FROM orders, items WHERE orders.order_id = items.order_id AND orders.customer_id = items.quantity",
+		},
+		{
+			name:  "join_or_across_tables",
+			query: "SELECT orders.order_id, items.item_id FROM orders, items WHERE orders.order_id = items.order_id AND (orders.status = 'alpha' OR items.category = 'beta')",
+		},
+		{
+			name:  "join_aggregate_with_residual_terms",
+			query: "SELECT orders.status, COUNT(*) AS n, SUM(items.price) AS p FROM orders, items WHERE orders.order_id = items.order_id AND items.category LIKE '%a' AND orders.amount > items.price AND 2 > 1 GROUP BY orders.status",
+		},
+		{
+			name:    "join_aggregate_having_order_limit",
+			query:   "SELECT orders.status, COUNT(*) AS n FROM orders, items WHERE orders.order_id = items.order_id GROUP BY orders.status HAVING COUNT(*) > 50 ORDER BY orders.status LIMIT 4",
+			ordered: true,
+		},
+
+		// --- Same-named columns from different tables ------------------------
+		{
+			name:  "self_join_same_named_columns",
+			query: "SELECT a.order_id, b.order_id, a.amount, b.amount FROM orders a, orders b WHERE a.customer_id = b.order_id AND a.order_id < 60",
+		},
+		{
+			name:  "self_join_filter_on_each_side",
+			query: "SELECT a.order_id, b.status FROM orders a, orders b WHERE a.customer_id = b.order_id AND a.status = 'alpha' AND b.status = 'beta'",
+		},
+		{
+			name:  "self_join_aggregate_same_named_columns",
+			query: "SELECT SUM(a.amount) AS sa, SUM(b.amount) AS sb FROM orders a, orders b WHERE a.customer_id = b.order_id",
+		},
+		{
+			name:      "error_ambiguous_select_column",
+			query:     "SELECT order_id FROM orders, items WHERE orders.order_id = items.order_id",
+			wantError: "ambiguous",
+		},
+
+		// --- IN / NOT IN ------------------------------------------------------
+		{
+			name:  "in_negative_literals",
+			query: "SELECT order_id FROM orders WHERE order_id - 10 IN (-5, -1, 3)",
+		},
+		{
+			name:  "not_in_with_null_selects_nothing",
+			query: "SELECT order_id FROM orders WHERE customer_id NOT IN (1, NULL)",
+		},
+		{
+			name:  "in_with_null",
+			query: "SELECT order_id FROM orders WHERE customer_id IN (1, 2, NULL)",
+		},
+		{
+			name:  "in_int_column_float_literals",
+			query: "SELECT order_id FROM orders WHERE customer_id IN (2.0, 3.5)",
+		},
+		{
+			name:  "not_in_nullable_column",
+			query: "SELECT order_id FROM orders WHERE customer_id NOT IN (1, 2, 3)",
+		},
+
+		// --- Mixed-type comparisons and three-valued logic -------------------
+		{
+			name:  "int_column_fractional_bound",
+			query: "SELECT order_id FROM orders WHERE customer_id >= 25.5",
+		},
+		{
+			name:  "int_column_between_fractional",
+			query: "SELECT order_id FROM orders WHERE customer_id BETWEEN 10.5 AND 12.5",
+		},
+		{
+			name:  "not_over_or_with_nulls",
+			query: "SELECT order_id FROM orders WHERE NOT (customer_id = 1 OR amount > 5000.0)",
+		},
+		{
+			name:  "not_over_and_with_nulls",
+			query: "SELECT order_id FROM orders WHERE NOT (customer_id = 1 AND amount > 5000.0)",
+		},
+
+		{
+			name:  "division_by_zero_is_null",
+			query: "SELECT order_id, amount / (customer_id - 25) AS q FROM orders WHERE customer_id BETWEEN 24 AND 26",
+		},
+
+		// --- Aggregate output shape -------------------------------------------
+		{
+			name:  "agg_without_group_column_in_select",
+			query: "SELECT COUNT(*) FROM orders GROUP BY status",
+		},
+		{
+			name:  "agg_select_order_differs_from_group_order",
+			query: "SELECT COUNT(*) AS n, status FROM orders GROUP BY status",
+		},
+		{
+			name:  "agg_group_column_alias",
+			query: "SELECT status AS s, SUM(amount) AS total FROM orders GROUP BY status",
+		},
+		{
+			name:  "agg_expression_over_aggregate",
+			query: "SELECT SUM(customer_id) + 1 AS s FROM orders",
+		},
+		{
+			name:  "agg_expression_mixing_group_and_aggregate",
+			query: "SELECT customer_id, customer_id * 1000 + COUNT(*) AS v FROM orders GROUP BY customer_id",
+		},
+
+		// --- HAVING -----------------------------------------------------------
+		{
+			name:  "having_on_group_column",
+			query: "SELECT status, COUNT(*) AS n FROM orders GROUP BY status HAVING status <> 'alpha'",
+		},
+		{
+			name:  "having_aggregate_inside_case",
+			query: "SELECT status FROM orders GROUP BY status HAVING CASE WHEN COUNT(*) > 45 THEN 1 ELSE 0 END = 1",
+		},
+		{
+			name:  "having_without_group_by",
+			query: "SELECT COUNT(*) AS n FROM orders HAVING COUNT(*) > 100000",
+		},
+		{
+			name:      "error_having_without_aggregation",
+			query:     "SELECT order_id FROM orders HAVING order_id > 1",
+			wantError: "HAVING",
+		},
+
+		// --- Sorting -----------------------------------------------------------
+		{
+			name:    "order_by_negative_floats_with_bool_column",
+			query:   "SELECT order_id, is_express, -amount AS neg FROM orders WHERE amount IS NOT NULL ORDER BY neg LIMIT 25",
+			ordered: true,
+		},
+		{
+			name:    "order_by_negative_floats_desc",
+			query:   "SELECT order_id, amount - 5000.0 AS delta FROM orders WHERE amount IS NOT NULL ORDER BY delta DESC LIMIT 25",
+			ordered: true,
+		},
+
+		// --- Statement tail ---------------------------------------------------
+		{
+			name:    "limit_offset",
+			query:   "SELECT order_id FROM orders ORDER BY order_id LIMIT 5 OFFSET 10",
+			ordered: true,
+		},
+		{
+			name:    "offset_on_grouped_result",
+			query:   "SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY status LIMIT 3 OFFSET 2",
+			ordered: true,
+		},
+		{
+			name:      "error_union",
+			query:     "SELECT order_id FROM orders UNION SELECT order_id FROM items",
+			wantError: "UNION",
 		},
 	}
 }

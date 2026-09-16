@@ -42,7 +42,9 @@ func pushPredicates(node LogicalNode) LogicalNode {
 	case *LogicalSort:
 		return &LogicalSort{Child: pushPredicates(n.Child), OrderBy: n.OrderBy}
 	case *LogicalLimit:
-		return &LogicalLimit{Child: pushPredicates(n.Child), Count: n.Count}
+		return &LogicalLimit{Child: pushPredicates(n.Child), Count: n.Count, Offset: n.Offset}
+	case *LogicalDistinct:
+		return &LogicalDistinct{Child: pushPredicates(n.Child)}
 	case *LogicalJoin:
 		return &LogicalJoin{Left: pushPredicates(n.Left), Right: pushPredicates(n.Right), Condition: n.Condition}
 	}
@@ -129,7 +131,7 @@ func pruneColumns(node LogicalNode, needed []string) LogicalNode {
 		return &LogicalSort{Child: pruneColumns(n.Child, childNeeded), OrderBy: n.OrderBy}
 
 	case *LogicalLimit:
-		return &LogicalLimit{Child: pruneColumns(n.Child, needed), Count: n.Count}
+		return &LogicalLimit{Child: pruneColumns(n.Child, needed), Count: n.Count, Offset: n.Offset}
 
 	case *LogicalDistinct:
 		// Distinct passes every column of its input through unchanged, so the
@@ -156,10 +158,9 @@ func pruneColumns(node LogicalNode, needed []string) LogicalNode {
 //     after this function has recursed into the scan.
 //
 // Membership is decided by name against each side's output schema. Names are
-// unqualified (buildJoinTree rewrites join conditions to bare names, and
-// collectCols drops the table qualifier), so a column name present in both
-// tables is kept on both sides. That over-approximates rather than under-prunes,
-// which is the safe direction.
+// unique across the plan — Build gives a column that exists in more than one
+// table a table-qualified name ("orders.id") — so each needed name selects a
+// column on exactly one side.
 //
 // No index remapping is needed downstream: every consumer of a join —
 // physicalJoin, tryParallelJoin, resolveAggConfig, buildExecExpr and the sort
@@ -239,39 +240,11 @@ func predicateCols(e sql.Expr) []string {
 }
 
 func collectCols(e sql.Expr, out *[]string) {
-	if e == nil {
-		return
-	}
-	switch x := e.(type) {
-	case *sql.ColumnRefExpr:
-		*out = append(*out, x.Name)
-	case *sql.BinaryExpr:
-		collectCols(x.Left, out)
-		collectCols(x.Right, out)
-	case *sql.UnaryExpr:
-		collectCols(x.Expr, out)
-	case *sql.IsNullExpr:
-		collectCols(x.Expr, out)
-	case *sql.BetweenExpr:
-		collectCols(x.Expr, out)
-		collectCols(x.Lo, out)
-		collectCols(x.Hi, out)
-	case *sql.InExpr:
-		collectCols(x.Expr, out)
-		for _, item := range x.List {
-			collectCols(item, out)
+	walkExpr(e, func(n sql.Expr) {
+		if ref, ok := n.(*sql.ColumnRefExpr); ok {
+			*out = append(*out, ref.Name)
 		}
-	case *sql.LikeExpr:
-		collectCols(x.Expr, out)
-	case *sql.AggFuncExpr:
-		collectCols(x.Arg, out)
-	case *sql.CaseExpr:
-		for _, w := range x.Whens {
-			collectCols(w.Cond, out)
-			collectCols(w.Result, out)
-		}
-		collectCols(x.Else, out)
-	}
+	})
 }
 
 func uniqueStrings(ss []string) []string {

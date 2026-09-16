@@ -196,6 +196,24 @@ func NewTableScanRange(reader *storage.Reader, projectedCols []string, zonePred 
 
 func (s *TableScan) Schema() Schema { return s.schema }
 
+// SetOutputNames renames the scan's output columns, positionally, without
+// changing which file columns are read. The planner uses it to give a column
+// that exists in more than one table of a query a name that identifies its
+// table, so every operator above the scan can resolve columns by name without
+// confusing the two.
+func (s *TableScan) SetOutputNames(names []string) error {
+	if len(names) != len(s.schema.Fields) {
+		return fmt.Errorf("exec: scan: %d output names for %d columns", len(names), len(s.schema.Fields))
+	}
+	fields := make([]Field, len(s.schema.Fields))
+	copy(fields, s.schema.Fields)
+	for i := range fields {
+		fields[i].Name = names[i]
+	}
+	s.schema = Schema{Fields: fields}
+	return nil
+}
+
 func (s *TableScan) Next(ctx context.Context) (*Batch, error) {
 	for {
 		if err := ctx.Err(); err != nil {

@@ -24,12 +24,12 @@ const (
 	TokStar
 	TokSemicolon
 	// Operators
-	TokEQ   // =
-	TokNE   // <> or !=
-	TokLT   // <
-	TokLE   // <=
-	TokGT   // >
-	TokGE   // >=
+	TokEQ // =
+	TokNE // <> or !=
+	TokLT // <
+	TokLE // <=
+	TokGT // >
+	TokGE // >=
 	TokPlus
 	TokMinus
 	TokSlash
@@ -68,43 +68,51 @@ const (
 	TokOUTER
 	TokCROSS
 	TokHAVING
+	TokOFFSET
+	TokUNION
+	TokINTERSECT
+	TokEXCEPT
 )
 
 var keywords = map[string]TokenKind{
-	"SELECT":   TokSELECT,
-	"FROM":     TokFROM,
-	"WHERE":    TokWHERE,
-	"GROUP":    TokGROUP,
-	"BY":       TokBY,
-	"ORDER":    TokORDER,
-	"LIMIT":    TokLIMIT,
-	"AS":       TokAS,
-	"AND":      TokAND,
-	"OR":       TokOR,
-	"NOT":      TokNOT,
-	"IN":       TokIN,
-	"IS":       TokIS,
-	"NULL":     TokNULL,
-	"TRUE":     TokTRUE,
-	"FALSE":    TokFALSE,
-	"BETWEEN":  TokBETWEEN,
-	"LIKE":     TokLIKE,
-	"CASE":     TokCASE,
-	"WHEN":     TokWHEN,
-	"THEN":     TokTHEN,
-	"ELSE":     TokELSE,
-	"END":      TokEND,
-	"DISTINCT": TokDISTINCT,
-	"ASC":      TokASC,
-	"DESC":     TokDESC,
-	"INNER":    TokINNER,
-	"JOIN":     TokJOIN,
-	"ON":       TokON,
-	"LEFT":     TokLEFT,
-	"RIGHT":    TokRIGHT,
-	"OUTER":    TokOUTER,
-	"CROSS":    TokCROSS,
-	"HAVING":   TokHAVING,
+	"SELECT":    TokSELECT,
+	"FROM":      TokFROM,
+	"WHERE":     TokWHERE,
+	"GROUP":     TokGROUP,
+	"BY":        TokBY,
+	"ORDER":     TokORDER,
+	"LIMIT":     TokLIMIT,
+	"AS":        TokAS,
+	"AND":       TokAND,
+	"OR":        TokOR,
+	"NOT":       TokNOT,
+	"IN":        TokIN,
+	"IS":        TokIS,
+	"NULL":      TokNULL,
+	"TRUE":      TokTRUE,
+	"FALSE":     TokFALSE,
+	"BETWEEN":   TokBETWEEN,
+	"LIKE":      TokLIKE,
+	"CASE":      TokCASE,
+	"WHEN":      TokWHEN,
+	"THEN":      TokTHEN,
+	"ELSE":      TokELSE,
+	"END":       TokEND,
+	"DISTINCT":  TokDISTINCT,
+	"ASC":       TokASC,
+	"DESC":      TokDESC,
+	"INNER":     TokINNER,
+	"JOIN":      TokJOIN,
+	"ON":        TokON,
+	"LEFT":      TokLEFT,
+	"RIGHT":     TokRIGHT,
+	"OUTER":     TokOUTER,
+	"CROSS":     TokCROSS,
+	"HAVING":    TokHAVING,
+	"OFFSET":    TokOFFSET,
+	"UNION":     TokUNION,
+	"INTERSECT": TokINTERSECT,
+	"EXCEPT":    TokEXCEPT,
 }
 
 // Token is a lexical token produced by the Lexer.

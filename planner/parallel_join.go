@@ -9,16 +9,15 @@ import (
 	"github.com/ryderpongracic1/vexq/storage"
 )
 
-// tryParallelJoin detects the parallel hash join shape and builds an
-// exec.ParallelHashJoinAggregate for it. It is called from Parallel before the
-// aggregate-over-scan detection and is purely additive: every shape it does not
-// handle returns matched=false, leaving the existing path untouched.
+// tryParallelJoin detects the parallel hash join shape beneath an aggregate and
+// builds an exec.ParallelHashJoinAggregate for it. Parallel calls it before the
+// aggregate-over-scan detection and builds the post-aggregate operators (HAVING,
+// projection, ORDER BY, LIMIT) above whatever it returns. Every shape it does
+// not handle returns matched=false.
 //
-// Shapes handled — Limit and Sort above the aggregate are peeled and applied
-// serially to the small merged result, exactly as Parallel does for
-// aggregate-over-scan plans:
+// Shape handled:
 //
-//	(LogicalLimit →)? (LogicalSort →)? LogicalAggregate → (LogicalFilter →)?
+//	LogicalAggregate → (LogicalFilter →)?
 //	    LogicalJoin{Left: <any subtree>, Right: (LogicalFilter →)? LogicalScan}
 //
 // The join's Right side becomes the parallel probe side and must bottom out in a
@@ -35,7 +34,6 @@ import (
 // this is visible in results; see exec.ParallelHashJoinAggregate.
 //
 // Falls back (matched=false) for:
-//   - any root that is not an aggregate under optional Sort/Limit
 //   - an aggregate whose child is not a join (Parallel's own path handles scans)
 //   - a probe side that is not a scan (e.g. a right-deep join tree)
 //   - a join condition serial planning would also reject, so Physical reports
@@ -45,12 +43,7 @@ import (
 //
 // An error return means the shape matched but planning it failed — a failure
 // serial planning would hit as well.
-func tryParallelJoin(ctx context.Context, root LogicalNode, numWorkers int) (exec.Operator, bool, error) {
-	limitNode, sortNode, aggNode := peelToAggregate(root)
-	if aggNode == nil {
-		return nil, false, nil
-	}
-
+func tryParallelJoin(ctx context.Context, aggNode *LogicalAggregate, numWorkers int) (exec.Operator, bool, error) {
 	// A residual filter between the aggregate and the join applies to joined
 	// rows, so it runs inside each worker pipeline above the join.
 	child := aggNode.Child
@@ -159,20 +152,14 @@ func tryParallelJoin(ctx context.Context, root LogicalNode, numWorkers int) (exe
 	buildOpts := buildSideRadixOptions(ctx, joinNode.Left, buildSchema)
 
 	// morselSize=0 → exec uses defaultMorselSize (one row group).
-	var op exec.Operator = exec.NewParallelHashJoinAggregate(
+	return exec.NewParallelHashJoinAggregate(
 		buildFactory, buildKeyIdx,
 		probeFactory, probeKeyIdx,
 		aboveJoin,
 		totalRGs, numWorkers, 0,
 		groupByIdxs, aggExprs, outSchema,
 		buildOpts...,
-	)
-
-	op, err = wrapSerialSortLimit(op, sortNode, limitNode, outSchema)
-	if err != nil {
-		return nil, true, err
-	}
-	return op, true, nil
+	), true, nil
 }
 
 // ---- Scan-rooted morsel pipelines -------------------------------------------
@@ -229,7 +216,7 @@ func openScanPipeline(ctx context.Context, node LogicalNode) (*scanPipeline, err
 	}
 	// Filter preserves its child's schema, so the projected scan schema is the
 	// whole pipeline's schema regardless of any filter above it.
-	tempScan, err := exec.NewTableScanRange(r, scan.NeededCols, sp.zonePred, 0, 1)
+	tempScan, err := scan.openScan(r, sp.zonePred, 0, 1)
 	if err != nil {
 		return nil, fmt.Errorf("scan %q: %w", scan.TableName, err)
 	}
@@ -254,7 +241,7 @@ func (sp *scanPipeline) factory() exec.PipelineFactory {
 		if err != nil {
 			return nil, fmt.Errorf("parallel join morsel: open: %w", err)
 		}
-		ts, err := exec.NewTableScanRange(fr, scan.NeededCols, zonePred, rgStart, rgEnd)
+		ts, err := scan.openScan(fr, zonePred, rgStart, rgEnd)
 		if err != nil {
 			_ = fr.Close()
 			return nil, fmt.Errorf("parallel join morsel: scan: %w", err)
@@ -437,70 +424,4 @@ func sameFields(a, b exec.Schema) bool {
 		}
 	}
 	return true
-}
-
-// peelToAggregate strips an optional Limit → Sort prefix and returns the
-// aggregate beneath it. aggNode is nil when root is not one of:
-//
-//	LogicalAggregate | LogicalSort → LogicalAggregate |
-//	LogicalLimit → LogicalSort → LogicalAggregate
-//
-// A Limit is only peeled when a Sort sits under it. LIMIT without ORDER BY takes
-// an arbitrary subset of groups, and the merged parallel group order differs from
-// the serial insertion order, so parallelizing it would return a different (still
-// SQL-valid) subset than serial execution. Matching Parallel's own restriction
-// keeps the two paths result-identical.
-func peelToAggregate(root LogicalNode) (limitNode *LogicalLimit, sortNode *LogicalSort, aggNode *LogicalAggregate) {
-	if l, ok := root.(*LogicalLimit); ok {
-		s, ok := l.Child.(*LogicalSort)
-		if !ok {
-			return nil, nil, nil
-		}
-		limitNode = l
-		sortNode = s
-		root = s.Child
-	} else if s, ok := root.(*LogicalSort); ok {
-		sortNode = s
-		root = s.Child
-	}
-	agg, ok := root.(*LogicalAggregate)
-	if !ok {
-		return nil, nil, nil
-	}
-	return limitNode, sortNode, agg
-}
-
-// wrapSerialSortLimit applies peeled Sort/Limit nodes serially on top of a
-// parallel aggregate. The merged aggregate output is one row per group, so
-// sorting and limiting it in the calling goroutine is both correct and cheap.
-//
-// Parallel currently inlines equivalent logic; it can adopt this helper once the
-// parallel-aggregate and parallel-join work streams are integrated.
-func wrapSerialSortLimit(op exec.Operator, sortNode *LogicalSort, limitNode *LogicalLimit, outSchema exec.Schema) (exec.Operator, error) {
-	if sortNode != nil {
-		var keys []exec.SortKey
-		for _, ob := range sortNode.OrderBy {
-			cr, ok := ob.Expr.(*sql.ColumnRefExpr)
-			if !ok {
-				_ = op.Close()
-				return nil, fmt.Errorf("planner: parallel join: ORDER BY only supports column references")
-			}
-			idx := outSchema.IndexOf(cr.Name)
-			if idx < 0 {
-				_ = op.Close()
-				return nil, fmt.Errorf("planner: parallel join: ORDER BY column %q not found", cr.Name)
-			}
-			keys = append(keys, exec.SortKey{ColIdx: idx, Descending: ob.Descending})
-		}
-		sortOp, err := exec.NewExternalSort(op, keys)
-		if err != nil {
-			_ = op.Close()
-			return nil, fmt.Errorf("planner: parallel join: sort: %w", err)
-		}
-		op = sortOp
-	}
-	if limitNode != nil {
-		op = exec.NewLimit(op, int(limitNode.Count))
-	}
-	return op, nil
 }

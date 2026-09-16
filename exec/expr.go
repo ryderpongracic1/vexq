@@ -966,6 +966,11 @@ func (b *BinOp) evalArith(op BinOpKind, lv, rv Vector, n int) (Vector, error) {
 			if storage.IsNullBit(out.NullBitmap, i) {
 				continue
 			}
+			if op == BinDiv && r.Values[i] == 0 {
+				// Division by zero is NULL (as in SQLite), never a made-up value.
+				storage.SetNullBit(out.NullBitmap, i)
+				continue
+			}
 			out.Values[i] = applyArithInt64(op, l.Values[i], r.Values[i])
 		}
 		return out, nil
@@ -978,6 +983,10 @@ func (b *BinOp) evalArith(op BinOpKind, lv, rv Vector, n int) (Vector, error) {
 		mergeNullBitmapsInto(out.NullBitmap, lv.Nulls(), rv.Nulls(), n)
 		for i := 0; i < n; i++ {
 			if storage.IsNullBit(out.NullBitmap, i) {
+				continue
+			}
+			if op == BinDiv && r.Values[i] == 0 {
+				storage.SetNullBit(out.NullBitmap, i)
 				continue
 			}
 			out.Values[i] = applyArithFloat64(op, l.Values[i], r.Values[i])
@@ -1047,7 +1056,10 @@ func (a *AndExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if err != nil {
 		return nil, err
 	}
-	fv := first.(*BoolVector)
+	fv, ok := first.(*BoolVector)
+	if !ok {
+		return nil, fmt.Errorf("expr: AND requires boolean operands, got %T", first)
+	}
 	n := fv.Length
 	out := acquireBoolVector(&a.out, n)
 	copy(out.Bits, fv.Bits)
@@ -1057,10 +1069,22 @@ func (a *AndExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		if err != nil {
 			return nil, err
 		}
-		cv2 := cv.(*BoolVector)
+		cv2, ok := cv.(*BoolVector)
+		if !ok {
+			return nil, fmt.Errorf("expr: AND requires boolean operands, got %T", cv)
+		}
+		// SQL three-valued logic, a byte of rows at a time. With t = known
+		// true and f = known false on each side: the result is true when both
+		// are true, false when either is false — a NULL on the other side does
+		// not matter — and NULL otherwise. Folding only the bits would report
+		// FALSE AND NULL as NULL, which a filter treats the same as FALSE but
+		// NOT(...) above it would not.
 		for i := 0; i < (n+7)/8; i++ {
-			out.Bits[i] &= cv2.Bits[i]
-			out.NullBitmap[i] &= cv2.NullBitmap[i]
+			lt, lf := out.Bits[i]&out.NullBitmap[i], ^out.Bits[i]&out.NullBitmap[i]
+			rt, rf := cv2.Bits[i]&cv2.NullBitmap[i], ^cv2.Bits[i]&cv2.NullBitmap[i]
+			t, f := lt&rt, lf|rf
+			out.Bits[i] = t
+			out.NullBitmap[i] = t | f
 		}
 	}
 	return out, nil
@@ -1089,7 +1113,10 @@ func (o *OrExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	if err != nil {
 		return nil, err
 	}
-	fv := first.(*BoolVector)
+	fv, ok := first.(*BoolVector)
+	if !ok {
+		return nil, fmt.Errorf("expr: OR requires boolean operands, got %T", first)
+	}
 	n := fv.Length
 	out := acquireBoolVector(&o.out, n)
 	copy(out.Bits, fv.Bits)
@@ -1099,12 +1126,18 @@ func (o *OrExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		if err != nil {
 			return nil, err
 		}
-		cv2 := cv.(*BoolVector)
+		cv2, ok := cv.(*BoolVector)
+		if !ok {
+			return nil, fmt.Errorf("expr: OR requires boolean operands, got %T", cv)
+		}
+		// Three-valued OR: true when either side is true, false only when
+		// both are false, NULL otherwise (so NULL OR FALSE stays NULL).
 		for i := 0; i < (n+7)/8; i++ {
-			out.Bits[i] |= cv2.Bits[i]
-			// A row is non-null if either side is non-null AND true,
-			// or both sides are non-null. Simple: keep null if both are null.
-			out.NullBitmap[i] |= cv2.NullBitmap[i]
+			lt, lf := out.Bits[i]&out.NullBitmap[i], ^out.Bits[i]&out.NullBitmap[i]
+			rt, rf := cv2.Bits[i]&cv2.NullBitmap[i], ^cv2.Bits[i]&cv2.NullBitmap[i]
+			t, f := lt|rt, lf&rf
+			out.Bits[i] = t
+			out.NullBitmap[i] = t | f
 		}
 	}
 	return out, nil
@@ -1133,7 +1166,8 @@ func (n *NotExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 	out := acquireBoolVector(&n.out, child.Length)
 	for i := 0; i < (child.Length+7)/8; i++ {
 		out.NullBitmap[i] = child.NullBitmap[i]
-		out.Bits[i] = child.Bits[i] ^ child.NullBitmap[i] // only flip bits that are valid (not null)
+		// Flip valid rows only; a NULL row stays NULL with a clear bit.
+		out.Bits[i] = ^child.Bits[i] & child.NullBitmap[i]
 	}
 	return out, nil
 }
@@ -1187,11 +1221,19 @@ func (e *IsNotNullExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 
 // ---- InExpr -----------------------------------------------------------------
 
-// InExpr checks whether a column value is in a fixed set of literals.
+// InExpr checks whether a value is in a fixed set of literals, with SQL NULL
+// semantics: a NULL input yields NULL, a match yields TRUE, and no match yields
+// FALSE — or NULL when the literal list contained a NULL, because the input
+// might have equalled that unknown value. That last rule is what makes
+// `x NOT IN (2, NULL)` select nothing.
 type InExpr struct {
 	Child Expr
-	// Set holds typed values matching Child's type.
+	// Set holds the non-NULL list values, typed to match Child: int64 for
+	// INT64, float64 for FLOAT64, int32 days for DATE, string for STRING and
+	// bool for BOOL. A value of any other type never matches.
 	Set []any
+	// HasNull records that the literal list contained NULL.
+	HasNull bool
 
 	out *BoolVector
 }
@@ -1209,31 +1251,51 @@ func (e *InExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		if cv.IsNull(i) {
 			continue
 		}
-		storage.SetValidBit(out.NullBitmap, i)
 		found := false
 		switch col := cv.(type) {
 		case *Int64Vector:
 			for _, sv := range e.Set {
-				if col.Values[i] == sv.(int64) {
+				if v, ok := sv.(int64); ok && col.Values[i] == v {
 					found = true
 					break
 				}
 			}
 		case *Float64Vector:
 			for _, sv := range e.Set {
-				if col.Values[i] == sv.(float64) {
+				if v, ok := sv.(float64); ok && col.Values[i] == v {
+					found = true
+					break
+				}
+			}
+		case *DateVector:
+			for _, sv := range e.Set {
+				if v, ok := sv.(int32); ok && col.Values[i] == v {
 					found = true
 					break
 				}
 			}
 		case *StringVector:
+			s := col.Get(i)
 			for _, sv := range e.Set {
-				if col.Get(i) == sv.(string) {
+				if v, ok := sv.(string); ok && s == v {
 					found = true
 					break
 				}
 			}
+		case *BoolVector:
+			for _, sv := range e.Set {
+				if v, ok := sv.(bool); ok && col.Get(i) == v {
+					found = true
+					break
+				}
+			}
+		default:
+			return nil, fmt.Errorf("expr: IN not supported for %T", cv)
 		}
+		if !found && e.HasNull {
+			continue // unknown: leave the row NULL
+		}
+		storage.SetValidBit(out.NullBitmap, i)
 		out.Set(i, found)
 	}
 	return out, nil

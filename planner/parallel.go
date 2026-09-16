@@ -6,44 +6,46 @@ import (
 	"runtime"
 
 	"github.com/ryderpongracic1/vexq/exec"
-	"github.com/ryderpongracic1/vexq/sql"
 	"github.com/ryderpongracic1/vexq/storage"
 )
 
-// Parallel returns a ParallelHashAggregate when the plan matches one of these
-// patterns:
+// Parallel builds a physical plan in which the query's aggregate runs as a
+// morsel-parallel operator, when the plan has one it can parallelize:
 //
-//	LogicalAggregate → (LogicalFilter →)? LogicalScan
-//	LogicalSort → LogicalAggregate → (LogicalFilter →)? LogicalScan
-//	LogicalLimit → LogicalSort → LogicalAggregate → (LogicalFilter →)? LogicalScan
+//	(post-aggregate operators →)? LogicalAggregate → (LogicalFilter →)? LogicalScan
+//	(post-aggregate operators →)? LogicalAggregate → (LogicalFilter →)? LogicalJoin
 //
-// For Sort/Limit-wrapped shapes, the aggregate is parallelized and the merged
-// result (which is small — one row per group) is sorted/limited serially.
+// The post-aggregate operators are the chain Build places above an aggregate —
+// the HAVING filter, the SELECT-list projection, DISTINCT, ORDER BY,
+// LIMIT/OFFSET and the final renaming projection — in any combination. The
+// aggregate's merged output is small (one row per group), so that chain is built
+// serially over the parallel aggregate exactly as Physical would build it over a
+// serial one, and the whole query returns the same rows either way.
 //
-// It partitions the scan's row groups evenly across numWorkers goroutines,
-// each running an independent scan+filter+pre-projection pipeline, then merges
-// the partial aggregate results in the calling goroutine.
-//
-// Aggregates over computed expressions (e.g. SUM(price * discount), the
-// canonical TPC-H Q6 shape) are parallelized: each worker pipeline ends with
+// For an aggregate over a scan, the scan's row groups are partitioned across
+// numWorkers goroutines, each running an independent scan+filter+pre-projection
+// pipeline, and the partial aggregate results are merged in the calling
+// goroutine. Aggregates over computed expressions (e.g. SUM(price * discount),
+// the canonical TPC-H Q6 shape) are parallelized: each worker pipeline ends with
 // the same pre-projection that the serial planner applies, materializing the
 // expression into a synthetic column per morsel before local accumulation. The
 // expression is row-local, so evaluating it per morsel is equivalent to
-// evaluating it over the whole scan.
-//
-// Aggregates over an inner hash join are handled by tryParallelJoin
-// ([planner/parallel_join.go]), which parallelizes the probe side.
+// evaluating it over the whole scan. Aggregates over an inner hash join are
+// handled by tryParallelJoin ([planner/parallel_join.go]), which parallelizes the
+// probe side.
 //
 // Float64 SUM/AVG results agree with serial execution to within IEEE-754
 // rounding rather than bit-for-bit: partitioning changes the order of float
 // additions, and float addition is not associative. This is a property of any
-// partitioned float reduction and already applies to the simple-column parallel
-// path; integer SUM/MIN/MAX and COUNT are exact. The project's correctness
-// standard for float aggregates is the 1e-9 relative tolerance used by
-// internal/goldentest.
+// partitioned float reduction; integer SUM/MIN/MAX and COUNT are exact. The
+// project's correctness standard for float aggregates is the 1e-9 relative
+// tolerance used by internal/goldentest.
 //
 // Falls back to Physical(ctx, root) when:
-//   - root is not a LogicalAggregate (or Sort/Limit above an aggregate)
+//   - the plan has no aggregate beneath its post-aggregate chain
+//   - the chain has a LIMIT or OFFSET with no ORDER BY beneath it: which groups
+//     survive would depend on group emission order, which differs between the
+//     serial and parallel aggregates
 //   - the aggregate child (after peeling an optional LogicalFilter) is neither a
 //     LogicalScan nor a join shape tryParallelJoin recognizes
 //   - any aggregate uses DISTINCT (partial distinct counts cannot be summed)
@@ -56,49 +58,105 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		numWorkers = runtime.NumCPU()
 	}
 
-	// Probe-side-parallel hash join (planner/parallel_join.go). Additive: it
-	// returns matched=false for every shape it does not handle, so the
-	// aggregate-over-scan detection below is unchanged.
-	if op, matched, err := tryParallelJoin(ctx, root, numWorkers); err != nil {
-		return nil, err
-	} else if matched {
-		return op, nil
+	aggNode := aggregateUnderPostOps(root)
+	if aggNode == nil {
+		return Physical(ctx, root)
 	}
 
-	// ---- Plan shape detection ------------------------------------------------
-	// Peel optional Limit → Sort above the aggregate. The aggregate output is
-	// small (one row per group), so serial sort/limit is correct and cheap.
-
-	var sortNode *LogicalSort
-	var limitNode *LogicalLimit
-
-	aggNode, ok := root.(*LogicalAggregate)
-	if !ok {
-		// Try Sort → Aggregate or Limit → Sort → Aggregate.
-		if s, ok := root.(*LogicalSort); ok {
-			if a, ok := s.Child.(*LogicalAggregate); ok {
-				sortNode = s
-				aggNode = a
-			} else {
-				return Physical(ctx, root) // sort over non-aggregate — fallback
-			}
-		} else if l, ok := root.(*LogicalLimit); ok {
-			if s, ok := l.Child.(*LogicalSort); ok {
-				if a, ok := s.Child.(*LogicalAggregate); ok {
-					limitNode = l
-					sortNode = s
-					aggNode = a
-				} else {
-					return Physical(ctx, root)
-				}
-			} else {
-				return Physical(ctx, root)
-			}
-		} else {
-			return Physical(ctx, root)
+	// Probe-side-parallel hash join (planner/parallel_join.go) first; it
+	// declines every shape it does not handle.
+	aggOp, matched, err := tryParallelJoin(ctx, aggNode, numWorkers)
+	if err != nil {
+		return nil, err
+	}
+	if !matched {
+		if aggOp, matched, err = tryParallelScanAggregate(ctx, aggNode, numWorkers); err != nil {
+			return nil, err
 		}
 	}
+	if !matched {
+		return Physical(ctx, root)
+	}
+	return buildAbove(root, aggNode, aggOp)
+}
 
+// aggregateUnderPostOps returns the aggregate beneath root's chain of
+// post-aggregate operators, or nil when root has no such aggregate or when the
+// chain applies LIMIT/OFFSET without an ORDER BY between it and the aggregate.
+func aggregateUnderPostOps(root LogicalNode) *LogicalAggregate {
+	unorderedLimit := false
+	for node := root; ; {
+		switch n := node.(type) {
+		case *LogicalAggregate:
+			if unorderedLimit {
+				return nil
+			}
+			return n
+		case *LogicalLimit:
+			unorderedLimit = true
+			node = n.Child
+		case *LogicalSort:
+			unorderedLimit = false
+			node = n.Child
+		case *LogicalProject:
+			node = n.Child
+		case *LogicalFilter:
+			node = n.Child
+		case *LogicalDistinct:
+			node = n.Child
+		default:
+			return nil
+		}
+	}
+}
+
+// buildAbove builds the operators of node's subtree above target, with op
+// standing in for target. Each builder closes its child on failure, so op is
+// closed exactly once if anything fails.
+func buildAbove(node LogicalNode, target *LogicalAggregate, op exec.Operator) (exec.Operator, error) {
+	if agg, ok := node.(*LogicalAggregate); ok && agg == target {
+		return op, nil
+	}
+	switch n := node.(type) {
+	case *LogicalFilter:
+		child, err := buildAbove(n.Child, target, op)
+		if err != nil {
+			return nil, err
+		}
+		return buildFilterOp(n, child)
+	case *LogicalProject:
+		child, err := buildAbove(n.Child, target, op)
+		if err != nil {
+			return nil, err
+		}
+		return buildProjectOp(n, child)
+	case *LogicalSort:
+		child, err := buildAbove(n.Child, target, op)
+		if err != nil {
+			return nil, err
+		}
+		return buildSortOp(n, child)
+	case *LogicalLimit:
+		child, err := buildAbove(n.Child, target, op)
+		if err != nil {
+			return nil, err
+		}
+		return buildLimitOp(n, child), nil
+	case *LogicalDistinct:
+		child, err := buildAbove(n.Child, target, op)
+		if err != nil {
+			return nil, err
+		}
+		return exec.NewDistinct(child), nil
+	}
+	_ = op.Close()
+	return nil, fmt.Errorf("planner: parallel: unexpected %T above aggregate", node)
+}
+
+// tryParallelScanAggregate builds a ParallelHashAggregate for an aggregate over
+// an optionally filtered scan. matched=false means the shape is not handled and
+// the caller should fall back to serial planning.
+func tryParallelScanAggregate(ctx context.Context, aggNode *LogicalAggregate, numWorkers int) (exec.Operator, bool, error) {
 	child := aggNode.Child
 
 	// Peel an optional LogicalFilter.
@@ -111,21 +169,21 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 	// The next node must be a LogicalScan (no join, no subquery).
 	scanNode, ok := child.(*LogicalScan)
 	if !ok {
-		return Physical(ctx, root) // unsupported shape — fallback
+		return nil, false, nil
 	}
 
 	// ---- Row group count -----------------------------------------------------
 
 	r, err := storage.Open(ctx, scanNode.FilePath)
 	if err != nil {
-		return nil, fmt.Errorf("planner: parallel: open %q: %w", scanNode.FilePath, err)
+		return nil, false, fmt.Errorf("planner: parallel: open %q: %w", scanNode.FilePath, err)
 	}
 	totalRGs := len(r.Meta().RowGroups)
 	_ = r.Close()
 
 	if totalRGs == 0 {
-		// Empty table: fall back to serial execution (degenerate case).
-		return Physical(ctx, root)
+		// Empty table: serial execution (degenerate case).
+		return nil, false, nil
 	}
 
 	// ---- Factory closure ----------------------------------------------------
@@ -149,7 +207,7 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 		if err != nil {
 			return nil, fmt.Errorf("parallel factory: open: %w", err)
 		}
-		scan, err := exec.NewTableScanRange(fr, scanNode.NeededCols, zonePred, rgStart, rgEnd)
+		scan, err := scanNode.openScan(fr, zonePred, rgStart, rgEnd)
 		if err != nil {
 			_ = fr.Close()
 			return nil, fmt.Errorf("parallel factory: scan: %w", err)
@@ -167,7 +225,7 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 			}
 			op, err = exec.NewFilter(op, filterExpr)
 			if err != nil {
-				_ = op.Close()
+				_ = scan.Close()
 				return nil, err
 			}
 		}
@@ -180,12 +238,12 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 			}
 		}
 
-		op, err = buildPreProjection(aggNode, op)
+		preOp, err := buildPreProjection(aggNode, op)
 		if err != nil {
 			_ = op.Close()
 			return nil, err
 		}
-		return op, nil
+		return preOp, nil
 	}
 
 	// ---- Pipeline schema detection ------------------------------------------
@@ -197,14 +255,11 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 	// A probe failure means this plan cannot be described to the parallel
 	// aggregate, so fall back to Physical: it is the authoritative
 	// implementation and will either execute the plan or report the real error.
-	// This keeps planner-detection gaps (for example a scan column list naming a
-	// column the file does not contain) degrading to serial execution instead of
-	// surfacing as a query error.
 
 	// totalRGs >= 1 here, so a single-row-group probe range is always valid.
 	probe, err := factory(ctx, 0, 1)
 	if err != nil {
-		return Physical(ctx, root)
+		return nil, false, nil
 	}
 	pipelineSchema := probe.Schema()
 	_ = probe.Close()
@@ -213,7 +268,7 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 
 	groupByIdxs, aggExprs, err := resolveAggConfig(aggNode, pipelineSchema)
 	if err != nil {
-		return Physical(ctx, root)
+		return nil, false, nil
 	}
 
 	// Fall back to serial execution if any aggregate uses DISTINCT.
@@ -223,7 +278,7 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 	// Serial execution is correct; parallel COUNT(DISTINCT) is a future improvement.
 	for _, ae := range aggExprs {
 		if ae.Kind == exec.AggCountDistinct {
-			return Physical(ctx, root)
+			return nil, false, nil
 		}
 	}
 
@@ -231,41 +286,7 @@ func Parallel(ctx context.Context, root LogicalNode, numWorkers int) (exec.Opera
 	outSchema := aggOutputSchema(aggNode, pipelineSchema, groupByIdxs, aggExprs)
 
 	// morselSize=0 → exec package uses defaultMorselSize (1 row group).
-	// Tune via environment or query hints in future work.
-	var op exec.Operator = exec.NewParallelHashAggregate(factory, totalRGs, numWorkers, 0, groupByIdxs, aggExprs, outSchema)
-
-	// ---- Wrap with peeled Sort/Limit ----------------------------------------
-	// The merged aggregate output is small (one row per group), so sorting and
-	// limiting it serially is correct and cheap.
-
-	if sortNode != nil {
-		var keys []exec.SortKey
-		for _, ob := range sortNode.OrderBy {
-			cr, ok := ob.Expr.(*sql.ColumnRefExpr)
-			if !ok {
-				_ = op.Close()
-				return nil, fmt.Errorf("planner: parallel: ORDER BY only supports column references")
-			}
-			idx := outSchema.IndexOf(cr.Name)
-			if idx < 0 {
-				_ = op.Close()
-				return nil, fmt.Errorf("planner: parallel: ORDER BY column %q not found", cr.Name)
-			}
-			keys = append(keys, exec.SortKey{ColIdx: idx, Descending: ob.Descending})
-		}
-		sortOp, err := exec.NewExternalSort(op, keys)
-		if err != nil {
-			_ = op.Close()
-			return nil, fmt.Errorf("planner: parallel: sort: %w", err)
-		}
-		op = sortOp
-	}
-
-	if limitNode != nil {
-		op = exec.NewLimit(op, int(limitNode.Count))
-	}
-
-	return op, nil
+	return exec.NewParallelHashAggregate(factory, totalRGs, numWorkers, 0, groupByIdxs, aggExprs, outSchema), true, nil
 }
 
 // aggOutputSchema computes the output schema of a HashAggregate without needing

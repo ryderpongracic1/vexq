@@ -141,7 +141,8 @@ func (s *ExternalSort) less(a, b sortRow) bool {
 		if bN {
 			return false
 		}
-		if s.schema.Fields[ci].Type == TypeString {
+		switch s.schema.Fields[ci].Type {
+		case TypeString:
 			as, bs := a.strValues[ci], b.strValues[ci]
 			if as == bs {
 				continue
@@ -150,6 +151,22 @@ func (s *ExternalSort) less(a, b sortRow) bool {
 				return as > bs
 			}
 			return as < bs
+		case TypeFloat64:
+			// values holds IEEE bits, whose integer order is not numeric order
+			// for negative numbers.
+			af := math.Float64frombits(uint64(a.values[ci]))
+			bf := math.Float64frombits(uint64(b.values[ci]))
+			if af == bf || (math.IsNaN(af) && math.IsNaN(bf)) {
+				continue
+			}
+			if math.IsNaN(af) || math.IsNaN(bf) {
+				// NaN sorts after every number, before or after per direction.
+				return math.IsNaN(bf) != key.Descending
+			}
+			if key.Descending {
+				return af > bf
+			}
+			return af < bf
 		}
 		if a.values[ci] == b.values[ci] {
 			continue
@@ -206,6 +223,16 @@ func (s *ExternalSort) emitBatch(rows []sortRow) *Batch {
 				}
 			}
 			vecs[c] = newStringVector(db, codes, nullBmp)
+
+		case TypeBool:
+			out := &BoolVector{Bits: make([]byte, (n+7)/8), NullBitmap: make([]byte, (n+7)/8), Length: n}
+			for i, r := range rows {
+				if !r.nulls[c] {
+					out.Set(i, r.values[c] != 0)
+					storage.SetValidBit(out.NullBitmap, i)
+				}
+			}
+			vecs[c] = out
 
 		default:
 			out := &Int64Vector{Values: make([]int64, n), NullBitmap: make([]byte, (n+7)/8)}

@@ -3,7 +3,7 @@
 // Usage:
 //
 //	vexq [--workers=N] <file.vxq> [file2.vxq ...] "SELECT ..."  – execute a SQL query
-//	vexq fsck <file.vxq>                                         – validate file integrity
+//	vexq fsck <file.vxq>                                         – validate file integrity (checksums, encodings, zone maps)
 package main
 
 import (
@@ -325,6 +325,15 @@ func runFsck(path string) error {
 				blockNum++
 			}
 			cr.Close()
+
+			// Verify the zone map against the data. The planner skips row groups
+			// whose min/max rule out a predicate, so a zone map that disagrees
+			// with the stored values makes queries silently miss rows — and the
+			// footer CRC cannot catch it.
+			if err := r.VerifyColumnStats(ctx, rg, col); err != nil {
+				fmt.Printf("  ERROR: row group %d col %s: %v\n", rg, f.Name, err)
+				colErrors++
+			}
 		}
 		totalErrors += colErrors
 	}

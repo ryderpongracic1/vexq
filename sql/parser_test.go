@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -258,5 +259,90 @@ func TestParseHavingWithWhere(t *testing.T) {
 	}
 	if hCol.Name != "total" {
 		t.Fatalf("expected 'total' in HAVING, got %q", hCol.Name)
+	}
+}
+
+func TestParseLimitOffset(t *testing.T) {
+	cases := []struct {
+		query         string
+		limit, offset int64 // -1 = absent
+	}{
+		{"SELECT a FROM t LIMIT 5 OFFSET 10", 5, 10},
+		{"SELECT a FROM t OFFSET 10 LIMIT 5", 5, 10},
+		{"SELECT a FROM t OFFSET 3", -1, 3},
+		{"SELECT a FROM t LIMIT 0", 0, -1},
+	}
+	for _, tc := range cases {
+		stmt := mustParse(t, tc.query)
+		gotLimit, gotOffset := int64(-1), int64(-1)
+		if stmt.Limit != nil {
+			gotLimit = *stmt.Limit
+		}
+		if stmt.Offset != nil {
+			gotOffset = *stmt.Offset
+		}
+		if gotLimit != tc.limit || gotOffset != tc.offset {
+			t.Errorf("%s: limit=%d offset=%d, want limit=%d offset=%d", tc.query, gotLimit, gotOffset, tc.limit, tc.offset)
+		}
+	}
+}
+
+func TestParseRejectsUnconsumedInput(t *testing.T) {
+	cases := []struct {
+		query, want string
+	}{
+		{"SELECT a FROM t UNION SELECT b FROM u", "UNION is not supported"},
+		{"SELECT a FROM t INTERSECT SELECT b FROM u", "INTERSECT is not supported"},
+		{"SELECT a FROM t EXCEPT SELECT b FROM u", "EXCEPT is not supported"},
+		{"SELECT a FROM t LIMIT 1 UNION SELECT b FROM u", "UNION is not supported"},
+		{"SELECT a FROM t LIMIT 1 2", "unexpected"},
+		{"SELECT a FROM t ORDER BY a banana", "unexpected"},
+		{"SELECT a FROM t; SELECT b FROM u", "unexpected"},
+		{"SELECT a FROM t LIMIT 1 LIMIT 2", "duplicate LIMIT"},
+		{"SELECT a FROM t OFFSET -1", "OFFSET requires a non-negative integer"},
+		{"SELECT a FROM t LIMIT 99999999999999999999", "out of range"},
+		{"SELECT a FROM t WHERE a = 99999999999999999999", "out of range"},
+	}
+	for _, tc := range cases {
+		_, err := NewParser(tc.query).ParseStatement()
+		if err == nil {
+			t.Errorf("%s: parsed without error", tc.query)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %q does not contain %q", tc.query, err, tc.want)
+		}
+	}
+	// A single trailing semicolon is accepted.
+	mustParse(t, "SELECT a FROM t LIMIT 1;")
+	// OFFSET is a keyword but still usable as a column name.
+	if stmt := mustParse(t, "SELECT offset FROM t WHERE offset > 1 LIMIT 2 OFFSET 1"); *stmt.Offset != 1 {
+		t.Errorf("offset = %d, want 1", *stmt.Offset)
+	}
+}
+
+func TestParseNegativeNumericLiterals(t *testing.T) {
+	stmt := mustParse(t, "SELECT a FROM t WHERE a IN (-2, -2.5, -9223372036854775808) AND b > -1")
+	and := stmt.Where.(*BinaryExpr)
+	in := and.Left.(*InExpr)
+	if v, ok := in.List[0].(*IntLiteral); !ok || v.Value != -2 {
+		t.Errorf("IN[0] = %#v, want IntLiteral(-2)", in.List[0])
+	}
+	if v, ok := in.List[1].(*FloatLiteral); !ok || v.Value != -2.5 {
+		t.Errorf("IN[1] = %#v, want FloatLiteral(-2.5)", in.List[1])
+	}
+	if v, ok := in.List[2].(*IntLiteral); !ok || v.Value != -9223372036854775808 {
+		t.Errorf("IN[2] = %#v, want the minimum int64", in.List[2])
+	}
+	if v, ok := and.Right.(*BinaryExpr).Right.(*IntLiteral); !ok || v.Value != -1 {
+		t.Errorf("comparison literal = %#v, want IntLiteral(-1)", and.Right.(*BinaryExpr).Right)
+	}
+	// Minus on a non-literal stays a unary expression.
+	if _, ok := mustParse(t, "SELECT -a FROM t").Columns[0].Expr.(*UnaryExpr); !ok {
+		t.Error("-a should parse as UnaryExpr")
+	}
+	// Binary minus is unaffected.
+	if b, ok := mustParse(t, "SELECT a - 1 FROM t").Columns[0].Expr.(*BinaryExpr); !ok || b.Op != OpSub {
+		t.Error("a - 1 should parse as subtraction")
 	}
 }

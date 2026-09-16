@@ -44,7 +44,8 @@ func writeTestFile(t *testing.T, n int) string {
 
 func TestAggregateInvalidColumn(t *testing.T) {
 	// A query referencing a nonexistent column in SUM should produce a planner
-	// error, not a panic in the execution layer.
+	// error, not a panic in the execution layer. Build resolves every column
+	// reference, so that is where it is reported.
 	path := writeTestFile(t, 10)
 	cat, err := catalog.OpenSingle(ctx, "test", path)
 	if err != nil {
@@ -59,13 +60,7 @@ func TestAggregateInvalidColumn(t *testing.T) {
 	}
 	stmt := node.(*sql.SelectStmt)
 
-	logical, err := planner.Build(ctx, stmt, cat)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	logical = planner.Optimize(logical)
-
-	_, err = planner.Physical(ctx, logical)
+	_, err = planner.Build(ctx, stmt, cat)
 	if err == nil {
 		t.Fatal("expected planner error for nonexistent aggregate column, got nil")
 	}

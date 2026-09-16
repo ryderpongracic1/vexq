@@ -15,7 +15,7 @@
 | 11 | SIMD filter kernel benchmark — AVX2 ceiling measurement ([`bench/simd_filter/`](../bench/simd_filter/)) | ✅ Complete |
 | 12 | Parallel scaling — decode-buffer reuse, sort-peeling, GC diagnosis | ✅ Complete |
 | 13 | Aggregate optimization — packed dictionary-code integer keys | ✅ Complete |
-| 14 | Correctness oracle — golden test suite (now 72 queries, 4 oracle paths) ([`internal/goldentest/`](../internal/goldentest/)) | ✅ Complete |
+| 14 | Correctness oracle — golden test suite (now 107 queries, 4 oracle paths) ([`internal/goldentest/`](../internal/goldentest/)) | ✅ Complete |
 | 15 | Expression eval hardening — NOT precedence, date coercion, CASE WHEN strings, COUNT(DISTINCT) | ✅ Complete |
 | 16 | Coarse-grained I/O — row-group-buffered reads, 62.9× pread reduction | ✅ Complete |
 | 17 | Parallel expression aggregates + parallel hash join (probe side) | ✅ Complete |
@@ -23,3 +23,4 @@
 | 19 | Radix-partitioned parallel join build — lock-free two-pass, 64-partition measured optimum | ✅ Complete |
 | 20 | Allocation campaign — scratch buffers, flat join table, window pool, pipeline reuse, rowSet, dict memo, presizing | ✅ Complete |
 | 21 | Correctness hardening — stacked-filter physical-length convention; string/date/bool aggregates; oracle to 72 queries / 4 paths | ✅ Complete |
+| 22 | SQL semantics fixes from external review — join residual predicates, table-qualified column identity, `IN`/`NOT IN` NULL and type semantics, SELECT-list-shaped aggregate output, full `HAVING`/`ORDER BY` resolution, `OFFSET`, rejection of unparsed input, three-valued `AND`/`OR`, zone-map verification in `fsck`; oracle to 107 queries with parallel errors failing | ✅ Complete |

@@ -19,11 +19,31 @@ func (p *Parser) ParseStatement() (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch tok.Kind {
-	case TokSELECT:
-		return p.parseSelect()
-	default:
+	if tok.Kind != TokSELECT {
 		return nil, fmt.Errorf("sql: expected SELECT at position %d, got %q", tok.Pos, tok.Text)
+	}
+	stmt, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	// The statement must consume the whole input. Anything the grammar does not
+	// recognise is an error rather than silently ignored: a trailing clause the
+	// engine skipped would otherwise return a different result than the query
+	// asked for.
+	if tok, _ := p.peek(); tok.Kind == TokSemicolon {
+		p.next()
+	}
+	tok, err = p.peek()
+	if err != nil {
+		return nil, err
+	}
+	switch tok.Kind {
+	case TokEOF:
+		return stmt, nil
+	case TokUNION, TokINTERSECT, TokEXCEPT:
+		return nil, fmt.Errorf("sql: %s is not supported (position %d)", strings.ToUpper(tok.Text), tok.Pos)
+	default:
+		return nil, fmt.Errorf("sql: unexpected %q at position %d", tok.Text, tok.Pos)
 	}
 }
 
@@ -111,18 +131,47 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.OrderBy = items
 	}
 
-	// LIMIT.
-	if tok, _ := p.peek(); tok.Kind == TokLIMIT {
+	// LIMIT and OFFSET, in either order.
+	for {
+		tok, _ := p.peek()
+		var dst **int64
+		switch tok.Kind {
+		case TokLIMIT:
+			dst = &stmt.Limit
+		case TokOFFSET:
+			dst = &stmt.Offset
+		}
+		if dst == nil {
+			break
+		}
+		if *dst != nil {
+			return nil, fmt.Errorf("sql: duplicate %s at position %d", strings.ToUpper(tok.Text), tok.Pos)
+		}
 		p.next()
-		tok, err := p.expect(TokInt)
+		n, err := p.parseCount(strings.ToUpper(tok.Text))
 		if err != nil {
 			return nil, err
 		}
-		n, _ := strconv.ParseInt(tok.Text, 10, 64)
-		stmt.Limit = &n
+		*dst = &n
 	}
 
 	return stmt, nil
+}
+
+// parseCount parses the non-negative integer that follows LIMIT or OFFSET.
+func (p *Parser) parseCount(clause string) (int64, error) {
+	tok, err := p.next()
+	if err != nil {
+		return 0, err
+	}
+	if tok.Kind != TokInt {
+		return 0, fmt.Errorf("sql: %s requires a non-negative integer, got %q at position %d", clause, tok.Text, tok.Pos)
+	}
+	n, err := strconv.ParseInt(tok.Text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("sql: %s value %q at position %d is out of range", clause, tok.Text, tok.Pos)
+	}
+	return n, nil
 }
 
 func (p *Parser) parseSelectColumns() ([]SelectColumn, error) {
@@ -442,6 +491,16 @@ func (p *Parser) parseUnary() (Expr, error) {
 		return &UnaryExpr{Op: OpNot, Expr: expr}, nil
 	case TokMinus:
 		p.next()
+		// Fold a minus directly in front of a numeric literal into a negative
+		// literal. Consumers that only accept literals (IN lists, zone-map
+		// pruning, LIMIT-style constants) would otherwise see a UnaryExpr and
+		// could not treat -2 as the constant it is. Parsing the sign together
+		// with the digits also admits the minimum int64, whose magnitude does
+		// not fit in an int64 on its own.
+		if next, _ := p.peek(); next.Kind == TokInt || next.Kind == TokFloat {
+			p.next()
+			return numericLiteral(next, "-")
+		}
 		expr, err := p.parseUnary()
 		if err != nil {
 			return nil, err
@@ -458,13 +517,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	}
 
 	switch tok.Kind {
-	case TokInt:
-		v, _ := strconv.ParseInt(tok.Text, 10, 64)
-		return &IntLiteral{Value: v}, nil
-
-	case TokFloat:
-		v, _ := strconv.ParseFloat(tok.Text, 64)
-		return &FloatLiteral{Value: v}, nil
+	case TokInt, TokFloat:
+		return numericLiteral(tok, "")
 
 	case TokString:
 		return &StringLiteral{Value: tok.Text}, nil
@@ -529,11 +583,30 @@ func (p *Parser) parsePrimary() (Expr, error) {
 
 	// Keyword identifiers that can appear as column names.
 	case TokSELECT, TokFROM, TokWHERE, TokGROUP, TokBY, TokORDER,
-		TokLIMIT, TokAS, TokON, TokJOIN, TokINNER, TokLEFT, TokRIGHT:
+		TokLIMIT, TokOFFSET, TokAS, TokON, TokJOIN, TokINNER, TokLEFT, TokRIGHT:
 		return &ColumnRefExpr{Name: tok.Text}, nil
 	}
 
 	return nil, fmt.Errorf("sql: unexpected token %q at position %d", tok.Text, tok.Pos)
+}
+
+// numericLiteral converts an integer or float token, with an optional sign
+// prefix, into a literal node. An integer that does not fit in int64 is an error
+// rather than a silent zero.
+func numericLiteral(tok Token, sign string) (Expr, error) {
+	text := sign + tok.Text
+	if tok.Kind == TokInt {
+		v, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("sql: integer literal %s at position %d is out of range", text, tok.Pos)
+		}
+		return &IntLiteral{Value: v}, nil
+	}
+	v, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return nil, fmt.Errorf("sql: invalid numeric literal %s at position %d", text, tok.Pos)
+	}
+	return &FloatLiteral{Value: v}, nil
 }
 
 var aggFuncs = map[string]bool{

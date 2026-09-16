@@ -73,7 +73,14 @@ func Evaluate(stmt *sql.SelectStmt, tables []Table) (*RefResult, error) {
 		}
 	}
 
-	// Step 7: LIMIT.
+	// Step 7: OFFSET, then LIMIT.
+	if stmt.Offset != nil {
+		offset := int(*stmt.Offset)
+		if offset > len(result.Rows) {
+			offset = len(result.Rows)
+		}
+		result.Rows = result.Rows[offset:]
+	}
 	if stmt.Limit != nil {
 		limit := int(*stmt.Limit)
 		if limit < len(result.Rows) {

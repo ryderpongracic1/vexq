@@ -2,7 +2,7 @@
 
 // DuckDB SOTA baseline benchmarks.
 // Build and run with: go test ./bench/tpch/ -tags duckdb -bench=BenchmarkDuckDB -benchtime=3x -v
-// Setup first:        go test ./bench/tpch/ -tags duckdb -run TestSetupDuckDB -v
+// Setup first:        VEXQ_SETUP_DUCKDB=1 go test ./bench/tpch/ -tags duckdb -run TestSetupDuckDB -v
 package tpch
 
 import (
@@ -36,9 +36,14 @@ func openDuckDB(t testing.TB) *sql.DB {
 
 // ---- DuckDB setup ----------------------------------------------------------
 
-// TestSetupDuckDB loads the TPC-H .tbl files into a DuckDB database.
-// Run once with: go test ./bench/tpch/ -tags duckdb -run TestSetupDuckDB -v
+// TestSetupDuckDB loads the TPC-H .tbl files into a DuckDB database, replacing
+// its tables. Like TestSetupSQLite it only runs when VEXQ_SETUP_DUCKDB=1 is set,
+// so `go test -tags duckdb ./...` does not rebuild the benchmark database.
+// Run once with: VEXQ_SETUP_DUCKDB=1 go test ./bench/tpch/ -tags duckdb -run TestSetupDuckDB -v
 func TestSetupDuckDB(t *testing.T) {
+	if os.Getenv("VEXQ_SETUP_DUCKDB") != "1" {
+		t.Skip("rebuilds data/tpch.duckdb; set VEXQ_SETUP_DUCKDB=1 to run")
+	}
 	dbPath := duckDBPath(t)
 
 	db, err := sql.Open("duckdb", dbPath)

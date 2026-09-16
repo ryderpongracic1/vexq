@@ -50,7 +50,7 @@ func physicalScan(ctx context.Context, n *LogicalScan) (exec.Operator, error) {
 		zonePred = buildZonePredicate(n.Predicate, n.Schema)
 	}
 
-	scan, err := exec.NewTableScan(r, n.NeededCols, zonePred)
+	scan, err := n.openScan(r, zonePred, 0, len(r.Meta().RowGroups))
 	if err != nil {
 		_ = r.Close()
 		return nil, fmt.Errorf("planner: scan %q: %w", n.TableName, err)
@@ -263,6 +263,12 @@ func physicalSort(ctx context.Context, n *LogicalSort) (exec.Operator, error) {
 	if err != nil {
 		return nil, err
 	}
+	return buildSortOp(n, child)
+}
+
+// buildSortOp wraps an already-constructed child operator with a sort for n,
+// closing child on failure.
+func buildSortOp(n *LogicalSort, child exec.Operator) (exec.Operator, error) {
 	schema := child.Schema()
 	var keys []exec.SortKey
 	for _, ob := range n.OrderBy {
@@ -278,7 +284,12 @@ func physicalSort(ctx context.Context, n *LogicalSort) (exec.Operator, error) {
 		}
 		keys = append(keys, exec.SortKey{ColIdx: idx, Descending: ob.Descending})
 	}
-	return exec.NewExternalSort(child, keys)
+	op, err := exec.NewExternalSort(child, keys)
+	if err != nil {
+		_ = child.Close()
+		return nil, err
+	}
+	return op, nil
 }
 
 func physicalLimit(ctx context.Context, n *LogicalLimit) (exec.Operator, error) {
@@ -286,7 +297,11 @@ func physicalLimit(ctx context.Context, n *LogicalLimit) (exec.Operator, error) 
 	if err != nil {
 		return nil, err
 	}
-	return exec.NewLimit(child, int(n.Count)), nil
+	return buildLimitOp(n, child), nil
+}
+
+func buildLimitOp(n *LogicalLimit, child exec.Operator) exec.Operator {
+	return exec.NewLimitOffset(child, int(n.Count), int(n.Offset))
 }
 
 func physicalDistinct(ctx context.Context, n *LogicalDistinct) (exec.Operator, error) {
@@ -422,9 +437,20 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Coerce lo/hi literals to match the column type (e.g. int→date).
+		// Coerce lo/hi literals to match the column type (e.g. int→date). An
+		// INT64/FLOAT64 mix that remains (ax BETWEEN 1.5 AND 3.5) is compared
+		// as FLOAT64, so all three operands are cast together.
 		_, lo = coerceOneSide(child, lo)
 		_, hi = coerceOneSide(child, hi)
+		if child.Type() == exec.TypeFloat64 || lo.Type() == exec.TypeFloat64 || hi.Type() == exec.TypeFloat64 {
+			child, lo, hi = castToFloat(child), castToFloat(lo), castToFloat(hi)
+		}
+		if _, _, err := comparableOperands(child, lo); err != nil {
+			return nil, fmt.Errorf("planner: BETWEEN: %w", err)
+		}
+		if _, _, err := comparableOperands(child, hi); err != nil {
+			return nil, fmt.Errorf("planner: BETWEEN: %w", err)
+		}
 		between := &exec.BetweenExpr{Child: child, Lo: lo, Hi: hi}
 		if x.Not {
 			return &exec.NotExpr{Child: between}, nil
@@ -436,18 +462,19 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		var set []any
+		inExpr := &exec.InExpr{Child: child}
 		for _, item := range x.List {
-			switch v := item.(type) {
-			case *sql.IntLiteral:
-				set = append(set, v.Value)
-			case *sql.FloatLiteral:
-				set = append(set, v.Value)
-			case *sql.StringLiteral:
-				set = append(set, v.Value)
+			v, isNull, ok, err := inListValue(item, child.Type())
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case isNull:
+				inExpr.HasNull = true
+			case ok:
+				inExpr.Set = append(inExpr.Set, v)
 			}
 		}
-		inExpr := &exec.InExpr{Child: child, Set: set}
 		if x.Not {
 			return &exec.NotExpr{Child: inExpr}, nil
 		}
@@ -457,6 +484,9 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 		child, err := buildExecExpr(x.Expr, schema)
 		if err != nil {
 			return nil, err
+		}
+		if child.Type() != exec.TypeString {
+			return nil, fmt.Errorf("planner: LIKE requires a STRING operand, got %v", child.Type())
 		}
 		pattern, ok := x.Pattern.(*sql.StringLiteral)
 		if !ok {
@@ -569,21 +599,22 @@ func buildBinExpr(x *sql.BinaryExpr, schema exec.Schema) (exec.Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	resultType := exec.TypeBool
-	if isArith {
-		resultType = l.Type()
-		if l.Type() == exec.TypeFloat64 || r.Type() == exec.TypeFloat64 {
-			resultType = exec.TypeFloat64
+	if !isArith {
+		if l, r, err = comparableOperands(l, r); err != nil {
+			return nil, fmt.Errorf("planner: %s: %w", sql.FormatExpr(x), err)
 		}
+		return &exec.BinOp{Op: op, Left: l, Right: r, T: exec.TypeBool}, nil
+	}
+	resultType := l.Type()
+	if l.Type() == exec.TypeFloat64 || r.Type() == exec.TypeFloat64 {
+		resultType = exec.TypeFloat64
 		// Mixed-type coercion: wrap the int64 side in a cast so evalArith
 		// always receives operands of matching type.
-		if resultType == exec.TypeFloat64 {
-			if l.Type() == exec.TypeInt64 {
-				l = &exec.CastIntToFloatExpr{Inner: l}
-			}
-			if r.Type() == exec.TypeInt64 {
-				r = &exec.CastIntToFloatExpr{Inner: r}
-			}
+		if l.Type() == exec.TypeInt64 {
+			l = &exec.CastIntToFloatExpr{Inner: l}
+		}
+		if r.Type() == exec.TypeInt64 {
+			r = &exec.CastIntToFloatExpr{Inner: r}
 		}
 	}
 	return &exec.BinOp{Op: op, Left: l, Right: r, T: resultType}, nil
@@ -628,6 +659,8 @@ func buildZonePredicate(e sql.Expr, schema exec.Schema) exec.ZonePredicate {
 }
 
 // zonePredEval returns true if the row group could contain rows matching e.
+// Every answer it cannot prove is true: a pruned row group is never read, so a
+// wrong false silently loses rows.
 func zonePredEval(e sql.Expr, schema exec.Schema, rg *storage.RowGroupMeta) bool {
 	switch x := e.(type) {
 	case *sql.BinaryExpr:
@@ -640,87 +673,33 @@ func zonePredEval(e sql.Expr, schema exec.Schema, rg *storage.RowGroupMeta) bool
 			return zoneRangePred(x, schema, rg)
 		}
 	case *sql.BetweenExpr:
-		// Equivalent to lo <= col <= hi; skip if max < lo or min > hi.
-		cr, ok := x.Expr.(*sql.ColumnRefExpr)
-		if !ok {
+		if x.Not {
 			return true
 		}
-		colIdx := schema.IndexOf(cr.Name)
-		if colIdx < 0 || colIdx >= len(rg.Columns) {
-			return true
-		}
-		zm := rg.Columns[colIdx].Stats
-		if !zm.HasMinMax {
-			return true
-		}
-		loVal := literalInt64(x.Lo)
-		hiVal := literalInt64(x.Hi)
-		if loVal == nil || hiVal == nil {
-			return true
-		}
-		rgMin := int64(zm.Min)
-		rgMax := int64(zm.Max)
-		if rgMax < *loVal || rgMin > *hiVal {
-			// Row group entirely outside [lo, hi]: plain BETWEEN has no matches (prune),
-			// NOT BETWEEN always matches (don't prune).
-			return x.Not
-		}
-		return true
+		// Equivalent to col >= lo AND col <= hi.
+		ge := &sql.BinaryExpr{Op: sql.OpGE, Left: x.Expr, Right: x.Lo}
+		le := &sql.BinaryExpr{Op: sql.OpLE, Left: x.Expr, Right: x.Hi}
+		return zoneRangePred(ge, schema, rg) && zoneRangePred(le, schema, rg)
 	}
 	return true // conservative: don't prune
 }
 
-// zoneRangePred evaluates a simple comparison expression against zone map stats.
+// zoneRangePred evaluates a column-vs-literal comparison against a row group's
+// min/max. The comparison is done in the column's own domain — signed int64 for
+// INT64, float64 for FLOAT64, int32 days for DATE — because the zone map stores
+// raw bits: comparing float bit patterns as integers, as this once did, orders
+// negative floats wrongly and pruned row groups that held matches. STRING
+// (dictionary-code) and BOOL zone maps are never used for pruning.
 func zoneRangePred(x *sql.BinaryExpr, schema exec.Schema, rg *storage.RowGroupMeta) bool {
+	op := x.Op
 	cr, ok := x.Left.(*sql.ColumnRefExpr)
+	lit := x.Right
 	if !ok {
-		// Try reversed.
-		cr, ok = x.Right.(*sql.ColumnRefExpr)
-		if !ok {
+		if cr, ok = x.Right.(*sql.ColumnRefExpr); !ok {
 			return true
 		}
-	}
-	colIdx := schema.IndexOf(cr.Name)
-	if colIdx < 0 || colIdx >= len(rg.Columns) {
-		return true
-	}
-	zm := rg.Columns[colIdx].Stats
-	if !zm.HasMinMax {
-		return true
-	}
-
-	// Get the literal side.
-	var lit sql.Expr
-	reversed := false
-	if _, ok := x.Left.(*sql.ColumnRefExpr); ok {
-		lit = x.Right
-	} else {
 		lit = x.Left
-		reversed = true
-	}
-	litVal := literalInt64(lit)
-	if litVal == nil {
-		return true
-	}
-	v := *litVal
-
-	// For float64 columns, zone map stores float64 bit patterns.
-	// If the literal was an integer (not yet converted to float bits), coerce it now
-	// so the bit-level comparison is valid.
-	colType := schema.Fields[colIdx].Type
-	if colType == exec.TypeFloat64 {
-		if _, isInt := lit.(*sql.IntLiteral); isInt {
-			v = int64(math.Float64bits(float64(v)))
-		}
-	}
-
-	rgMin := int64(zm.Min)
-	rgMax := int64(zm.Max)
-
-	op := x.Op
-	if reversed {
-		// Swap comparison direction.
-		switch op {
+		switch op { // literal OP col  ≡  col OP' literal
 		case sql.OpLT:
 			op = sql.OpGT
 		case sql.OpLE:
@@ -731,39 +710,121 @@ func zoneRangePred(x *sql.BinaryExpr, schema exec.Schema, rg *storage.RowGroupMe
 			op = sql.OpLE
 		}
 	}
+	colIdx := schema.IndexOf(cr.Name)
+	if colIdx < 0 || colIdx >= len(rg.Columns) {
+		return true
+	}
+	zm := rg.Columns[colIdx].Stats
+	if !zm.HasMinMax || op == sql.OpNE {
+		return true
+	}
+
+	// minCmp and maxCmp compare the row group's min and max with the literal:
+	// negative when the bound is smaller, zero when equal, positive when larger.
+	var minCmp, maxCmp int
+	switch schema.Fields[colIdx].Type {
+	case exec.TypeInt64:
+		v, ok := zoneLiteral(lit)
+		if !ok {
+			return true
+		}
+		switch lv := v.(type) {
+		case int64:
+			minCmp, maxCmp = cmpOrdered(int64(zm.Min), lv), cmpOrdered(int64(zm.Max), lv)
+		case float64:
+			lo, hi := int64(zm.Min), int64(zm.Max)
+			if math.IsNaN(lv) || !exactFloat(lo) || !exactFloat(hi) {
+				return true
+			}
+			minCmp, maxCmp = cmpOrdered(float64(lo), lv), cmpOrdered(float64(hi), lv)
+		default:
+			return true
+		}
+	case exec.TypeFloat64:
+		v, ok := zoneLiteral(lit)
+		if !ok {
+			return true
+		}
+		var lv float64
+		switch t := v.(type) {
+		case int64:
+			lv = float64(t)
+		case float64:
+			lv = t
+		default:
+			return true
+		}
+		lo, hi := math.Float64frombits(zm.Min), math.Float64frombits(zm.Max)
+		if math.IsNaN(lv) || math.IsNaN(lo) || math.IsNaN(hi) {
+			return true
+		}
+		minCmp, maxCmp = cmpOrdered(lo, lv), cmpOrdered(hi, lv)
+	case exec.TypeDate:
+		days, ok := zoneDateLiteral(lit)
+		if !ok {
+			return true
+		}
+		minCmp, maxCmp = cmpOrdered(int64(int32(uint32(zm.Min))), days), cmpOrdered(int64(int32(uint32(zm.Max))), days)
+	default:
+		return true
+	}
 
 	switch op {
 	case sql.OpEQ:
-		return rgMin <= v && v <= rgMax
-	case sql.OpNE:
-		return true // can't easily prune with NE
+		return minCmp <= 0 && maxCmp >= 0
 	case sql.OpLT:
-		return rgMin < v
+		return minCmp < 0
 	case sql.OpLE:
-		return rgMin <= v
+		return minCmp <= 0
 	case sql.OpGT:
-		return rgMax > v
+		return maxCmp > 0
 	case sql.OpGE:
-		return rgMax >= v
+		return maxCmp >= 0
 	}
 	return true
 }
 
-func literalInt64(e sql.Expr) *int64 {
-	switch x := e.(type) {
-	case *sql.IntLiteral:
-		return &x.Value
-	case *sql.FloatLiteral:
-		v := int64(math.Float64bits(x.Value))
-		return &v
-	case *sql.StringLiteral:
-		// Try to parse as a date (YYYY-MM-DD).
-		if t, err := time.ParseInLocation("2006-01-02", x.Value, time.UTC); err == nil {
-			days := int64(t.Sub(epoch).Hours() / 24)
-			return &days
-		}
+func cmpOrdered[T int64 | float64](a, b T) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
 	}
-	return nil
+	return 0
+}
+
+// exactFloat reports whether v converts to float64 without rounding, so
+// comparing its float64 image with a float literal gives the exact answer.
+func exactFloat(v int64) bool {
+	return v >= -(1<<53) && v <= 1<<53
+}
+
+// zoneLiteral returns a numeric literal's value as int64 or float64.
+func zoneLiteral(e sql.Expr) (any, bool) {
+	switch x := foldConstant(e).(type) {
+	case *sql.IntLiteral:
+		return x.Value, true
+	case *sql.FloatLiteral:
+		return x.Value, true
+	}
+	return nil, false
+}
+
+// zoneDateLiteral returns the days-since-epoch value a literal denotes when
+// compared with a DATE column, mirroring coerceOneSide.
+func zoneDateLiteral(e sql.Expr) (int64, bool) {
+	switch x := foldConstant(e).(type) {
+	case *sql.IntLiteral:
+		return int64(int32(x.Value)), true
+	case *sql.StringLiteral:
+		t, err := time.ParseInLocation("2006-01-02", x.Value, time.UTC)
+		if err != nil {
+			return 0, false
+		}
+		return int64(int32(t.Sub(epoch).Hours() / 24)), true
+	}
+	return 0, false
 }
 
 // coercePair adjusts literal types so both sides of a BinOp are compatible.
@@ -809,10 +870,123 @@ func coerceOneSide(a, b exec.Expr) (exec.Expr, exec.Expr) {
 			return a, &exec.Literal{Val: v, T: exec.TypeFloat64}
 		}
 	case exec.TypeInt64:
+		// Only an integral float literal converts exactly; 2.5 must stay a
+		// float so the comparison is done in FLOAT64 (comparableOperands)
+		// rather than against a truncated 2.
 		if lit.T == exec.TypeFloat64 {
-			v := int64(lit.Val.(float64))
-			return a, &exec.Literal{Val: v, T: exec.TypeInt64}
+			if v, ok := exactInt64(lit.Val.(float64)); ok {
+				return a, &exec.Literal{Val: v, T: exec.TypeInt64}
+			}
 		}
 	}
 	return a, b
+}
+
+// exactInt64 converts f to int64 when f is an integer that int64 represents.
+func exactInt64(f float64) (int64, bool) {
+	if f != math.Trunc(f) || f < -(1<<63) || f >= 1<<63 {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// castToFloat wraps an INT64 expression in a cast to FLOAT64; other expressions
+// are returned unchanged.
+func castToFloat(e exec.Expr) exec.Expr {
+	if e.Type() != exec.TypeInt64 {
+		return e
+	}
+	if lit, ok := e.(*exec.Literal); ok {
+		return &exec.Literal{Val: float64(lit.Val.(int64)), T: exec.TypeFloat64}
+	}
+	return &exec.CastIntToFloatExpr{Inner: e}
+}
+
+// comparableOperands returns l and r adjusted so the executor can compare them:
+// an INT64/FLOAT64 mix is compared as FLOAT64, and any other pair must already
+// share a type the comparison kernels support. Rejecting a mismatch here turns
+// what used to be an executor panic (a DATE column compared with an INT64
+// column) into a planning error.
+func comparableOperands(l, r exec.Expr) (exec.Expr, exec.Expr, error) {
+	lt, rt := l.Type(), r.Type()
+	if lt != rt && (lt == exec.TypeInt64 || lt == exec.TypeFloat64) && (rt == exec.TypeInt64 || rt == exec.TypeFloat64) {
+		return castToFloat(l), castToFloat(r), nil
+	}
+	if lt != rt {
+		return nil, nil, fmt.Errorf("cannot compare %v with %v", lt, rt)
+	}
+	switch lt {
+	case exec.TypeInt64, exec.TypeFloat64, exec.TypeDate:
+		return l, r, nil
+	}
+	return nil, nil, fmt.Errorf("comparison of %v values is not supported (only = and <> against a string literal)", lt)
+}
+
+// inListValue converts one IN-list entry to the representation exec.InExpr
+// compares against a value of type t. ok=false means the entry is a valid
+// constant that no value of type t can equal (2.5 against INT64), so it is
+// left out of the set. isNull reports a NULL entry.
+func inListValue(item sql.Expr, t exec.DataType) (v any, isNull, ok bool, err error) {
+	bad := func() (any, bool, bool, error) {
+		return nil, false, false, fmt.Errorf("planner: IN list entry %s cannot be compared with a %v value", sql.FormatExpr(item), t)
+	}
+	switch lit := foldConstant(item).(type) {
+	case *sql.NullLiteral:
+		return nil, true, false, nil
+	case *sql.IntLiteral:
+		switch t {
+		case exec.TypeInt64:
+			return lit.Value, false, true, nil
+		case exec.TypeFloat64:
+			return float64(lit.Value), false, true, nil
+		case exec.TypeDate:
+			return int32(lit.Value), false, lit.Value == int64(int32(lit.Value)), nil
+		}
+		return bad()
+	case *sql.FloatLiteral:
+		switch t {
+		case exec.TypeFloat64:
+			return lit.Value, false, true, nil
+		case exec.TypeInt64:
+			iv, exact := exactInt64(lit.Value)
+			return iv, false, exact, nil
+		}
+		return bad()
+	case *sql.StringLiteral:
+		switch t {
+		case exec.TypeString:
+			return lit.Value, false, true, nil
+		case exec.TypeDate:
+			d, err := time.ParseInLocation("2006-01-02", lit.Value, time.UTC)
+			if err != nil {
+				return nil, false, false, fmt.Errorf("planner: IN list entry %q is not a date (YYYY-MM-DD)", lit.Value)
+			}
+			return int32(d.Sub(epoch).Hours() / 24), false, true, nil
+		}
+		return bad()
+	case *sql.BoolLiteral:
+		if t == exec.TypeBool {
+			return lit.Value, false, true, nil
+		}
+		return bad()
+	}
+	return nil, false, false, fmt.Errorf("planner: IN list entries must be literals, got %s", sql.FormatExpr(item))
+}
+
+// foldConstant reduces unary minus applied to a numeric literal (-(2), --2.5)
+// to a literal, returning any other expression unchanged.
+func foldConstant(e sql.Expr) sql.Expr {
+	u, ok := e.(*sql.UnaryExpr)
+	if !ok || u.Op != sql.OpMinus {
+		return e
+	}
+	switch lit := foldConstant(u.Expr).(type) {
+	case *sql.IntLiteral:
+		if lit.Value != math.MinInt64 {
+			return &sql.IntLiteral{Value: -lit.Value}
+		}
+	case *sql.FloatLiteral:
+		return &sql.FloatLiteral{Value: -lit.Value}
+	}
+	return e
 }

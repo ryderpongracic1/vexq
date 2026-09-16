@@ -38,7 +38,7 @@ exec/          — Vectorized operator pipeline
 catalog/       — Table registry with lazy schema loading from .vxq footer
 storage/       — .vxq file format: writer, reader, block codec, zone maps
 internal/encoding — Little-endian primitives, CRC32-IEEE helpers
-internal/goldentest — End-to-end correctness oracle (72-query suite, 4 execution paths)
+internal/goldentest — End-to-end correctness oracle (107-query suite, 4 execution paths)
 bench/tpch     — TPC-H Q1/Q3/Q6/Q12 benchmarks vs SQLite and DuckDB
 bench/simd_filter — Isolated AVX2 filter kernel benchmark (ceiling measurement, x86-64)
 ```
@@ -84,7 +84,7 @@ Q1's 8.6× on 14 cores (10P+4E) is ~86% efficiency against the realistic 10-P-co
 
 ### Correctness
 
-All four TPC-H query results are verified identical to SQLite output in-harness (Q6's SUM to 1e-9 relative tolerance), and vexq's canonical Q6 matches DuckDB's result exactly. An independent 72-query golden suite ([internal/goldentest/](internal/goldentest/)) verifies the full SQL subset against a naive row-at-a-time reference evaluator across four oracle paths — serial, parallel, optimizer-off, and stacked-filter — under `-race` in CI. 72/72 passing on all four paths, zero known correctness issues.
+All four TPC-H query results are verified identical to SQLite output in-harness (Q6's SUM to 1e-9 relative tolerance), and vexq's canonical Q6 matches DuckDB's result exactly. Beyond those queries, the evidence is test coverage: a 107-query golden suite ([internal/goldentest/](internal/goldentest/)) compares results, output width and aliases with a naive row-at-a-time reference evaluator on four execution paths (serial, parallel, optimizer-off, stacked-filter), and [planner/sql_semantics_test.go](planner/sql_semantics_test.go) pins hand-computed answers for the documented SQL rules. Everything passes, including under `-race` in CI. Tests only cover the shapes they exercise: an earlier, smaller suite missed several wrong-result bugs that a later review found (now fixed with regression tests), so treat untested SQL shapes as unverified. Details are in [docs/benchmarks.md](docs/benchmarks.md#correctness).
 
 ## Quickstart
 
@@ -101,7 +101,7 @@ vexq --workers=4 lineitem.vxq "SELECT l_returnflag, COUNT(*) FROM lineitem GROUP
 # Multi-table join query
 vexq lineitem.vxq orders.vxq "SELECT o_orderkey, l_quantity FROM orders, lineitem WHERE o_orderkey = l_orderkey LIMIT 10"
 
-# Validate file integrity (CRC, footer, zone maps)
+# Validate file integrity (block and footer CRCs, encodings, zone maps recomputed from the data)
 vexq fsck lineitem.vxq
 ```
 
@@ -130,5 +130,6 @@ Requires Go 1.22+. No external runtime dependencies (SQLite and DuckDB are bench
 - **Benchmarks are single-machine, ARM64.** DuckDB's strongest x86 SIMD paths (AVX-512) are unavailable on the benchmark machine; an x86 comparison would likely widen DuckDB's per-core advantage. The comparison is same-machine and therefore fair, but the Q1 figures should be read with that context.
 - **`ExternalSort` is in-memory** (spill-to-disk planned); `COUNT(DISTINCT)` falls back to serial execution.
 - **In-engine SIMD and probe-stream partitioning were profiled and declined as measured** (end-to-end ceilings ~1.03× and ~1.005× respectively): serial wall time is dominated by pread syscalls and page management, not compute, so the honest remaining optimizations are I/O-side — late materialization and adaptive compression, both open. The profiles are in [docs/benchmarks.md](docs/benchmarks.md).
-- **Column pruning through joins is name-based, not cost-based**, and a single-table `SELECT COUNT(*)` still decodes every column.
+- **SQL is a subset** ([docs/sql.md](docs/sql.md)): inner joins keyed on `INT64`/`DATE` equalities only, `GROUP BY` on column references only, no subqueries or set operations. Unsupported constructs are rejected with an error rather than ignored.
+- **Column pruning is name-based, not cost-based**, and a single-table `SELECT COUNT(*)` still decodes every column.
 - **Default worker count is `runtime.NumCPU()`**; capping at the performance-core count (the measured bend in the worker sweep) remains open.

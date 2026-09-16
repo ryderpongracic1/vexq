@@ -16,6 +16,7 @@ type SelectStmt struct {
 	GroupBy  []Expr         // nil if absent
 	OrderBy  []OrderByItem
 	Limit    *int64 // nil if absent
+	Offset   *int64 // nil if absent
 }
 
 func (*SelectStmt) nodeTag() {}
@@ -134,8 +135,8 @@ const (
 
 // IsNullExpr is IS NULL / IS NOT NULL.
 type IsNullExpr struct {
-	Expr   Expr
-	IsNot  bool
+	Expr  Expr
+	IsNot bool
 }
 
 func (*IsNullExpr) nodeTag() {}
