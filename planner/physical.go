@@ -11,8 +11,6 @@ import (
 	"github.com/ryderpongracic1/vexq/storage"
 )
 
-var epoch = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
-
 // Physical converts a logical plan into a physical operator tree.
 func Physical(ctx context.Context, node LogicalNode) (exec.Operator, error) {
 	switch n := node.(type) {
@@ -251,6 +249,10 @@ func resolveAggConfig(n *LogicalAggregate, schema exec.Schema) (groupByIdxs []in
 		srcType := exec.TypeInt64
 		if ae.ColIdx >= 0 {
 			srcType = schema.Fields[ae.ColIdx].Type
+		}
+		if (ae.Kind == exec.AggSum || ae.Kind == exec.AggAvg) &&
+			srcType != exec.TypeInt64 && srcType != exec.TypeFloat64 {
+			return nil, nil, fmt.Errorf("planner: %s requires a numeric argument, got %v", agg.Func, srcType)
 		}
 		ae.AccumType = exec.AccumTypeFor(ae.Kind, srcType)
 		aggExprs = append(aggExprs, ae)
@@ -504,6 +506,9 @@ func buildExecExpr(e sql.Expr, schema exec.Schema) (exec.Expr, error) {
 			cond, err := buildExecExpr(w.Cond, schema)
 			if err != nil {
 				return nil, err
+			}
+			if cond.Type() != exec.TypeBool {
+				return nil, fmt.Errorf("planner: CASE WHEN condition must be BOOL, got %v", cond.Type())
 			}
 			result, err := buildExecExpr(w.Result, schema)
 			if err != nil {
@@ -811,18 +816,32 @@ func zoneLiteral(e sql.Expr) (any, bool) {
 	return nil, false
 }
 
+func exactDateDays(v int64) (int32, bool) {
+	days := int32(v)
+	return days, int64(days) == v
+}
+
+// parseDateDays converts a YYYY-MM-DD literal to days since the Unix epoch.
+// time.Time.Sub cannot be used here: time.Duration saturates at roughly 292
+// years, while DATE's int32 day representation covers the parser's full range.
+func parseDateDays(s string) (int32, bool) {
+	t, err := time.ParseInLocation("2006-01-02", s, time.UTC)
+	if err != nil {
+		return 0, false
+	}
+	return exactDateDays(t.Unix() / (24 * 60 * 60))
+}
+
 // zoneDateLiteral returns the days-since-epoch value a literal denotes when
 // compared with a DATE column, mirroring coerceOneSide.
 func zoneDateLiteral(e sql.Expr) (int64, bool) {
 	switch x := foldConstant(e).(type) {
 	case *sql.IntLiteral:
-		return int64(int32(x.Value)), true
+		days, ok := exactDateDays(x.Value)
+		return int64(days), ok
 	case *sql.StringLiteral:
-		t, err := time.ParseInLocation("2006-01-02", x.Value, time.UTC)
-		if err != nil {
-			return 0, false
-		}
-		return int64(int32(t.Sub(epoch).Hours() / 24)), true
+		days, ok := parseDateDays(x.Value)
+		return int64(days), ok
 	}
 	return 0, false
 }
@@ -850,11 +869,10 @@ func coerceOneSide(a, b exec.Expr) (exec.Expr, exec.Expr) {
 			if !ok {
 				break
 			}
-			t, err := time.ParseInLocation("2006-01-02", s, time.UTC)
-			if err != nil {
+			days, ok := parseDateDays(s)
+			if !ok {
 				break
 			}
-			days := int32(t.Sub(epoch).Hours() / 24)
 			return a, &exec.Literal{Val: days, T: exec.TypeDate}
 		}
 		// Integer literal beside a DateVector: interpret as days-since-epoch,
@@ -862,7 +880,9 @@ func coerceOneSide(a, b exec.Expr) (exec.Expr, exec.Expr) {
 		// coercion above).  This allows predicates like `order_date > 18000`.
 		if lit.T == exec.TypeInt64 {
 			v := lit.Val.(int64)
-			return a, &exec.Literal{Val: int32(v), T: exec.TypeDate}
+			if days, ok := exactDateDays(v); ok {
+				return a, &exec.Literal{Val: days, T: exec.TypeDate}
+			}
 		}
 	case exec.TypeFloat64:
 		if lit.T == exec.TypeInt64 {
@@ -940,7 +960,11 @@ func inListValue(item sql.Expr, t exec.DataType) (v any, isNull, ok bool, err er
 		case exec.TypeFloat64:
 			return float64(lit.Value), false, true, nil
 		case exec.TypeDate:
-			return int32(lit.Value), false, lit.Value == int64(int32(lit.Value)), nil
+			days, exact := exactDateDays(lit.Value)
+			if !exact {
+				return nil, false, false, fmt.Errorf("planner: IN list entry %d is outside the DATE day range", lit.Value)
+			}
+			return days, false, true, nil
 		}
 		return bad()
 	case *sql.FloatLiteral:
@@ -957,11 +981,11 @@ func inListValue(item sql.Expr, t exec.DataType) (v any, isNull, ok bool, err er
 		case exec.TypeString:
 			return lit.Value, false, true, nil
 		case exec.TypeDate:
-			d, err := time.ParseInLocation("2006-01-02", lit.Value, time.UTC)
-			if err != nil {
+			days, ok := parseDateDays(lit.Value)
+			if !ok {
 				return nil, false, false, fmt.Errorf("planner: IN list entry %q is not a date (YYYY-MM-DD)", lit.Value)
 			}
-			return int32(d.Sub(epoch).Hours() / 24), false, true, nil
+			return days, false, true, nil
 		}
 		return bad()
 	case *sql.BoolLiteral:

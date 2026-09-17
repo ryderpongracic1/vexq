@@ -19,11 +19,11 @@ import (
 // semanticsCatalog writes two small tables that share a column name and returns
 // a catalog over them.
 //
-//	a: ax  shared  name       fx    nx
-//	    1      10  apple     1.5     1
-//	    2      20  banana   -2.5  NULL
-//	    3      30  cherry    3.0     3
-//	   -2      40  apricot  -0.5  NULL
+//	a: ax  shared  name       fx    nx    flag       day  other_day
+//	    1      10  apple     1.5     1    true         0         10
+//	    2      20  banana   -2.5  NULL   false    106751         20
+//	    3      30  cherry    3.0     3    true    2932896         30
+//	   -2      40  apricot  -0.5  NULL   false        40         40
 //
 //	b: bx  shared  bname
 //	    1     100  x
@@ -42,6 +42,9 @@ func semanticsCatalog(t *testing.T) *catalog.Catalog {
 		{Name: "name", Type: storage.TypeString},
 		{Name: "fx", Type: storage.TypeFloat64},
 		{Name: "nx", Type: storage.TypeInt64, Nullable: true},
+		{Name: "flag", Type: storage.TypeBool},
+		{Name: "day", Type: storage.TypeDate},
+		{Name: "other_day", Type: storage.TypeDate},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -55,6 +58,9 @@ func semanticsCatalog(t *testing.T) *catalog.Catalog {
 	mustOK(t, w.AppendColumn(ctx, 2, nil, []string{"apple", "banana", "cherry", "apricot"}))
 	mustOK(t, w.AppendColumn(ctx, 3, nil, []float64{1.5, -2.5, 3.0, -0.5}))
 	mustOK(t, w.AppendColumn(ctx, 4, nxNulls, []int64{1, 0, 3, 0}))
+	mustOK(t, w.AppendColumn(ctx, 5, nil, []bool{true, false, true, false}))
+	mustOK(t, w.AppendColumn(ctx, 6, nil, []int32{0, 106751, 2932896, 40}))
+	mustOK(t, w.AppendColumn(ctx, 7, nil, []int32{10, 20, 30, 40}))
 	mustOK(t, w.EndRowGroup())
 	mustOK(t, w.Finish(ctx))
 
@@ -465,6 +471,106 @@ func TestComparisonCoercion(t *testing.T) {
 			query: "SELECT ax FROM a WHERE NOT (nx = 1 OR ax = 5)",
 			rows:  []string{"3"},
 		},
+	})
+}
+
+func TestCaseSupportsAllResultTypesAndRejectsNonBooleanConditions(t *testing.T) {
+	runSemanticsCases(t, []semanticsCase{
+		{
+			name:    "boolean_result",
+			query:   "SELECT ax, CASE WHEN ax = 1 THEN TRUE ELSE FALSE END AS picked FROM a ORDER BY ax",
+			rows:    []string{"-2|false", "1|true", "2|false", "3|false"},
+			ordered: true,
+		},
+		{
+			name:    "date_result",
+			query:   "SELECT ax, CASE WHEN ax = 1 THEN day ELSE other_day END AS picked FROM a ORDER BY ax",
+			rows:    []string{"-2|1970-02-10", "1|1970-01-01", "2|1970-01-21", "3|1970-01-31"},
+			ordered: true,
+		},
+		{
+			name:    "date_result_without_else",
+			query:   "SELECT ax, CASE WHEN ax = 1 THEN day END AS picked FROM a ORDER BY ax",
+			rows:    []string{"-2|NULL", "1|1970-01-01", "2|NULL", "3|NULL"},
+			ordered: true,
+		},
+		{
+			name:    "non_boolean_condition",
+			query:   "SELECT CASE WHEN ax THEN 1 ELSE 0 END FROM a",
+			wantErr: "CASE WHEN condition must be BOOL",
+		},
+	})
+}
+
+func TestSumAndAvgRejectNonNumericArguments(t *testing.T) {
+	runSemanticsCases(t, []semanticsCase{
+		{name: "sum_string", query: "SELECT SUM(name) FROM a", wantErr: "SUM requires a numeric argument"},
+		{name: "avg_string", query: "SELECT AVG(name) FROM a", wantErr: "AVG requires a numeric argument"},
+		{name: "sum_bool", query: "SELECT SUM(flag) FROM a", wantErr: "SUM requires a numeric argument"},
+		{name: "avg_date", query: "SELECT AVG(day) FROM a", wantErr: "AVG requires a numeric argument"},
+	})
+}
+
+func TestDateLiteralConversionIsExact(t *testing.T) {
+	runSemanticsCases(t, []semanticsCase{
+		{
+			name:  "distant_date_comparison",
+			query: "SELECT ax FROM a WHERE day = '9999-12-31'",
+			rows:  []string{"3"},
+		},
+		{
+			name:  "distant_date_in_list",
+			query: "SELECT ax FROM a WHERE day IN ('9999-12-31')",
+			rows:  []string{"3"},
+		},
+		{
+			name:  "distant_date_between",
+			query: "SELECT ax FROM a WHERE day BETWEEN '9999-12-31' AND '9999-12-31'",
+			rows:  []string{"3"},
+		},
+		{
+			name:    "integer_day_overflow_comparison",
+			query:   "SELECT ax FROM a WHERE day = 4294967296",
+			wantErr: "cannot compare",
+		},
+		{
+			name:    "integer_day_overflow_in_list",
+			query:   "SELECT ax FROM a WHERE day IN (4294967296)",
+			wantErr: "outside the DATE day range",
+		},
+	})
+
+	t.Run("distant_date_zone_map", func(t *testing.T) {
+		ctx := context.Background()
+		path := filepath.Join(t.TempDir(), "dates.vxq")
+		w, err := storage.NewWriter(path, storage.Schema{Fields: []storage.Field{
+			{Name: "id", Type: storage.TypeInt64},
+			{Name: "day", Type: storage.TypeDate},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustOK(t, w.BeginRowGroup(1))
+		mustOK(t, w.AppendColumn(ctx, 0, nil, []int64{1}))
+		mustOK(t, w.AppendColumn(ctx, 1, nil, []int32{106751}))
+		mustOK(t, w.EndRowGroup())
+		mustOK(t, w.BeginRowGroup(1))
+		mustOK(t, w.AppendColumn(ctx, 0, nil, []int64{2}))
+		mustOK(t, w.AppendColumn(ctx, 1, nil, []int32{2932896}))
+		mustOK(t, w.EndRowGroup())
+		mustOK(t, w.Finish(ctx))
+
+		cat, err := catalog.OpenSingle(ctx, "dates", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := runSemantics(t, cat, "SELECT id FROM dates WHERE day = '9999-12-31'")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := [][]string{{"2"}}; fmt.Sprint(got.rows) != fmt.Sprint(want) {
+			t.Fatalf("rows = %v, want %v", got.rows, want)
+		}
 	})
 }
 

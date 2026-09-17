@@ -46,6 +46,7 @@ by name, and any other trailing text is reported as unexpected.
 - Comparisons `=, <>, <, <=, >, >=` between numbers (an `INT64`/`FLOAT64` mix is
   compared as `FLOAT64`, so `int_col >= 2.5` is exact), between dates, and
   between a `DATE` and a `'YYYY-MM-DD'` string or an integer day number.
+  Integer day numbers must fit the signed 32-bit `DATE` representation.
   `STRING` columns support `=` and `<>` against a string literal, `LIKE` and
   `IN`. Any other comparison (strings with `<`, a date with an integer column,
   a string column with a string column) is a planning error.
@@ -68,7 +69,8 @@ by name, and any other trailing text is reported as unexpected.
 
 - Aggregate functions: `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT col)`, `SUM`,
   `AVG`, `MIN`, `MAX`. Arguments may be expressions (`SUM(price * (1 - disc))`).
-  `DISTINCT` is supported only for `COUNT`.
+  `SUM` and `AVG` require an `INT64` or `FLOAT64` argument; `DISTINCT` is
+  supported only for `COUNT`.
 - A query aggregates when it has `GROUP BY`, or an aggregate anywhere in its
   `SELECT` list or `HAVING` clause.
 - `GROUP BY` takes column references.

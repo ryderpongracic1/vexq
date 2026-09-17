@@ -28,7 +28,7 @@ type AggExpr struct {
 	OutName   string   // output column name
 	Distinct  bool     // true for COUNT(DISTINCT col)
 	AccumType DataType // encoding of the accumulator this aggregate runs in:
-	// TypeInt64   for COUNT, SUM/MIN/MAX over integer/date/bool columns
+	// TypeInt64   for COUNT, integer SUM, and MIN/MAX over integer/date/bool columns
 	// TypeFloat64 for SUM/MIN/MAX over float64 columns, and always for AVG
 	// TypeString  for MIN/MAX over string columns — the running value lives in
 	//             HashAggregate.strAccs, not in the int64 groups accumulator
@@ -154,6 +154,9 @@ func NewHashAggregate(child Operator, groupBy []int, aggExprs []AggExpr) (*HashA
 				return nil, fmt.Errorf("exec: hash aggregate: aggregate column %d out of range", ae.ColIdx)
 			}
 			srcType = childSchema.Fields[ae.ColIdx].Type
+		}
+		if (ae.Kind == AggSum || ae.Kind == AggAvg) && srcType != TypeInt64 && srcType != TypeFloat64 {
+			return nil, fmt.Errorf("exec: hash aggregate: SUM/AVG input %q must be numeric, got %v", ae.OutName, srcType)
 		}
 		if ae.AccumType == 0 {
 			ae.AccumType = AccumTypeFor(ae.Kind, srcType)
@@ -1073,13 +1076,9 @@ func buildGroupByVector(h *HashAggregate, keys []string, gbPos int, srcType Data
 //
 // The default arm returns 0 for any vector kind with no int64 encoding — today
 // that is only *StringVector. Callers must not route a string column here
-// expecting a comparable value: this silent 0 is what made MIN/MAX over a STRING
-// column return 0 for every input, since 0 beats both MaxInt64 and MinInt64.
-// MIN/MAX now run strings through a TypeString accumulator (see strAccs) and
-// never reach this function. SUM over a STRING column still does, and still
-// yields 0 — a pre-existing defect left untouched here, since a numeric SUM of
-// text has no correct answer to converge on and rejecting it is a separate
-// behavioural change.
+// expecting a comparable value. MIN/MAX run strings through a TypeString
+// accumulator, and SUM/AVG reject non-numeric inputs during planning and
+// NewHashAggregate construction.
 func extractInt64(v Vector, i int) int64 {
 	switch col := v.(type) {
 	case *Int64Vector:

@@ -1486,7 +1486,10 @@ func (e *CaseExpr) Eval(ctx context.Context, b *Batch) (Vector, error) {
 		if err != nil {
 			return nil, err
 		}
-		cond := condV.(*BoolVector)
+		cond, ok := condV.(*BoolVector)
+		if !ok {
+			return nil, fmt.Errorf("expr: CASE WHEN condition must return BOOL, got %T", condV)
+		}
 		valV, err := w.Result.Eval(ctx, b)
 		if err != nil {
 			return nil, err
@@ -1571,6 +1574,42 @@ func mergeVectors(cond *BoolVector, valV, base Vector, n int) Vector {
 			}
 		}
 		return newStringVector(db, codes, nullBmp)
+	case *BoolVector:
+		vv := valV.(*BoolVector)
+		out := &BoolVector{
+			Bits:       make([]byte, (n+7)/8),
+			NullBitmap: make([]byte, (n+7)/8),
+			Length:     n,
+		}
+		copy(out.Bits, bv.Bits)
+		copy(out.NullBitmap, bv.NullBitmap)
+		for i := 0; i < n; i++ {
+			if !cond.IsNull(i) && cond.Get(i) {
+				out.Set(i, vv.Get(i))
+				if vv.IsNull(i) {
+					storage.SetNullBit(out.NullBitmap, i)
+				} else {
+					storage.SetValidBit(out.NullBitmap, i)
+				}
+			}
+		}
+		return out
+	case *DateVector:
+		vv := valV.(*DateVector)
+		out := &DateVector{Values: make([]int32, n), NullBitmap: make([]byte, (n+7)/8)}
+		copy(out.Values, bv.Values)
+		copy(out.NullBitmap, bv.NullBitmap)
+		for i := 0; i < n; i++ {
+			if !cond.IsNull(i) && cond.Get(i) {
+				out.Values[i] = vv.Values[i]
+				if vv.IsNull(i) {
+					storage.SetNullBit(out.NullBitmap, i)
+				} else {
+					storage.SetValidBit(out.NullBitmap, i)
+				}
+			}
+		}
+		return out
 	default:
 		return base
 	}
@@ -1585,7 +1624,9 @@ func nullVector(t DataType, n int) Vector {
 		return &Float64Vector{Values: make([]float64, n), NullBitmap: make([]byte, (n+7)/8)}
 	case TypeString:
 		return &StringVector{Codes: make([]uint32, n), Dict: nil, NullBitmap: make([]byte, (n+7)/8)}
-	default:
+	case TypeDate:
+		return &DateVector{Values: make([]int32, n), NullBitmap: make([]byte, (n+7)/8)}
+	default: // TypeBool
 		return &BoolVector{Bits: make([]byte, (n+7)/8), NullBitmap: make([]byte, (n+7)/8), Length: n}
 	}
 }
